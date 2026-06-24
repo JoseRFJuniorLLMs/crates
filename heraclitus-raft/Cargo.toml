@@ -1,0 +1,18 @@
+[package]
+name = "heraclitus-raft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Replication: log shipping v0 (RFC-003); openraft consensus behind feature flag (planned)"
+
+[features]
+# Reserved for the openraft consensus upgrade (post-v0).
+replication = []
+
+[dependencies]
+heraclitus-core = { workspace = true }
+heraclitus-log = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

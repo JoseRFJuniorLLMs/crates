@@ -1,0 +1,48 @@
+[package]
+name = "heraclitus-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "gRPC (tonic) + minimal REST (axum) server composing the engine"
+
+[[bin]]
+name = "heraclitus-server"
+path = "src/main.rs"
+
+# Windows service wrapper: same engine, driven by the Service Control Manager.
+[[bin]]
+name = "heraclitus-service"
+path = "src/bin/service.rs"
+
+[dependencies]
+heraclitus-core = { workspace = true }
+heraclitus-compliance = { workspace = true }
+heraclitus-crypto = { workspace = true }
+heraclitus-log = { workspace = true }
+heraclitus-manifold = { workspace = true }
+heraclitus-memtable = { workspace = true }
+heraclitus-views = { workspace = true }
+heraclitus-index-vector = { workspace = true }
+heraclitus-index-graph = { workspace = true }
+heraclitus-index-text = { workspace = true }
+heraclitus-index-attr = { workspace = true }
+heraclitus-activation = { workspace = true }
+heraclitus-retrieval = { workspace = true }
+heraclitus-query = { workspace = true }
+heraclitus-proto = { workspace = true }
+tonic = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Only the service binary needs these, and only on Windows.
+[target.'cfg(windows)'.dependencies]
+windows-service = { workspace = true }
+tracing-appender = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

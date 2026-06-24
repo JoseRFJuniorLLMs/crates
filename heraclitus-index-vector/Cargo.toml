@@ -1,0 +1,20 @@
+[package]
+name = "heraclitus-index-vector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-crate HNSW with pluggable product-manifold metric and bitmap filter push-down"
+
+[dependencies]
+heraclitus-core = { workspace = true }
+heraclitus-manifold = { workspace = true }
+heraclitus-views = { workspace = true }
+roaring = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+ulid = { workspace = true }

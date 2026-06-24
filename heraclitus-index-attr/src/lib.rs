@@ -1,0 +1,236 @@
+//! heraclitus-index-attr — o índice secundário AUTOMÁTICO.
+//!
+//! Um banco sem índices não é um banco. Esta view indexa **todos os atributos**
+//! de cada evento — `(campo, valor) -> [LSN]` — para que uma consulta por CPF,
+//! CNPJ, nome ou qualquer outro campo seja O(postings), não um scan do log.
+//!
+//! - **Automático/inteligente:** indexa qualquer campo presente nos `attrs`; não
+//!   é preciso declarar índices.
+//! - **View materializada:** `apply(lsn, event)` no append (read-your-own-writes)
+//!   e reconstruível por replay determinístico a partir do LSN 0.
+//! - **Persistido:** `checkpoint`/`open` (bincode) — num log de milhões de nós o
+//!   arranque carrega o índice e só replaya a cauda, em vez de reconstruir tudo.
+//!
+//! O planeador de queries usa `lookup` para resolver `WHERE n.<campo> = "v"` sem
+//! varrer a janela (ver heraclitus-query::plan).
+
+use heraclitus_core::{Episode, HeraclitusError, Lsn};
+use heraclitus_views::View;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::Path;
+
+const BINCODE_CFG: bincode::config::Configuration = bincode::config::standard();
+const SNAPSHOT_FILE: &str = "attr_index.bin";
+/// Separador entre campo e valor na chave do índice (US, nunca aparece em dados).
+const SEP: char = '\u{1f}';
+/// Valores quase-ubíquos sem poder discriminante são ignorados (evita postings
+/// gigantes que não ajudam a localizar nada).
+const SKIP_VALUES: &[&str] = &["", "0", "-1", "nao", "sim", "true", "false", "null", "none"];
+/// Valores maiores que isto são texto livre (descrições) — inúteis para busca
+/// exata e fariam o índice explodir em RAM/disco. Identificadores e nomes
+/// (CPF/CNPJ/códigos/razão social) ficam muito abaixo.
+const MAX_VALUE_LEN: usize = 80;
+
+#[derive(Default, Serialize, Deserialize)]
+struct Snapshot {
+    watermark: Lsn,
+    applied: bool,
+    /// `"campo\u{1f}valor" -> [LSN]` (postings em ordem crescente de LSN).
+    exact: HashMap<String, Vec<Lsn>>,
+}
+
+/// Índice invertido de atributos. Persistido e reconstruível por replay.
+#[derive(Default)]
+pub struct AttrIndex {
+    inner: Snapshot,
+}
+
+fn ikey(field: &str, value: &str) -> String {
+    let mut s = String::with_capacity(field.len() + value.len() + 1);
+    s.push_str(field);
+    s.push(SEP);
+    s.push_str(value);
+    s
+}
+
+impl AttrIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Abre o índice carregando o checkpoint de `dir` (vazio se não existir).
+    pub fn open(dir: impl AsRef<Path>) -> Self {
+        let path = dir.as_ref().join(SNAPSHOT_FILE);
+        match std::fs::read(&path) {
+            Ok(bytes) => match bincode::serde::decode_from_slice::<Snapshot, _>(&bytes, BINCODE_CFG) {
+                Ok((snap, _)) => AttrIndex { inner: snap },
+                Err(_) => AttrIndex::new(), // checkpoint corrompido -> rebuild por replay
+            },
+            Err(_) => AttrIndex::new(),
+        }
+    }
+
+    /// LSNs (ordenados) dos eventos cujo `field == value`. Vazio se nada bate.
+    pub fn lookup(&self, field: &str, value: &str) -> &[Lsn] {
+        self.inner
+            .exact
+            .get(&ikey(field, value))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Nº de pares (campo,valor) distintos indexados.
+    pub fn keys(&self) -> usize {
+        self.inner.exact.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.exact.is_empty()
+    }
+
+    /// Grava o checkpoint em `dir` (escrita atómica tmp+rename).
+    pub fn save(&self, dir: impl AsRef<Path>) -> Result<(), HeraclitusError> {
+        std::fs::create_dir_all(dir.as_ref())?;
+        let bytes = bincode::serde::encode_to_vec(&self.inner, BINCODE_CFG)
+            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+        let dst = dir.as_ref().join(SNAPSHOT_FILE);
+        let tmp = dir.as_ref().join(format!("{SNAPSHOT_FILE}.tmp"));
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &dst)?;
+        Ok(())
+    }
+}
+
+impl View for AttrIndex {
+    fn name(&self) -> &str {
+        "attr"
+    }
+
+    fn apply(&mut self, lsn: Lsn, event: &Episode) {
+        // Idempotente: replay e tail entregam LSNs estritamente crescentes.
+        if self.inner.applied && lsn <= self.inner.watermark {
+            return;
+        }
+        for (field, value) in &event.attrs {
+            let v = value.trim();
+            if v.len() > MAX_VALUE_LEN || SKIP_VALUES.contains(&v.to_ascii_lowercase().as_str()) {
+                continue;
+            }
+            self.inner.exact.entry(ikey(field, v)).or_default().push(lsn);
+        }
+        self.inner.watermark = lsn;
+        self.inner.applied = true;
+    }
+
+    fn watermark(&self) -> Lsn {
+        self.inner.watermark
+    }
+
+    fn checkpoint(&self, dir: &Path) -> Result<(), HeraclitusError> {
+        self.save(dir)
+    }
+
+    fn reset(&mut self) {
+        self.inner = Snapshot::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use heraclitus_core::{Episode, EventKind};
+
+    fn ep(cnpj: &str, nome: &str) -> Episode {
+        let mut e = Episode::new("etl", EventKind::Observation, nome.as_bytes().to_vec());
+        e.attrs.insert("cnpj".into(), cnpj.into());
+        e.attrs.insert("nome".into(), nome.into());
+        e
+    }
+
+    #[test]
+    fn indexes_any_field_and_looks_up_fast() {
+        let mut idx = AttrIndex::new();
+        idx.apply(0, &ep("11222333000144", "OMEGA LTDA"));
+        idx.apply(1, &ep("99888777000100", "ALFA SA"));
+        idx.apply(2, &ep("11222333000144", "OMEGA LTDA")); // mesma empresa, outro evento
+
+        assert_eq!(idx.lookup("cnpj", "11222333000144"), &[0, 2]);
+        assert_eq!(idx.lookup("cnpj", "99888777000100"), &[1]);
+        assert_eq!(idx.lookup("nome", "ALFA SA"), &[1]);
+        assert!(idx.lookup("cnpj", "inexistente").is_empty());
+        assert_eq!(idx.watermark(), 2);
+    }
+
+    #[test]
+    fn replay_idempotent_no_duplicate_postings() {
+        let mut idx = AttrIndex::new();
+        let e = ep("11222333000144", "OMEGA LTDA");
+        idx.apply(0, &e);
+        idx.apply(0, &e); // replay sobreposto do MESMO lsn -> ignorado
+        assert_eq!(idx.lookup("cnpj", "11222333000144"), &[0]);
+    }
+
+    #[test]
+    fn skips_ubiquitous_placeholder_values() {
+        let mut idx = AttrIndex::new();
+        let mut e = Episode::new("etl", EventKind::Observation, vec![]);
+        e.attrs.insert("vencedor_flag".into(), "0".into());
+        e.attrs.insert("cnpj".into(), "".into());
+        idx.apply(0, &e);
+        assert!(idx.lookup("vencedor_flag", "0").is_empty());
+        assert!(idx.lookup("cnpj", "").is_empty());
+    }
+
+    #[test]
+    fn skips_long_free_text_values() {
+        let mut idx = AttrIndex::new();
+        let mut e = Episode::new("etl", EventKind::Observation, vec![]);
+        let desc = "objeto: ".to_string() + &"contratacao de servicos diversos ".repeat(5);
+        assert!(desc.len() > 80);
+        e.attrs.insert("objeto".into(), desc.clone());
+        e.attrs.insert("cnpj".into(), "11222333000144".into());
+        idx.apply(0, &e);
+        assert!(idx.lookup("objeto", &desc).is_empty(), "texto livre não é indexado");
+        assert_eq!(idx.lookup("cnpj", "11222333000144"), &[0], "identificador curto é indexado");
+    }
+
+    #[test]
+    fn checkpoint_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = AttrIndex::new();
+        idx.apply(0, &ep("11222333000144", "OMEGA LTDA"));
+        idx.apply(1, &ep("99888777000100", "ALFA SA"));
+        idx.save(dir.path()).unwrap();
+
+        let re = AttrIndex::open(dir.path());
+        assert_eq!(re.lookup("cnpj", "11222333000144"), &[0]);
+        assert_eq!(re.lookup("nome", "ALFA SA"), &[1]);
+        assert_eq!(re.watermark(), 1);
+    }
+
+    #[test]
+    fn rebuild_by_replay_equals_incremental() {
+        // determinismo: indexar 0..N incrementalmente == reconstruir do zero.
+        let build = |n: u64| {
+            let mut idx = AttrIndex::new();
+            for i in 0..n {
+                idx.apply(i, &ep(&format!("cnpj{}", i % 3), &format!("nome{i}")));
+            }
+            idx
+        };
+        let a = build(30);
+        let mut b = AttrIndex::new();
+        b.reset();
+        for i in 0..30u64 {
+            b.apply(i, &ep(&format!("cnpj{}", i % 3), &format!("nome{i}")));
+        }
+        assert_eq!(a.lookup("cnpj", "cnpj0"), b.lookup("cnpj", "cnpj0"));
+        assert_eq!(a.lookup("cnpj", "cnpj0"), &[0, 3, 6, 9, 12, 15, 18, 21, 24, 27]);
+    }
+}
