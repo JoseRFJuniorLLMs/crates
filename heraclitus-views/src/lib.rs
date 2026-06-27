@@ -86,17 +86,29 @@ impl ViewRegistry {
             .map(|v| self.watermarks.get(v.name()).map(|w| w + 1).unwrap_or(0))
             .min()
             .unwrap_or(0);
-        let events = log.scan(from, u64::MAX)?;
-        let mut applied = 0;
-        for (lsn, ep) in &events {
-            for v in self.views.iter_mut() {
-                let wm = self.watermarks.get(v.name()).copied();
-                if wm.is_none() || *lsn > wm.unwrap() {
-                    v.apply(*lsn, ep);
-                    self.watermarks.insert(v.name().to_string(), *lsn);
-                    applied += 1;
+        // Paginado: varre o log em janelas de 100k (NÃO materializa milhões de
+        // episódios num único Vec — limita o pico de RAM do arranque, que era o
+        // `alloc` gigante que estourava em logs grandes).
+        let head = log.head();
+        let mut applied = 0u64;
+        let mut cur = from;
+        while cur <= head {
+            let batch = log.scan_capped(cur, head + 1, 100_000)?;
+            if batch.is_empty() {
+                break;
+            }
+            let last = batch.last().unwrap().0;
+            for (lsn, ep) in &batch {
+                for v in self.views.iter_mut() {
+                    let wm = self.watermarks.get(v.name()).copied();
+                    if wm.is_none() || *lsn > wm.unwrap() {
+                        v.apply(*lsn, ep);
+                        self.watermarks.insert(v.name().to_string(), *lsn);
+                        applied += 1;
+                    }
                 }
             }
+            cur = last + 1;
         }
         self.persist_watermarks()?;
         Ok(applied)

@@ -1,13 +1,15 @@
 //! heraclitus-server — gRPC (tonic) + minimal REST (axum), §3.14.
 //! The server composes; the storage knows nothing about HTTP or LLMs.
 
+pub mod boot;
 pub mod engine;
 pub mod grpc;
 pub mod rest;
 
 pub use engine::Engine;
 
-use heraclitus_core::{HeraclitusConfig, HeraclitusError};
+use crate::boot::{group, Boot};
+use heraclitus_core::{FsyncPolicy, HeraclitusConfig, HeraclitusError};
 use heraclitus_proto::v1::heraclitus_server::HeraclitusServer;
 use std::sync::Arc;
 use tonic::{Request, Status};
@@ -22,7 +24,28 @@ pub async fn serve(
     config: HeraclitusConfig,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), HeraclitusError> {
-    let engine = Arc::new(Engine::open(&config)?);
+    serve_with(config, shutdown, Boot::auto()).await
+}
+
+/// Like [`serve`], but with an explicit boot narrator. `serve` uses
+/// [`Boot::auto`] (a pretty console boot on a TTY, plain `tracing` otherwise);
+/// pass [`Boot::silent`] to suppress the startup narration entirely.
+#[allow(clippy::result_large_err)]
+pub async fn serve_with(
+    config: HeraclitusConfig,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    boot: Boot,
+) -> Result<(), HeraclitusError> {
+    boot.banner(env!("CARGO_PKG_VERSION"));
+    let fsync = match &config.fsync {
+        FsyncPolicy::Always => "fsync sempre (durabilidade máxima)".to_string(),
+        FsyncPolicy::GroupCommit { interval_ms } => format!("group-commit a cada {interval_ms}ms"),
+    };
+    boot.info_line("Dados", &config.data_dir.display().to_string());
+    boot.info_line("Durabilidade", &fsync);
+    boot.info_line("Memtable", &format!("{} eventos", group(config.memtable_cap as u64)));
+
+    let engine = Arc::new(Engine::open_with_boot(&config, &boot)?);
 
     let grpc_addr: std::net::SocketAddr = config
         .grpc_addr
@@ -38,7 +61,7 @@ pub async fn serve(
     // interceptor is a no-op (default — backward compatible, localhost bind).
     let expected_auth = config.auth_token.clone().map(|t| format!("Bearer {t}"));
     if expected_auth.is_some() {
-        tracing::info!("gRPC bearer-token authentication ENABLED");
+        boot.warn_line("Auth gRPC", "Bearer token EXIGIDO em cada chamada");
     }
     let auth = move |req: Request<()>| -> Result<Request<()>, Status> {
         match &expected_auth {
@@ -62,6 +85,7 @@ pub async fn serve(
     let rest = rest::router(engine.clone());
 
     let rest_listener = tokio::net::TcpListener::bind(rest_addr).await?;
+    boot.ok_line("Servidor REST (axum)", &format!("http://{rest_addr}"));
     let rest_task = tokio::spawn(async move {
         let _ = axum::serve(rest_listener, rest).await;
     });
@@ -85,9 +109,9 @@ pub async fn serve(
             config.compliance_min_lsn_step,
             config.data_dir.join("receipts"),
         );
-        tracing::info!(
-            mode = %config.compliance_tsa_mode,
-            "compliance: daemon de carimbo de tempo ATIVO"
+        boot.warn_line(
+            "Compliance RFC 3161",
+            &format!("carimbo de tempo ATIVO · modo {}", config.compliance_tsa_mode),
         );
         let log = engine.log.clone();
         Some(tokio::spawn(run_worker(
@@ -100,7 +124,8 @@ pub async fn serve(
         None
     };
 
-    tracing::info!(%grpc_addr, %rest_addr, "heraclitus-server up");
+    boot.ok_line("Servidor gRPC (tonic)", &grpc_addr.to_string());
+    boot.ready(&grpc_addr.to_string(), &rest_addr.to_string());
     tonic::transport::Server::builder()
         .add_service(svc)
         .serve_with_shutdown(grpc_addr, shutdown)

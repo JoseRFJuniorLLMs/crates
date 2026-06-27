@@ -17,6 +17,7 @@ path = "src/bin/service.rs"
 
 [dependencies]
 heraclitus-core = { workspace = true }
+heraclitus-btree = { workspace = true }
 heraclitus-compliance = { workspace = true }
 heraclitus-crypto = { workspace = true }
 heraclitus-log = { workspace = true }

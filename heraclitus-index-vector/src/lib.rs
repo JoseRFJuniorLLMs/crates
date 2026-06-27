@@ -247,6 +247,69 @@ impl VectorIndex {
             .collect()
     }
 
+    /// Exact Top-k by brute-force over ALL points, accelerated by the GPU when
+    /// available (M20.3.1b2). The GPU computes the batch product-manifold
+    /// distance (RECALL, ≥30× oversample) via `heraclitus_gpu::topm_product`; the
+    /// CPU then rescores the candidates with the exact f64 [`ProductMetric`] and
+    /// has the final say — so the result is the true nearest set regardless of
+    /// GPU float precision. Without a GPU it falls back to a CPU brute-force.
+    /// The approximate HNSW [`search`](Self::search) is never affected.
+    pub fn search_exact_gpu(&self, query: &ProductPoint, k: usize) -> Vec<VectorHit> {
+        if self.nodes.is_empty() || k == 0 {
+            return Vec::new();
+        }
+        let (a, b, c) = (query.hyp.len(), query.sph.len(), query.euc.len());
+        let dim = a + b + c;
+
+        let mut qflat = Vec::with_capacity(dim);
+        qflat.extend_from_slice(&query.hyp);
+        qflat.extend_from_slice(&query.sph);
+        qflat.extend_from_slice(&query.euc);
+
+        let mut vflat = Vec::with_capacity(self.nodes.len() * dim);
+        for node in &self.nodes {
+            if node.point.hyp.len() != a || node.point.sph.len() != b || node.point.euc.len() != c {
+                // Heterogeneous point layout — stay exact via the CPU metric.
+                return self.rescore(query, 0..self.nodes.len(), k);
+            }
+            vflat.extend_from_slice(&node.point.hyp);
+            vflat.extend_from_slice(&node.point.sph);
+            vflat.extend_from_slice(&node.point.euc);
+        }
+
+        let sig = heraclitus_gpu::ProductSig {
+            a,
+            b,
+            c,
+            c1: (-self.metric.sig.k1) as f32,
+            k2: self.metric.sig.k2 as f32,
+            weights: [
+                self.metric.sig.weights[0] as f32,
+                self.metric.sig.weights[1] as f32,
+                self.metric.sig.weights[2] as f32,
+            ],
+            ball_eps: heraclitus_manifold::BALL_EPS as f32,
+        };
+
+        // GPU RECALL with ≥30× oversample, then exact f64 CPU rescore (final say).
+        let m = k.saturating_mul(30).min(self.nodes.len());
+        let cands = heraclitus_gpu::topm_product(&qflat, &vflat, &sig, m, 1e6);
+        self.rescore(query, cands.iter().map(|c| c.index as usize), k)
+    }
+
+    /// Rescore candidate internal ids with the exact f64 metric, take Top-k.
+    fn rescore(&self, query: &ProductPoint, cand: impl Iterator<Item = usize>, k: usize) -> Vec<VectorHit> {
+        let mut scored: Vec<(f64, usize)> = cand
+            .map(|i| (self.metric.dist(query, &self.nodes[i].point), i))
+            .collect();
+        scored.sort_by(|x, y| x.0.total_cmp(&y.0));
+        scored.truncate(k);
+        scored
+            .into_iter()
+            .map(|(d, i)| VectorHit { id: self.ids[i], lsn: self.lsns[i], dist: d as f32 })
+            .collect()
+    }
+
     /// Internal id for an event (to build filter bitmaps).
     pub fn internal_id(&self, event: &EventId) -> Option<u32> {
         self.by_event.get(event).copied()
@@ -365,5 +428,41 @@ mod tests {
             hits.iter().map(|h| h.id).collect::<Vec<_>>()
         };
         assert_eq!(build(), build(), "same input order must give same index");
+    }
+
+    /// M20.3.1b2 GATE: GPU-accelerated exact search must equal the f64
+    /// brute-force ground truth over the *full* product metric (hyp+sph+euc).
+    /// With `--features gpu` on real hardware this validates the wired GPU RECALL
+    /// + CPU rescore; without it, the CPU fallback. Either way the HNSW
+    /// `search()` is untouched.
+    #[test]
+    fn search_exact_gpu_matches_bruteforce() {
+        let metric = ProductMetric::default();
+        let mut idx = VectorIndex::new(metric.clone());
+        // Well-separated product points: hyp, sph and euc all move with i.
+        let mk = |i: usize| -> ProductPoint {
+            let fi = i as f32;
+            ProductPoint {
+                hyp: vec![fi * 0.004, fi * 0.003],
+                sph: vec![(fi * 0.02).cos(), (fi * 0.02).sin()],
+                euc: vec![fi * 0.2, fi * 0.1],
+            }
+        };
+        let mut ids = Vec::new();
+        for i in 0..120usize {
+            let id = EventId(ulid::Ulid::from_parts(i as u64, i as u128));
+            ids.push(id);
+            idx.insert(id, i as u64, mk(i));
+        }
+        let query = mk(0);
+        let k = 8;
+
+        // Ground truth: exact f64 brute-force with the REAL ProductMetric.
+        let mut gt: Vec<(f64, usize)> = (0..120).map(|i| (metric.dist(&query, &mk(i)), i)).collect();
+        gt.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let gt_ids: Vec<EventId> = gt.iter().take(k).map(|(_, i)| ids[*i]).collect();
+
+        let got: Vec<EventId> = idx.search_exact_gpu(&query, k).iter().map(|h| h.id).collect();
+        assert_eq!(got, gt_ids, "GPU-accelerated exact search must equal f64 brute-force");
     }
 }

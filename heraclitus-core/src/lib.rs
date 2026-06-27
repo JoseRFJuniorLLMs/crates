@@ -9,6 +9,7 @@ pub mod error;
 pub mod event;
 pub mod hlc;
 pub mod id;
+pub mod vm;
 
 pub use config::{FsyncPolicy, HeraclitusConfig};
 pub use error::HeraclitusError;

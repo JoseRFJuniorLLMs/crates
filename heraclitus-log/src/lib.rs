@@ -7,6 +7,7 @@
 //! torn-write recovery on open (truncate at first crc mismatch).
 
 pub mod format;
+pub mod vm_bridge;
 
 use format::{Decoded, SegmentFooter, SegmentHeader, FOOTER_LEN, HEADER_LEN};
 use heraclitus_core::{Episode, FsyncPolicy, HeraclitusError, Hlc, Lsn, SegmentId};

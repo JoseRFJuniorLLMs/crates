@@ -43,6 +43,13 @@ fn apply_path_defaults() {
     if std::env::var_os("HERACLITUS_DATA_DIR").is_none() {
         std::env::set_var("HERACLITUS_DATA_DIR", base.join("data"));
     }
+    // The service writes execution to a structured daily log file (and, in
+    // console mode, to stdout too). Force the plain boot so the fancy console
+    // sequence (spinner, ANSI, banner) never lands in the log; the standalone
+    // `heraclitus-server` binary doesn't call this and keeps the pretty boot.
+    if std::env::var_os("HERACLITUS_PLAIN_BOOT").is_none() {
+        std::env::set_var("HERACLITUS_PLAIN_BOOT", "1");
+    }
 }
 
 #[cfg(windows)]

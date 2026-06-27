@@ -3,6 +3,7 @@
 
 use heraclitus_activation::ActivationStore;
 use heraclitus_core::{Episode, EventKind, HeraclitusConfig, HeraclitusError, Lsn, ProductPoint};
+use heraclitus_core::vm::{ConsistencyVirtualMachine, VmInstruction, VmState, VmVersion};
 use heraclitus_crypto::KeyStore;
 use heraclitus_index_graph::entity::EntityResolver;
 use heraclitus_index_graph::temporal::TemporalGraph;
@@ -10,6 +11,7 @@ use heraclitus_index_attr::AttrIndex;
 use heraclitus_index_graph::GraphIndex;
 use heraclitus_index_text::TextIndex;
 use heraclitus_index_vector::VectorIndex;
+use heraclitus_log::vm_bridge;
 use heraclitus_log::Log;
 use heraclitus_manifold::ProductMetric;
 use heraclitus_memtable::Memtable;
@@ -42,6 +44,10 @@ pub struct Engine {
     metric: ProductMetric,
     /// Per-agent key store when encryption at rest is enabled (§3.10).
     keystore: Option<Arc<KeyStore>>,
+    /// Modo bulk-ingest: `append` grava SÓ no log (pula memtable/views/attr em
+    /// RAM). Liga com HERACLITUS_LOG_ONLY=1 — permite cargas massivas (centenas
+    /// de GB) com RAM limitada; as views se constroem depois via `view rebuild`.
+    log_only: bool,
 }
 
 /// Wrapper so the same index object can be both registered as a View and
@@ -76,64 +82,177 @@ impl<T: View> View for Shared<T> {
 }
 
 impl Engine {
+    /// Open the engine silently (tests, the CLI, embedded callers). For the
+    /// narrated server boot use [`Engine::open_with_boot`].
     pub fn open(config: &HeraclitusConfig) -> Result<Self, HeraclitusError> {
+        Self::open_with_boot(config, &crate::boot::Boot::silent())
+    }
+
+    /// Open the engine while narrating each subsystem through `boot`. The server
+    /// passes a console reporter (banner, `[  OK  ]` lines, spinner on the slow
+    /// replay phases); `open` passes a silent one so nothing leaks into tests.
+    pub fn open_with_boot(
+        config: &HeraclitusConfig,
+        boot: &crate::boot::Boot,
+    ) -> Result<Self, HeraclitusError> {
+        use crate::boot::{fmt_bytes, group, sup};
+
+        // Modo recovery para stores grandes demais p/ a RAM: pula o replay das
+        // views pesadas (que vivem 100% em RAM) e a (re)construção do índice de
+        // atributos. O banco sobe servindo o log (a fonte da verdade); as views
+        // ficam vazias até um `view rebuild`. Liga com HERACLITUS_SKIP_VIEW_REPLAY=1.
+        let truthy = |k: &str| {
+            std::env::var(k)
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+                .unwrap_or(false)
+        };
+        // Bulk-ingest: appends gravam só no log. Implica pular o replay no boot.
+        let log_only = truthy("HERACLITUS_LOG_ONLY");
+        let skip_replay = log_only || truthy("HERACLITUS_SKIP_VIEW_REPLAY");
+
         // Encryption at rest (§3.10): when enabled, the log seals episode
         // content with a per-agent key kept under `<data_dir>/keys`.
         let keystore = if config.encryption_at_rest {
-            Some(KeyStore::open(config.data_dir.join("keys"))?)
+            let p = boot.phase("Cifra em repouso (keystore por agente)");
+            let ks = KeyStore::open(config.data_dir.join("keys"))?;
+            p.ok("ChaCha20-Poly1305 · crypto-shred pronto");
+            Some(ks)
         } else {
             None
         };
-        let log = Arc::new(Log::open_with_keystore(
-            config.data_dir.join("log"),
-            config.segment_max_bytes,
-            config.fsync.clone(),
-            keystore.clone(),
-        )?);
-        let metric = ProductMetric::default();
-        let vector = Arc::new(Mutex::new(VectorIndex::new(metric.clone())));
-        let text = Arc::new(Mutex::new(TextIndex::new()));
-        let graph = Arc::new(Mutex::new(GraphIndex::new()));
-        let tgraph = Arc::new(Mutex::new(TemporalGraph::new()));
-        let entity = Arc::new(Mutex::new(EntityResolver::new()));
-        let activation = Arc::new(Mutex::new(ActivationStore::new(config.activation_decay)));
 
-        let mut registry = ViewRegistry::open(&config.data_dir)?;
-        registry.register(Box::new(Shared(vector.clone())));
-        registry.register(Box::new(Shared(text.clone())));
-        registry.register(Box::new(Shared(graph.clone())));
-        registry.register(Box::new(Shared(tgraph.clone())));
-        registry.register(Box::new(Shared(entity.clone())));
-        registry.register(Box::new(Shared(activation.clone())));
-        registry.catch_up(&log)?;
+        let log = {
+            let p = boot.phase("Log append-only (a fonte da verdade)");
+            let log = Arc::new(Log::open_with_keystore(
+                config.data_dir.join("log"),
+                config.segment_max_bytes,
+                config.fsync.clone(),
+                keystore.clone(),
+            )?);
+            let head = log.head();
+            p.ok(format!(
+                "{} eventos · head LSN {} · segmentos de {}",
+                group(head),
+                group(head),
+                fmt_bytes(config.segment_max_bytes)
+            ));
+            log
+        };
+
+        // The geometry announces itself: the learned product manifold signature.
+        let metric = {
+            let p = boot.phase("Geometria de produto (variedade aprendida)");
+            let m = ProductMetric::default();
+            let s = &m.sig;
+            p.ok(format!(
+                "H{}⊗S{}⊗E{} · Poincaré κ={} · esfera κ=+{} · {} dims",
+                sup(s.a),
+                sup(s.b),
+                sup(s.c),
+                s.k1,
+                s.k2,
+                s.a + s.b + s.c
+            ));
+            m
+        };
+
+        let vector = {
+            let p = boot.phase("Índice vetorial (HNSW hiperbólico)");
+            let v = Arc::new(Mutex::new(VectorIndex::new(metric.clone())));
+            p.ok("k-NN no espaço de produto");
+            v
+        };
+        let text = {
+            let p = boot.phase("Índice de texto (invertido)");
+            let t = Arc::new(Mutex::new(TextIndex::new()));
+            p.ok("recall em duas fases");
+            t
+        };
+        let graph = {
+            let p = boot.phase("Índice de grafo (proveniência DAG)");
+            let g = Arc::new(Mutex::new(GraphIndex::new()));
+            p.ok("WHY · arestas de origem");
+            g
+        };
+        let tgraph = {
+            let p = boot.phase("Grafo temporal (consultas AS OF)");
+            let g = Arc::new(Mutex::new(TemporalGraph::new()));
+            p.ok("arestas com intervalos de validade");
+            g
+        };
+        let entity = {
+            let p = boot.phase("Resolução de entidades");
+            let e = Arc::new(Mutex::new(EntityResolver::new()));
+            p.ok("merge/cluster por chave");
+            e
+        };
+        let activation = {
+            let p = boot.phase("Ativação ACT-R (memória cognitiva)");
+            let a = Arc::new(Mutex::new(ActivationStore::new(config.activation_decay)));
+            p.ok(format!("decaimento d={}", config.activation_decay));
+            a
+        };
+
+        // The slow phase on a big log: replay the tail into every view. The
+        // spinner moves here while millions of events stream through.
+        let registry = {
+            let p = boot.phase("Replay das views a partir do log");
+            let mut registry = ViewRegistry::open(&config.data_dir)?;
+            registry.register(Box::new(Shared(vector.clone())));
+            registry.register(Box::new(Shared(text.clone())));
+            registry.register(Box::new(Shared(graph.clone())));
+            registry.register(Box::new(Shared(tgraph.clone())));
+            registry.register(Box::new(Shared(entity.clone())));
+            registry.register(Box::new(Shared(activation.clone())));
+            if skip_replay {
+                p.ok("PULADO — HERACLITUS_SKIP_VIEW_REPLAY (views vazias; use view rebuild)");
+            } else {
+                registry.catch_up(&log)?;
+                let wm = registry.min_watermark();
+                p.ok(format!("6 views materializadas @ LSN {}", group(wm)));
+            }
+            registry
+        };
 
         // Índice secundário de atributos: carrega o checkpoint e replaya só a
         // cauda (arranque rápido); num log virgem constrói tudo uma vez e grava.
         let attr_dir = config.data_dir.join("views");
-        let attr = Arc::new(Mutex::new(AttrIndex::open(&attr_dir)));
-        {
-            let mut idx = attr.lock().unwrap();
-            // Build PAGINADO: o log é varrido em janelas (não materializa os
-            // milhões de episódios de uma vez — limita a RAM do arranque).
-            let head = log.head();
-            let mut cur = if idx.is_empty() { 0 } else { idx.watermark() };
-            let mut built = false;
-            while cur <= head {
-                let batch = log.scan_capped(cur, head + 1, 100_000)?;
-                if batch.is_empty() {
-                    break;
+        let attr = {
+            let p = boot.phase("Índice de atributos (campo → LSN)");
+            let attr = Arc::new(Mutex::new(AttrIndex::open(&attr_dir)));
+            let keys = {
+                let mut idx = attr.lock().unwrap();
+                if !skip_replay {
+                    // Build PAGINADO: o log é varrido em janelas (não materializa os
+                    // milhões de episódios de uma vez — limita a RAM do arranque).
+                    let head = log.head();
+                    let mut cur = if idx.is_empty() { 0 } else { idx.watermark() };
+                    let mut built = false;
+                    while cur <= head {
+                        let batch = log.scan_capped(cur, head + 1, 100_000)?;
+                        if batch.is_empty() {
+                            break;
+                        }
+                        let last = batch.last().unwrap().0;
+                        for (lsn, ep) in &batch {
+                            idx.apply(*lsn, ep);
+                        }
+                        built = true;
+                        cur = last + 1;
+                    }
+                    if built {
+                        idx.save(&attr_dir)?;
+                    }
                 }
-                let last = batch.last().unwrap().0;
-                for (lsn, ep) in &batch {
-                    idx.apply(*lsn, ep);
-                }
-                built = true;
-                cur = last + 1;
+                idx.keys()
+            };
+            if skip_replay {
+                p.ok(format!("PULADO — {} chaves do checkpoint", group(keys as u64)));
+            } else {
+                p.ok(format!("{} chaves indexadas", group(keys as u64)));
             }
-            if built {
-                idx.save(&attr_dir)?;
-            }
-        }
+            attr
+        };
 
         Ok(Self {
             log,
@@ -149,6 +268,7 @@ impl Engine {
             attr_dir,
             metric,
             keystore,
+            log_only,
         })
     }
 
@@ -156,6 +276,43 @@ impl Engine {
     /// periodicamente / no shutdown para o arranque seguinte só replayar a cauda).
     pub fn checkpoint_attr(&self) -> Result<(), HeraclitusError> {
         self.attr.lock().unwrap().save(&self.attr_dir)
+    }
+
+    // ── H-VM ledger (M20) ────────────────────────────────────────────────────
+    // The Sovereignty-Layer key/value ledger, reachable from the engine. Writes
+    // are H-VM ISA bytecode appended to the *same* durable log as episodes
+    // (`vm_bridge`, additive — the format is untouched); reads replay the log
+    // through the deterministic reducer (read-your-writes via the log being the
+    // truth). State is replayed on demand today; an incremental cache backed by
+    // the Bᵋ-tree checkpoint is the next refinement.
+
+    /// Append an H-VM upsert to the durable log.
+    pub fn hvm_upsert(&self, key: Vec<u8>, val: Vec<u8>) -> Result<Lsn, HeraclitusError> {
+        let lsn = self.log.head();
+        let instr = VmInstruction::Upsert { key, val, lsn, ev_id: heraclitus_core::EventId::new() };
+        vm_bridge::append_instruction(&self.log, VmVersion(1), &instr)
+    }
+
+    /// Append an H-VM delete to the durable log.
+    pub fn hvm_delete(&self, key: Vec<u8>) -> Result<Lsn, HeraclitusError> {
+        let lsn = self.log.head();
+        let instr = VmInstruction::Delete { key, lsn, ev_id: heraclitus_core::EventId::new() };
+        vm_bridge::append_instruction(&self.log, VmVersion(1), &instr)
+    }
+
+    /// Replay the H-VM ledger from the log into a deterministic [`VmState`].
+    pub fn hvm_state(&self) -> Result<VmState, HeraclitusError> {
+        let vm = ConsistencyVirtualMachine::new(VmVersion(1));
+        vm_bridge::replay_vm(&self.log, &vm)
+    }
+
+    /// Materialize the H-VM ledger into a Bᵋ-tree (Fractal Tree) and persist it
+    /// atomically as a checkpoint. Reload with `heraclitus_btree::BEpsilonTree::load`.
+    pub fn hvm_checkpoint(&self, path: &std::path::Path) -> Result<(), HeraclitusError> {
+        let vm = ConsistencyVirtualMachine::new(VmVersion(1));
+        let tree = vm_bridge::replay_vm_to_btree(&self.log, &vm)?;
+        tree.save(path)?;
+        Ok(())
     }
 
     /// Crypto-shred (§3.10): destroy an agent's encryption key so all of its
@@ -173,6 +330,11 @@ impl Engine {
     /// Append + synchronously index into memtable AND views.
     /// Read-your-own-writes holds for every index path.
     pub fn append(&self, episode: Episode) -> Result<Lsn, HeraclitusError> {
+        // Bulk-ingest: grava só no log (RAM limitada p/ cargas massivas). As
+        // views/attr se reconstroem depois do log (a fonte da verdade).
+        if self.log_only {
+            return self.log.append(episode);
+        }
         let lsn = self.log.append(episode.clone())?;
         self.memtable.apply(lsn, episode.clone());
         self.views.lock().unwrap().apply(lsn, &episode);
@@ -538,6 +700,36 @@ mod tests {
             ..Default::default()
         };
         Engine::open(&cfg).unwrap()
+    }
+
+    #[test]
+    fn m20_hvm_ledger_through_engine_survives_reopen_and_checkpoints() {
+        // M20 integration: the H-VM ledger is reachable from the Engine, durable
+        // across a reopen (replay), and checkpointable to a Bᵋ-tree on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("hvm.hbt");
+        {
+            let engine = engine_in(dir.path());
+            engine.hvm_upsert(b"user:1".to_vec(), b"alice".to_vec()).unwrap();
+            engine.hvm_upsert(b"user:2".to_vec(), b"bob".to_vec()).unwrap();
+            engine.hvm_delete(b"user:1".to_vec()).unwrap();
+
+            let state = engine.hvm_state().unwrap();
+            assert_eq!(state.memory_layers.get(b"user:2".as_slice()), Some(&b"bob".to_vec()));
+            assert!(!state.memory_layers.contains_key(b"user:1".as_slice()));
+
+            // Checkpoint to a Bᵋ-tree on disk and verify its contents.
+            engine.hvm_checkpoint(&ckpt).unwrap();
+            let loaded = heraclitus_btree::BEpsilonTree::load(&ckpt).unwrap();
+            assert_eq!(loaded.get(b"user:2"), Some(b"bob".to_vec()));
+            assert_eq!(loaded.get(b"user:1"), None);
+        }
+
+        // Reopen over the same data dir: the ledger replays from the durable log.
+        let engine2 = engine_in(dir.path());
+        let state2 = engine2.hvm_state().unwrap();
+        assert_eq!(state2.memory_layers.get(b"user:2".as_slice()), Some(&b"bob".to_vec()));
+        assert!(!state2.memory_layers.contains_key(b"user:1".as_slice()));
     }
 
     #[test]
