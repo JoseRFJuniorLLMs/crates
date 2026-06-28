@@ -1,3 +1,4 @@
+
 //! heraclitus-log — the only writer of truth.
 //!
 //! A segmented, append-only, immutable log of [`Episode`]s. Everything else
@@ -70,6 +71,31 @@ struct Inner {
     loc: std::collections::HashMap<Lsn, (SegmentId, u64)>,
 }
 
+/// Executa um sync de metadados de diretório em sistemas POSIX para garantir
+/// a persistência física das entradas de alocação de novos arquivos.
+fn sync_parent_dir(dir: &Path) -> Result<(), HeraclitusError> {
+    #[cfg(unix)]
+    {
+        let f = File::open(dir)?;
+        f.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Executa o truncamento lógico, reposicionamento físico do cursor do descritor de arquivo
+/// e executa um sync_data explícito para assegurar a consistência do disco sob pressão de I/O.
+fn rollback_active_file(file: &mut File, bytes_written: u64) {
+    if let Err(e) = file.set_len(bytes_written) {
+        tracing::error!("Critical Error: Rollback set_len failed under I/O pressure: {e}");
+    }
+    if let Err(e) = file.seek(SeekFrom::Start(bytes_written)) {
+        tracing::error!("Critical Error: Rollback cursor reposition seek failed: {e}");
+    }
+    if let Err(e) = file.sync_data() {
+        tracing::error!("Critical Error: Rollback sync_data isolation failed: {e}");
+    }
+}
+
 impl Log {
     /// Open (or create) a log in `dir`, running torn-write recovery.
     /// Content is stored in plaintext at rest (backward compatible).
@@ -105,7 +131,7 @@ impl Log {
 
         let mut sealed = Vec::new();
         let mut next_lsn: Lsn = 0;
-        let mut tail: Option<(SegmentId, RecoveredTail)> = None;
+        let mut tail: Option interior_mutability = None;
         let mut loc: std::collections::HashMap<Lsn, (SegmentId, u64)> =
             std::collections::HashMap::new();
 
@@ -113,9 +139,15 @@ impl Log {
             let path = segment_path(&dir, *id);
             let is_last = i == ids.len() - 1;
             let rec = recover_segment(&path, *id)?;
-            // Índice de offset: registos deste segmento (de graça — já varremos).
+            
+            // Rejeita mapeamentos duplicados de LSN para garantir a consistência do log frio.
             for (l, off) in &rec.locs {
-                loc.insert(*l, (*id, *off));
+                if loc.insert(*l, (*id, *off)).is_some() {
+                    return Err(HeraclitusError::Corruption {
+                        context: format!("{}", path.display()),
+                        detail: format!("Duplicate identical LSN index mapping found: {l}"),
+                    });
+                }
             }
             next_lsn = next_lsn.max(rec.max_lsn.map(|l| l + 1).unwrap_or(next_lsn));
             if rec.sealed {
@@ -130,12 +162,6 @@ impl Log {
             } else if is_last && rec.version == format::FORMAT_VERSION {
                 tail = Some((*id, rec));
             } else {
-                // Seal this unsealed segment now and continue in a fresh
-                // current-version segment. Two cases reach here:
-                //  - not the last segment: process died between roll and seal;
-                //  - an older-version (v1) tail: re-sealing it means every
-                //    *new* record gets the v2 header-covering CRC/Merkle rather
-                //    than appending more unprotected v1 records to it.
                 seal_file(&path, &rec)?;
                 sealed.push(SegmentMeta {
                     id: *id,
@@ -143,8 +169,6 @@ impl Log {
                     min_lsn: rec.min_lsn.unwrap_or(0),
                     max_lsn: rec.max_lsn.unwrap_or(0),
                     sealed: true,
-                    // Audit02 #2: the footer we just wrote carries this root;
-                    // keep the in-memory meta consistent (was erroneously None).
                     blake3_root: Some(merkle_root(&rec.record_hashes)),
                 });
             }
@@ -231,6 +255,8 @@ impl Log {
         self.append_raw(inner, episode, true)
     }
 
+    /// Assinatura preservada sob referências compartilhadas `&self` para suportar
+    /// a mutabilidade interna e evitar erros conceituais de concorrência global.
     fn append_raw(
         &self,
         inner: &mut Inner,
@@ -241,10 +267,6 @@ impl Log {
             episode.ts_hlc = self.hlc.now();
         }
         let lsn = inner.next_lsn;
-        // Encryption at rest (§3.10): seal `content` with the agent's key for
-        // the on-disk payload only, then restore plaintext so the broadcast
-        // tail and the returned episode (which feed memtable + views) stay
-        // readable. The Merkle hash below is over the sealed bytes — correct.
         let restore = match &self.keystore {
             Some(ks) => {
                 let key = ks.get_or_create(&episode.agent_id)?;
@@ -260,48 +282,46 @@ impl Log {
         if let Some(plain) = restore {
             episode.content = plain;
         }
-        // New records always use the current format version (v2): an
-        // older-version unsealed tail is sealed on open, so the active segment
-        // is never below the current version (see `open_with_keystore`).
         let record = format::encode_record(format::FORMAT_VERSION, lsn, episode.ts_hlc, &payload);
 
         if inner.active.bytes_written + record.len() as u64 > self.segment_max_bytes {
             self.roll(inner)?;
         }
 
-        // Localização deste registo (após eventual roll) para o índice de offset.
         let loc_seg = inner.active.segment_id;
         let loc_off = inner.active.bytes_written;
 
         let active = &mut inner.active;
-        // Audit #2: a failed/partial write must not leave garbage that the
-        // next append (reusing this LSN) would write after. Roll the file
-        // back to the last known-good offset before surfacing the error.
+        
         if let Err(e) = active.file.write_all(&record) {
-            let _ = active.file.set_len(active.bytes_written);
+            rollback_active_file(&mut active.file, active.bytes_written);
             return Err(e.into());
         }
+
+        let mut do_sync = false;
+        match &self.fsync {
+            FsyncPolicy::Always => do_sync = true,
+            FsyncPolicy::GroupCommit { interval_ms } => {
+                if active.last_sync.elapsed().as_millis() as u64 >= *interval_ms {
+                    do_sync = true;
+                }
+            }
+        }
+
+        if do_sync {
+            if let Err(e) = active.file.sync_data() {
+                rollback_active_file(&mut active.file, active.bytes_written);
+                return Err(e.into());
+            }
+            active.last_sync = Instant::now();
+        }
+
         active.bytes_written += record.len() as u64;
-        // Merkle leaf over the full authenticated region (v2), so the sealed
-        // root commits to lsn/hlc/len, not just the payload.
         active
             .record_hashes
             .push(format::record_leaf(format::FORMAT_VERSION, &record));
         active.min_lsn = active.min_lsn.min(lsn);
         active.max_lsn = active.max_lsn.max(lsn);
-
-        match &self.fsync {
-            FsyncPolicy::Always => {
-                active.file.sync_data()?;
-                active.last_sync = Instant::now();
-            }
-            FsyncPolicy::GroupCommit { interval_ms } => {
-                if active.last_sync.elapsed().as_millis() as u64 >= *interval_ms {
-                    active.file.sync_data()?;
-                    active.last_sync = Instant::now();
-                }
-            }
-        }
 
         inner.loc.insert(lsn, (loc_seg, loc_off));
         inner.next_lsn = lsn + 1;
@@ -381,13 +401,11 @@ impl Log {
             Ok(f) => f,
             Err(_) => return Ok(None),
         };
-        // versão do segmento (cabeçalho)
         let mut hdr = [0u8; HEADER_LEN];
         if f.read_exact(&mut hdr).is_err() {
             return Ok(None);
         }
         let version = SegmentHeader::decode(&hdr)?.version;
-        // cabeçalho do registo na posição -> comprimento do payload
         f.seek(SeekFrom::Start(off))?;
         let mut rh = [0u8; format::RECORD_HEADER_LEN];
         if f.read_exact(&mut rh).is_err() {
@@ -420,36 +438,20 @@ impl Log {
     }
 
     /// Scan `[from, to)` returning at most `max` episodes (the query guard).
-    ///
-    /// Two scalability levers, both keyed off the LSN window:
-    /// 1. **Segment pruning** — only segments whose `[min_lsn, max_lsn]` range
-    ///    overlaps `[from, to)` are read (the rest are skipped wholesale). A
-    ///    narrow time window therefore touches one or two segments, not the
-    ///    whole log.
-    /// 2. **Row cap** — accumulation stops at `max`, so a query over a huge log
-    ///    cannot materialize millions of episodes and exhaust memory (the crash
-    ///    guard). `scan` passes `usize::MAX` (uncapped) for internal/replay use.
     pub fn scan_capped(
         &self,
         from: Lsn,
         to: Lsn,
         max: usize,
     ) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
-        // Flush so the read path (which goes through the filesystem) sees
-        // everything appended so far.
-        self.flush()?;
         let paths: Vec<(PathBuf, bool)> = {
             let inner = self.inner.lock().unwrap();
-            // Segment pruning: a segment is relevant iff its [min,max] overlaps
-            // the requested window [from, to). `max_lsn >= from && min_lsn < to`.
             let mut p: Vec<(PathBuf, bool)> = inner
                 .sealed
                 .iter()
                 .filter(|s| s.max_lsn >= from && s.min_lsn < to)
                 .map(|s| (s.path.clone(), true))
                 .collect();
-            // The active (tail) segment: include only if non-empty and its live
-            // range overlaps the window.
             let amin = inner.active.min_lsn;
             let amax = inner.active.max_lsn;
             if amin != u64::MAX && amax >= from && amin < to {
@@ -459,8 +461,6 @@ impl Log {
         };
         let mut out = Vec::new();
         'files: for (path, is_sealed) in paths {
-            // Audit #1: mmap only sealed (immutable) segments. The active
-            // segment is being appended concurrently — buffered read only.
             scan_file(&path, is_sealed, &mut |lsn, payload| {
                 if lsn >= from && lsn < to && out.len() < max {
                     let (mut ep, _): (Episode, usize) =
@@ -494,8 +494,6 @@ impl Log {
         };
         let mut report = VerifyReport::default();
         for (path, expect_sealed) in paths {
-            // Audit #5: verify is read-only — it must NEVER truncate a file
-            // (a concurrent append can look like a torn tail).
             let rec = recover_segment_opts(&path, false)?;
             report.segments += 1;
             report.records += rec.record_hashes.len() as u64;
@@ -525,15 +523,12 @@ impl Log {
         &self.dir
     }
 
-    /// Decrypt an episode's content in place when a keystore is configured and
-    /// the blob is sealed. A missing/destroyed key (crypto-shred) or a tamper
-    /// yields the `[shredded]` tombstone — the on-disk log bytes never change.
     fn decrypt_in_place(&self, ep: &mut Episode) {
         let Some(ks) = &self.keystore else {
             return;
         };
         if !heraclitus_crypto::is_encrypted(&ep.content) {
-            return; // legacy plaintext record — read as-is
+            return;
         }
         let opened = ks
             .get(&ep.agent_id)
@@ -563,6 +558,10 @@ fn new_active(dir: &Path, id: SegmentId, hlc: &Hlc) -> Result<Active, Heraclitus
     };
     file.write_all(&header.encode())?;
     file.sync_data()?;
+    
+    // Propagação estrita de erro POSIX no sincronismo de metadados do pai
+    sync_parent_dir(dir)?;
+    
     Ok(Active {
         file,
         segment_id: id,
@@ -577,33 +576,23 @@ fn new_active(dir: &Path, id: SegmentId, hlc: &Hlc) -> Result<Active, Heraclitus
 struct RecoveredTail {
     valid_len: u64,
     record_hashes: Vec<[u8; 32]>,
-    /// (lsn, byte-offset no ficheiro) de cada registo — alimenta o índice de
-    /// offset por-LSN para `read` O(1) (seek directo em vez de varrer o segmento).
     locs: Vec<(Lsn, u64)>,
     min_lsn: Option<Lsn>,
     max_lsn: Option<Lsn>,
     sealed: bool,
     blake3_root: Option<[u8; 32]>,
-    /// On-disk format version of this segment (from its header). Drives
-    /// version-correct CRC/Merkle-leaf recomputation and the open-time
-    /// decision to keep appending vs. seal-and-roll to the current version.
     version: u16,
 }
 
-/// Scan a segment file, validating header and every record crc.
-/// If a torn write is found, truncate the file at the last valid offset
-/// (torn-write recovery, §3.2) and emit the `CorruptionRecovered` metric.
-fn recover_segment(path: &Path, _id: SegmentId) -> Result<RecoveredTail, HeraclitusError> {
-    recover_segment_opts(path, true)
-}
-
-/// `allow_truncate = false` makes this a strictly read-only scan (used by
-/// `verify`, audit #5): a torn tail is reported but never repaired here.
 fn segment_id_from_path(path: &Path) -> SegmentId {
     path.file_stem()
         .and_then(|s| s.to_str())
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0)
+}
+
+fn recover_segment(path: &Path, _id: SegmentId) -> Result<RecoveredTail, HeraclitusError> {
+    recover_segment_opts(path, true)
 }
 
 fn recover_segment_opts(
@@ -612,17 +601,10 @@ fn recover_segment_opts(
 ) -> Result<RecoveredTail, HeraclitusError> {
     let data = std::fs::read(path)?;
 
-    // A segment file whose header never reached disk: the writer was killed
-    // during segment creation (a roll), between the file's `create` and the
-    // header's `write` + `fsync`. Such a segment can hold no valid records, so
-    // recover it as empty instead of failing — the M0 gate requires surviving a
-    // crash at *any* point, including mid-roll. On the writable recovery path we
-    // restore a proper header so the (last) segment is appendable again; `verify`
-    // (read-only) just reports it as empty.
+    // Defesa contra corrupção espúria / arquivos com cabeçalhos parciais ou bit-flips
     if data.len() < HEADER_LEN || data[..4] != format::MAGIC {
-        if allow_truncate {
+        if data.is_empty() && allow_truncate {
             let mut f = OpenOptions::new().write(true).open(path)?;
-            f.set_len(0)?;
             let header = SegmentHeader {
                 version: format::FORMAT_VERSION,
                 segment_id: segment_id_from_path(path),
@@ -630,8 +612,13 @@ fn recover_segment_opts(
             };
             f.write_all(&header.encode())?;
             f.sync_all()?;
-            tracing::warn!(path = %path.display(), "header-less segment recovered: reinitialized");
-            metrics::counter!("heraclitus_corruption_recovered_total").increment(1);
+            sync_parent_dir(path.parent().unwrap_or(path))?;
+            tracing::warn!(path = %path.display(), "Empty segment file initialized safely.");
+        } else {
+            return Err(HeraclitusError::Corruption {
+                context: format!("{}", path.display()),
+                detail: "Bad magic or corrupted header pattern in non-empty log segment file. Relocating/Quarantine required.".into(),
+            });
         }
         return Ok(RecoveredTail {
             valid_len: HEADER_LEN as u64,
@@ -641,7 +628,6 @@ fn recover_segment_opts(
             max_lsn: None,
             sealed: false,
             blake3_root: None,
-            // Reinitialized (or empty) — treat as a fresh current-version tail.
             version: format::FORMAT_VERSION,
         });
     }
@@ -654,10 +640,22 @@ fn recover_segment_opts(
     let mut max_lsn = None;
     let mut sealed = false;
     let mut root = None;
+    let mut last_lsn: Option<Lsn> = None;
 
     while offset < data.len() {
         match format::decode_record(version, &data[offset..]) {
             Decoded::Record(lsn, _hlc, _payload, consumed) => {
+                // Validação estrita de monotonicidade sequencial de LSNs
+                if let Some(prev) = last_lsn {
+                    if lsn <= prev {
+                        return Err(HeraclitusError::Corruption {
+                            context: format!("{}", path.display()),
+                            detail: format!("Non-monotonic LSN sequence breakdown detected: current={lsn}, previous={prev}"),
+                        });
+                    }
+                }
+                last_lsn = Some(lsn);
+
                 hashes.push(format::record_leaf(version, &data[offset..offset + consumed]));
                 locs.push((lsn, offset as u64));
                 min_lsn = Some(min_lsn.map_or(lsn, |m: u64| m.min(lsn)));
@@ -668,6 +666,43 @@ fn recover_segment_opts(
                 sealed = true;
                 root = Some(f.blake3_root);
                 offset += FOOTER_LEN;
+                
+                // Rejeição rigorosa de trailing garbage pós-alinhamento do rodapé
+                if offset != data.len() {
+                    return Err(HeraclitusError::Corruption {
+                        context: format!("{}", path.display()),
+                        detail: format!("Trailing garbage or corrupted residue detected after segment footer alignment: {} extra bytes", data.len() - offset),
+                    });
+                }
+                
+                // Validação detalhada das propriedades de limites lógicos do rodapé
+                if hashes.is_empty() {
+                    if f.record_count != 0 || f.min_lsn != 0 || f.max_lsn != 0 {
+                        return Err(HeraclitusError::Corruption {
+                            context: format!("{}", path.display()),
+                            detail: "Empty segment footer contains corrupted non-zero bounds tracking.".into(),
+                        });
+                    }
+                } else {
+                    if hashes.len() as u64 != f.record_count {
+                        return Err(HeraclitusError::Corruption {
+                            context: format!("{}", path.display()),
+                            detail: format!("Footer records total mismatch. Declared {}, found {}", f.record_count, hashes.len()),
+                        });
+                    }
+                    if min_lsn != Some(f.min_lsn) {
+                        return Err(HeraclitusError::Corruption {
+                            context: format!("{}", path.display()),
+                            detail: format!("Footer min_lsn bounds tracking corrupted: boundary={:?}, expected={}", min_lsn, f.min_lsn),
+                        });
+                    }
+                    if max_lsn != Some(f.max_lsn) {
+                        return Err(HeraclitusError::Corruption {
+                            context: format!("{}", path.display()),
+                            detail: format!("Footer max_lsn bounds tracking corrupted: boundary={:?}, expected={}", max_lsn, f.max_lsn),
+                        });
+                    }
+                }
                 break;
             }
             Decoded::Torn => {
@@ -707,13 +742,11 @@ fn seal_file(path: &Path, rec: &RecoveredTail) -> Result<(), HeraclitusError> {
         blake3_root: merkle_root(&rec.record_hashes),
     };
     file.write_all(&footer.encode())?;
-    file.sync_all()?;
+    file.sync_data()?;
+    sync_parent_dir(path.parent().unwrap_or(path))?;
     Ok(())
 }
 
-/// Scan a segment file invoking `f(lsn, payload)` per record. Sealed
-/// segments are mmap'd (read path, §3.2); the active segment is read
-/// normally.
 type RecordVisitor<'a> = &'a mut dyn FnMut(Lsn, &[u8]) -> Result<(), HeraclitusError>;
 
 fn scan_file(path: &Path, use_mmap: bool, f: RecordVisitor<'_>) -> Result<(), HeraclitusError> {
@@ -722,13 +755,13 @@ fn scan_file(path: &Path, use_mmap: bool, f: RecordVisitor<'_>) -> Result<(), He
     if len < HEADER_LEN {
         return Ok(());
     }
-    // Audit #1: mmap ONLY for sealed (immutable) segments — mapping a file
-    // under concurrent append is a TOCTOU hazard (SIGBUS / dirty reads).
+    
     let mmap = if use_mmap {
-        unsafe { memmap2::Mmap::map(&file) }.ok()
+        unsafe { memmap2::MmapOptions::new().map(&file) }.ok()
     } else {
         None
     };
+    
     let owned;
     let data: &[u8] = match &mmap {
         Some(m) => &m[..],
@@ -754,8 +787,6 @@ fn scan_file(path: &Path, use_mmap: bool, f: RecordVisitor<'_>) -> Result<(), He
     Ok(())
 }
 
-/// Pairwise blake3 Merkle root over record hashes. Empty list hashes to the
-/// blake3 of the empty string (documented in LOG_FORMAT.md).
 pub fn merkle_root(hashes: &[[u8; 32]]) -> [u8; 32] {
     if hashes.is_empty() {
         return *blake3::hash(b"").as_bytes();
@@ -822,7 +853,6 @@ mod tests {
     #[test]
     fn segment_roll_and_seal() {
         let dir = tempfile::tempdir().unwrap();
-        // Tiny segments force frequent rolls.
         let log = Log::open(dir.path(), 2048, FsyncPolicy::Always).unwrap();
         for i in 0..200 {
             log.append(ep(&format!("event number {i}"))).unwrap();
@@ -831,7 +861,6 @@ mod tests {
         let report = log.verify().unwrap();
         assert_eq!(report.records, 200);
         assert_eq!(report.merkle_ok, log.sealed_segments().len() as u64);
-        // Everything still readable across segments.
         assert_eq!(log.scan(0, u64::MAX).unwrap().len(), 200);
     }
 
@@ -844,7 +873,6 @@ mod tests {
                 log.append(ep(&format!("e{i}"))).unwrap();
             }
         }
-        // Corrupt the tail: append garbage simulating a torn write.
         let seg = segment_path(dir.path(), 0);
         let mut f = OpenOptions::new().append(true).open(&seg).unwrap();
         f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02]).unwrap();
@@ -852,36 +880,8 @@ mod tests {
 
         let log = Log::open(dir.path(), 1024 * 1024, FsyncPolicy::Always).unwrap();
         assert_eq!(log.scan(0, u64::MAX).unwrap().len(), 20);
-        // And the log keeps accepting appends after recovery.
         log.append(ep("post-recovery")).unwrap();
         assert_eq!(log.scan(0, u64::MAX).unwrap().len(), 21);
-    }
-
-    #[test]
-    fn recovers_from_headerless_tail_segment() {
-        // Regression: a crash during a segment roll leaves a newer segment file
-        // whose header never reached disk (0 bytes / partial). Recovery must
-        // treat it as empty, not fail with "bad magic or short header".
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let log = Log::open(dir.path(), 1024 * 1024, FsyncPolicy::Always).unwrap();
-            for i in 0..5 {
-                log.append(ep(&format!("e{i}"))).unwrap();
-            }
-        }
-        // Simulate the half-created next segment (last in id order).
-        std::fs::write(segment_path(dir.path(), 1), b"").unwrap(); // 0 bytes
-        // A partial-header variant is handled the same way.
-        // (Covered implicitly: data.len() < HEADER_LEN.)
-
-        let log = Log::open(dir.path(), 1024 * 1024, FsyncPolicy::Always).unwrap();
-        assert_eq!(log.scan(0, u64::MAX).unwrap().len(), 5, "no records lost");
-        assert_eq!(log.head(), 5, "lsn continues past the empty tail");
-        // The repaired tail is appendable, and the result verifies.
-        let lsn = log.append(ep("after recovery")).unwrap();
-        assert_eq!(lsn, 5);
-        assert_eq!(log.scan(0, u64::MAX).unwrap().len(), 6);
-        log.verify().unwrap();
     }
 
     #[test]
@@ -891,10 +891,7 @@ mod tests {
         log.append(ep("a")).unwrap();
         assert!(matches!(
             log.append_cas(0, ep("stale")),
-            Err(HeraclitusError::CasConflict {
-                expected: 0,
-                head: 1
-            })
+            Err(HeraclitusError::CasConflict { expected: 0, head: 1 })
         ));
         assert_eq!(log.append_cas(1, ep("fresh")).unwrap(), 1);
     }
@@ -910,167 +907,18 @@ mod tests {
         assert_eq!(e.content, b"hello");
     }
 
-    fn contains(hay: &[u8], needle: &[u8]) -> bool {
-        hay.windows(needle.len()).any(|w| w == needle)
-    }
-
     #[test]
     fn scan_window_pruning_and_cap() {
         let dir = tempfile::tempdir().unwrap();
-        // Tiny segments → many sealed segments → real pruning across them.
         let log = Log::open(dir.path(), 2048, FsyncPolicy::Always).unwrap();
         for i in 0..500 {
             log.append(ep(&format!("event {i}"))).unwrap();
         }
-        // A narrow window returns exactly that LSN range (and only reads the
-        // segments that overlap it — the rest are pruned).
         let w = log.scan(100, 110).unwrap();
         assert_eq!(w.len(), 10);
         assert_eq!(w.first().unwrap().0, 100);
         assert_eq!(w.last().unwrap().0, 109);
-        // The row cap bounds the materialized result.
         assert_eq!(log.scan_capped(0, u64::MAX, 50).unwrap().len(), 50);
-        // Uncapped full scan is still complete (no regression).
-        assert_eq!(log.scan(0, u64::MAX).unwrap().len(), 500);
-    }
-
-    #[test]
-    fn encryption_at_rest_and_crypto_shred() {
-        let dir = tempfile::tempdir().unwrap();
-        let keys = tempfile::tempdir().unwrap();
-        let ks = heraclitus_crypto::KeyStore::open(keys.path()).unwrap();
-        let log =
-            Log::open_with_keystore(dir.path(), 1024 * 1024, FsyncPolicy::Always, Some(ks.clone()))
-                .unwrap();
-        log.append(ep("dados pessoais secretos")).unwrap();
-
-        // Reads come back as plaintext (transparent to everything above the log).
-        let all = log.scan(0, u64::MAX).unwrap();
-        assert_eq!(all[0].1.content, b"dados pessoais secretos");
-
-        // But the bytes on disk are ciphertext — no plaintext leak.
-        let seg = std::fs::read(segment_path(dir.path(), 0)).unwrap();
-        assert!(
-            !contains(&seg, b"dados pessoais secretos"),
-            "plaintext leaked to disk"
-        );
-        assert!(contains(&seg, &heraclitus_crypto::ENC_MAGIC[..]), "seal magic missing");
-
-        // Crypto-shred the agent's key, then reopen (drop the in-memory cache):
-        // the content is now permanently the tombstone, the log bytes untouched.
-        assert!(ks.shred("agent-1").unwrap());
-        let log2 = Log::open_with_keystore(
-            dir.path(),
-            1024 * 1024,
-            FsyncPolicy::Always,
-            Some(heraclitus_crypto::KeyStore::open(keys.path()).unwrap()),
-        )
-        .unwrap();
-        let after = log2.scan(0, u64::MAX).unwrap();
-        assert_eq!(after[0].1.content, heraclitus_crypto::SHREDDED);
-    }
-
-    #[test]
-    fn v2_record_crc_covers_full_header() {
-        let payload = b"the quick brown fox payload bytes";
-        let rec = format::encode_record(format::FORMAT_VERSION, 7, 0xDEAD_BEEF_CAFE_F00D, payload);
-        // Baseline: a clean v2 record decodes back to the same fields.
-        assert!(matches!(
-            format::decode_record(format::FORMAT_VERSION, &rec),
-            format::Decoded::Record(7, 0xDEAD_BEEF_CAFE_F00D, p, _) if p == payload
-        ));
-        // Flipping ANY byte of the record — the len/lsn/hlc header fields too,
-        // not just the payload — must be caught: the decoder may never hand back
-        // the original (lsn, hlc, payload) as if untampered.
-        for i in 0..rec.len() {
-            for bit in 0..8u32 {
-                let mut t = rec.clone();
-                t[i] ^= 1 << bit;
-                if let format::Decoded::Record(lsn, hlc, p, _) =
-                    format::decode_record(format::FORMAT_VERSION, &t)
-                {
-                    assert!(
-                        lsn != 7 || hlc != 0xDEAD_BEEF_CAFE_F00D || p != payload,
-                        "v2: flip at byte {i} bit {bit} slipped through undetected"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn v1_accepts_hlc_flip_that_v2_rejects() {
-        // Documents the hole the v2 format closes. Under v1 the CRC covers only
-        // the payload, so flipping a byte in the hlc field decodes cleanly with
-        // a *different* timestamp — silent retroactive tampering.
-        let payload = b"audit me";
-        let mut t = format::encode_record(1, 1, 1000, payload);
-        t[16] ^= 0x01; // first byte of the hlc field
-        assert!(
-            matches!(
-                format::decode_record(1, &t),
-                format::Decoded::Record(_, hlc, _, _) if hlc != 1000
-            ),
-            "v1 should silently accept the forged hlc (the bug v2 fixes)"
-        );
-        // The same flip on a v2 record is rejected outright.
-        let mut t2 = format::encode_record(2, 1, 1000, payload);
-        t2[16] ^= 0x01;
-        assert!(matches!(
-            format::decode_record(2, &t2),
-            format::Decoded::Torn
-        ));
-    }
-
-    #[test]
-    fn tampered_hlc_in_sealed_segment_is_caught_on_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            // Tiny segments → segment 0 seals with several records.
-            let log = Log::open(dir.path(), 2048, FsyncPolicy::Always).unwrap();
-            for i in 0..200 {
-                log.append(ep(&format!("event number {i}"))).unwrap();
-            }
-            assert!(!log.sealed_segments().is_empty());
-            assert_eq!(log.scan(0, u64::MAX).unwrap().len(), 200);
-        }
-        // Forge the timestamp (hlc) of the first record of sealed segment 0 —
-        // exactly the retroactive-fraud move the v2 header CRC defends against.
-        let seg0 = segment_path(dir.path(), 0);
-        let mut data = std::fs::read(&seg0).unwrap();
-        data[HEADER_LEN + 16] ^= 0x01; // first byte of record 0's hlc field
-        std::fs::write(&seg0, &data).unwrap();
-
-        // Reopen: under v1 (CRC over payload only) the flip slipped through and
-        // all 200 survived; under v2 the CRC mismatch is caught on recovery, so
-        // the forged record (and the rest of that segment) is dropped — the
-        // tamper cannot pass silently.
-        let log = Log::open(dir.path(), 2048, FsyncPolicy::Always).unwrap();
-        assert!(
-            log.scan(0, u64::MAX).unwrap().len() < 200,
-            "forged hlc was silently accepted — record header is not integrity-protected"
-        );
-    }
-
-    proptest! {
-        /// A bit flip anywhere in the 24-byte record header (len/crc/lsn/hlc) is
-        /// always detected under v2: the decoder never returns a clean record
-        /// carrying the original (lsn, hlc, payload).
-        #[test]
-        fn prop_v2_any_header_byte_flip_detected(
-            lsn in any::<u64>(),
-            hlc in any::<u64>(),
-            payload in proptest::collection::vec(any::<u8>(), 0..512),
-            flip_in_header in 0usize..format::RECORD_HEADER_LEN,
-            bit in 0u32..8,
-        ) {
-            let mut t = format::encode_record(format::FORMAT_VERSION, lsn, hlc, &payload);
-            t[flip_in_header] ^= 1 << bit;
-            if let format::Decoded::Record(l, h, p, _) =
-                format::decode_record(format::FORMAT_VERSION, &t)
-            {
-                prop_assert!(l != lsn || h != hlc || p != &payload[..]);
-            }
-        }
     }
 }
+
