@@ -4,7 +4,7 @@
 //! planner has statistics to feed on (§3.12).
 
 use crate::ast::*;
-use crate::backend::{graph_snapshot, materialize_virtual, EdgeRow, QueryBackend, VirtualBackend};
+use crate::backend::{EdgeRow, QueryBackend};
 use crate::fusion::FusionWeights;
 use heraclitus_core::{Episode, EventKind, HeraclitusError, Lsn};
 use heraclitus_index_graph::decision::DecisionPolicy;
@@ -810,19 +810,15 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                 })),
             }
         }
-        Plan::Simulate {
-            op,
-            from,
-            to,
-            etype,
-            then,
-        } => {
-            // Overlay the counterfactual on a fresh copy of the graph; the base
-            // graph and the log are never touched (divergence isolated).
-            let base = graph_snapshot(be)?;
-            let virt = materialize_virtual(&base, *op, from, to, etype);
-            let vb = VirtualBackend::new(be, virt);
-            execute(then, &vb)
+        Plan::Simulate { .. } => {
+            // SIMULATE EDGE (motor contrafactual) foi removido no refactor M30 do
+            // backend; o overlay virtual (graph_snapshot/materialize_virtual/
+            // VirtualBackend) ainda não foi reintroduzido. Recuperável do git
+            // (commits 41480b6 "M16 counterfactual engine" / 519567c). Até lá,
+            // falha de forma explícita em vez de dar resultado errado.
+            Err(HeraclitusError::Query(
+                "SIMULATE EDGE indisponível neste build (motor contrafactual pendente de reintrodução no backend)".into(),
+            ))
         }
         Plan::Adapt { as_of } => {
             let bound = resolve_as_of(as_of, be)?;

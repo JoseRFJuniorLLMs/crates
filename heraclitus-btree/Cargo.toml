@@ -8,6 +8,7 @@ description = "Write-optimized Bᵋ-tree (Fractal Tree) for materialized-view pe
 
 [dependencies]
 blake3 = { workspace = true }
+crc32fast = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

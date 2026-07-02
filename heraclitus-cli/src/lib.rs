@@ -18,7 +18,7 @@ pub fn log_inspect(dir: &std::path::Path) -> Result<String, heraclitus_core::Her
         out += &format!(
             "  seg {:06}  lsn [{}, {}]  merkle {}\n",
             s.id,
-            s.min_lsn,
+            s.base_lsn,
             s.max_lsn,
             s.blake3_root
                 .map(|r| format!("{:02x}{:02x}..", r[0], r[1]))

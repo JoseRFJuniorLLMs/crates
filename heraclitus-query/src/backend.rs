@@ -392,19 +392,32 @@ impl HnswIndex {
             let selected = self.select_neighbors_heuristic(&vector, candidates, M);
 
             for neighbor in selected {
-                if let Some(layer_map) = self.layers.get_mut(layer_idx) {
+                // Fase 1: muta self.layers e decide se é preciso podar (liberta o
+                // &mut self.layers no fim do bloco). Fase 2 usa &self (nodes +
+                // select_neighbors_heuristic) sem conflito de borrow.
+                let pool_for_prune = if let Some(layer_map) = self.layers.get_mut(layer_idx) {
                     let node_links = layer_map.get_mut(&lsn).unwrap();
                     Arc::make_mut(node_links).push(neighbor);
-                    
+
                     let links = layer_map.entry(neighbor).or_default();
                     if !links.contains(&lsn) {
                         Arc::make_mut(links).push(lsn);
                     }
                     if links.len() > M {
-                        if let Some(n_vec) = self.nodes.get(&neighbor) {
-                            let mut pool = links.to_vec();
-                            pool.push(lsn);
-                            let pruned = self.select_neighbors_heuristic(n_vec, pool, M);
+                        let mut pool = links.to_vec();
+                        pool.push(lsn);
+                        Some(pool)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(pool) = pool_for_prune {
+                    if let Some(n_vec) = self.nodes.get(&neighbor) {
+                        let pruned = self.select_neighbors_heuristic(n_vec, pool, M);
+                        if let Some(layer_map) = self.layers.get_mut(layer_idx) {
                             layer_map.insert(neighbor, Arc::new(pruned));
                         }
                     }
@@ -924,8 +937,8 @@ impl QueryBackend for LogBackend {
         };
 
         let mut visited = BTreeSet::new();
-        let mut candidate_heap = BinaryHeap::new();
-        let mut top_hits_heap = BinaryHeap::new();
+        let mut candidate_heap: BinaryHeap<MinScoreEntry> = BinaryHeap::new();
+        let mut top_hits_heap: BinaryHeap<MinScoreEntry> = BinaryHeap::new();
 
         if let Some(first_vec) = b.vector_index.nodes.get(&best_routing_node) {
             let initial_dist = b.vector_index.compute_distance(vector, first_vec);

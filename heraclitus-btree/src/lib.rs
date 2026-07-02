@@ -42,6 +42,11 @@ const OFF_LOW_LEN: usize = 27;
 const OFF_HIGH_OFF: usize = 29;
 const OFF_HIGH_LEN: usize = 31;
 const OFF_BLOOM: usize = 33;
+// Prefixo comum (compressão por prefixo): ocupa os 4 bytes livres entre o bloom
+// (33..97, 512 bits) e o início dos slots (101). Dois u16: offset e comprimento
+// do prefixo no payload da página.
+const OFF_PFX_OFF: usize = 97;
+const OFF_PFX_LEN: usize = 99;
 const OFF_SLOTS_START: usize = 101;
 const PAYLOAD_END_MAX: usize = PAGE_SIZE - SIG_SIZE;
 
@@ -564,7 +569,10 @@ impl DiskNode {
         let mut children = Vec::new();
         let mut buffer = BTreeMap::new();
         
-        let mut last_offset = 0;
+        // Payloads crescem para baixo a partir de PAYLOAD_END_MAX, logo os offsets
+        // dos sufixos de chave são NÃO-CRESCENTES entre slots consecutivos. Um
+        // offset maior que o anterior denuncia corrupção/sobreposição física.
+        let mut last_offset = usize::MAX;
         for _ in 0..slot_count {
             let suf_off = read_u16(data, pos)? as usize;
             let suf_len = read_u16(data, pos + 2)? as usize;
@@ -574,7 +582,7 @@ impl DiskNode {
             cumulative_hash.copy_from_slice(safe_slice(data, pos + 14, HASH_LEN)?);
             pos += 42;
             
-            if suf_off < last_offset && last_offset > 0 {
+            if last_offset != usize::MAX && suf_off > last_offset {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "Inconsistência de ordenação ou sobreposição física detectada nos slots"));
             }
             last_offset = suf_off;
@@ -824,8 +832,9 @@ impl BEpsilonTree {
         
         let id = if sb.free_list_len > 0 {
             sb.free_list_len -= 1;
-            let r_id = sb.free_list[sb.free_list_len as usize];
-            sb.free_list[sb.free_list_len as usize] = 0;
+            let slot = sb.free_list_len as usize;
+            let r_id = sb.free_list[slot];
+            sb.free_list[slot] = 0;
             r_id
         } else if sb.free_list_head > 0 {
             let next_head = sb.free_list_head;
@@ -869,7 +878,8 @@ impl BEpsilonTree {
             self.store.write_page(id, &clean_tombstone)?;
             self.metrics.write_amplification_count.fetch_add(1, Ordering::Relaxed);
             
-            sb.free_list[sb.free_list_len as usize] = id;
+            let slot = sb.free_list_len as usize;
+            sb.free_list[slot] = id;
             sb.free_list_len += 1;
         } else {
             let mut clean_tombstone = vec![0u8; PAGE_SIZE];
@@ -915,7 +925,7 @@ impl BEpsilonTree {
     }
 
     pub fn prune_mvcc_history(&self, oldest_active_lsn: u64) {
-        let mut pruned_count = 0;
+        let mut pruned_count: usize = 0;
         for shard_idx in 0..NUM_SHARDS {
             let c = self.cache_shards[shard_idx].lock().unwrap();
             for frame in c.values() {
@@ -1486,5 +1496,115 @@ impl BEpsilonTree {
         let total_accounted = visited_nodes.len() + visited_overflow.len() + visited_freelist.len() + 2;
         if total_accounted != total_physical_pages as usize { return Ok(false); }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod page_roundtrip_tests {
+    //! Round-trip da (de)serialização física da página, com foco na compressão
+    //! por prefixo (feature M22: OFF_PFX_OFF/OFF_PFX_LEN). Sem estes testes a
+    //! feature de formato de página ficava sem rede de segurança.
+    use super::*;
+
+    fn leaf(keys: &[&str], vals: &[&str]) -> DiskNode {
+        DiskNode {
+            id: 42,
+            header: PageHeader {
+                page_type: PageType::Leaf as u8,
+                version: VERSION,
+                generation: 7,
+                lsn: 99,
+                slot_count: keys.len() as u16,
+                free_start: 0,
+                payload_end: 0,
+            },
+            low_key: keys.first().map(|k| k.as_bytes().to_vec()),
+            high_key: keys.last().map(|k| k.as_bytes().to_vec()),
+            slots: Vec::new(),
+            keys: keys.iter().map(|k| k.as_bytes().to_vec()).collect(),
+            vals: vals.iter().map(|v| v.as_bytes().to_vec()).collect(),
+            children: Vec::new(),
+            buffer: BTreeMap::new(),
+            bloom: BloomFilter::default(),
+        }
+    }
+
+    #[test]
+    fn common_prefix_extraction() {
+        let n = leaf(&["prefix_alpha", "prefix_beta", "prefix_gamma"], &["1", "2", "3"]);
+        assert_eq!(n.calculate_common_prefix(), b"prefix_".to_vec());
+        // No shared prefix → empty.
+        let m = leaf(&["apple", "banana"], &["1", "2"]);
+        assert_eq!(m.calculate_common_prefix(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn leaf_roundtrip_with_prefix() {
+        let n = leaf(&["prefix_alpha", "prefix_beta", "prefix_gamma"], &["v1", "v2", "v3"]);
+        let buf = n.serialize().unwrap();
+
+        // The prefix header fields (OFF_PFX_*) must point at the real prefix.
+        let pfx_len = read_u16(&buf, OFF_PFX_LEN).unwrap() as usize;
+        assert_eq!(pfx_len, b"prefix_".len(), "OFF_PFX_LEN deve refletir o prefixo comum");
+
+        let n2 = DiskNode::deserialize(n.id, &buf).unwrap();
+        assert_eq!(n2.keys, n.keys, "chaves reconstruídas com prefixo devem bater");
+        assert_eq!(n2.vals, n.vals);
+        assert_eq!(n2.low_key, n.low_key);
+        assert_eq!(n2.high_key, n.high_key);
+        // Serialização determinística: re-serializar deve dar bytes idênticos.
+        assert_eq!(n2.serialize().unwrap(), buf, "round-trip não é byte-idêntico");
+    }
+
+    #[test]
+    fn leaf_roundtrip_without_prefix() {
+        let n = leaf(&["apple", "banana", "cherry"], &["v1", "v2", "v3"]);
+        let buf = n.serialize().unwrap();
+        assert_eq!(read_u16(&buf, OFF_PFX_LEN).unwrap(), 0, "sem prefixo comum, pfx_len=0");
+        let n2 = DiskNode::deserialize(n.id, &buf).unwrap();
+        assert_eq!(n2.keys, n.keys);
+        assert_eq!(n2.vals, n.vals);
+    }
+
+    #[test]
+    fn internal_roundtrip_with_buffer() {
+        let mut buffer: BTreeMap<Key, Vec<Msg>> = BTreeMap::new();
+        buffer.insert(b"k_msg1".to_vec(), vec![Msg::Upsert(b"x".to_vec(), 5)]);
+        buffer.insert(b"k_msg2".to_vec(), vec![Msg::Delete(7)]);
+        let node = DiskNode {
+            id: 3,
+            header: PageHeader {
+                page_type: PageType::Internal as u8,
+                version: VERSION,
+                generation: 1,
+                lsn: 10,
+                slot_count: 2,
+                free_start: 0,
+                payload_end: 0,
+            },
+            low_key: Some(b"k_a".to_vec()),
+            high_key: Some(b"k_b".to_vec()),
+            slots: Vec::new(),
+            keys: vec![b"k_a".to_vec(), b"k_b".to_vec()], // prefixo comum "k_"
+            vals: Vec::new(),
+            children: vec![10, 20, 30], // slot_count + 1
+            buffer,
+            bloom: BloomFilter::default(),
+        };
+        let buf = node.serialize().unwrap();
+        let n2 = DiskNode::deserialize(node.id, &buf).unwrap();
+        assert_eq!(n2.keys, node.keys, "separadores reconstruídos");
+        assert_eq!(n2.children, node.children, "ponteiros de filhos preservados");
+        assert_eq!(n2.buffer, node.buffer, "mensagens do buffer (prefixo-stripped) preservadas");
+        assert_eq!(n2.serialize().unwrap(), buf);
+    }
+
+    #[test]
+    fn prefix_region_does_not_overlap_bloom() {
+        // OFF_BLOOM(33) + 64 bytes de bloom termina em 97; OFF_PFX_OFF=97,
+        // OFF_PFX_LEN=99, OFF_SLOTS_START=101. Sanidade do layout.
+        assert_eq!(OFF_BLOOM + BLOOM_FILTER_SIZE_BYTES, OFF_PFX_OFF);
+        assert_eq!(OFF_PFX_OFF + 2, OFF_PFX_LEN);
+        assert_eq!(OFF_PFX_LEN + 2, OFF_SLOTS_START);
     }
 }

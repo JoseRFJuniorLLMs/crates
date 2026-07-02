@@ -34,7 +34,9 @@ pub const MAGIC: [u8; 4] = *b"HRKL";
 pub const FOOTER_MAGIC: [u8; 4] = *b"HFTR";
 /// Bumped 1 → 2: CRC and Merkle leaf now cover the full record header, not
 /// just the payload. v1 segments remain readable.
-pub const FORMAT_VERSION: u16 = 2;
+/// Bumped 2 → 3: StoragePayload now persists the full Episode (id, session_id,
+/// kind, embedding, attrs, parents) — the log is the complete source of truth.
+pub const FORMAT_VERSION: u16 = 3;
 pub const HEADER_LEN: usize = 4 + 2 + 8 + 8;
 pub const RECORD_HEADER_LEN: usize = 4 + 4 + 8 + 8;
 pub const FOOTER_LEN: usize = 4 + 8 + 8 + 8 + 32;

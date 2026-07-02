@@ -7,6 +7,12 @@ pub enum HeraclitusError {
     #[error("storage error: {0}")]
     Storage(#[from] std::io::Error),
 
+    #[error("storage engine error: {0}")]
+    StorageEngine(String),
+
+    #[error("crypto error: {0}")]
+    Crypto(String),
+
     #[error("corruption detected in {context}: {detail}")]
     Corruption { context: String, detail: String },
 

@@ -17,7 +17,7 @@ pub mod format;
 pub mod vm_bridge;
 
 use format::{Decoded, SegmentFooter, SegmentHeader, FOOTER_LEN, HEADER_LEN};
-use heraclitus_core::{Episode, FsyncPolicy, HeraclitusError, Hlc, Lsn, SegmentId};
+use heraclitus_core::{Episode, EventId, EventKind, FsyncPolicy, HeraclitusError, Hlc, Lsn, ProductPoint, SegmentId};
 use heraclitus_crypto::KeyStore;
 use arc_swap::ArcSwap;
 use std::fs::{File, OpenOptions};
@@ -130,9 +130,33 @@ impl Drop for WorkerDropGuard {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoragePayload {
     pub opaque_meta: [u8; 16],
+    pub id: EventId,
     pub agent_id: String,
+    pub session_id: String,
     pub ts_hlc: u64,
+    pub kind: EventKind,
     pub content: Vec<u8>,
+    pub embedding: Option<ProductPoint>,
+    pub attrs: std::collections::BTreeMap<String, String>,
+    pub parents: Vec<EventId>,
+}
+
+impl StoragePayload {
+    /// Reconstrói o `Episode` completo a partir do payload persistido. O
+    /// `content` volta cifrado; quem chama aplica `decrypt_in_place` se preciso.
+    fn into_episode(self) -> Episode {
+        Episode {
+            id: self.id,
+            ts_hlc: self.ts_hlc,
+            agent_id: self.agent_id,
+            session_id: self.session_id,
+            kind: self.kind,
+            content: self.content,
+            embedding: self.embedding,
+            attrs: self.attrs,
+            parents: self.parents,
+        }
+    }
 }
 
 pub struct Log {
@@ -404,9 +428,15 @@ impl Log {
 
                                 let storage_payload = StoragePayload {
                                     opaque_meta: *opaque_meta,
+                                    id: episode.id,
                                     agent_id: episode.agent_id.clone(),
+                                    session_id: episode.session_id.clone(),
                                     ts_hlc: episode.ts_hlc,
+                                    kind: episode.kind.clone(),
                                     content: content_payload.to_vec(),
+                                    embedding: episode.embedding.clone(),
+                                    attrs: episode.attrs.clone(),
+                                    parents: episode.parents.clone(),
                                 };
 
                                 scratch_buffer.clear();
@@ -462,6 +492,12 @@ impl Log {
                             LogCommand::Flush { resp_tx } => {
                                 sync_required = true;
                                 stashed_flushes.push(resp_tx.clone());
+                            }
+                            LogCommand::Truncate { resp_tx, .. } => {
+                                // Truncate é tratado fora do lote (fase de batching); se
+                                // aqui chegar, recusa defensivamente sem corromper o pipeline.
+                                let _ = resp_tx.send(Err(HeraclitusError::StorageEngine(
+                                    "Truncate não é processado dentro do lote de escrita".into())));
                             }
                         }
                     }
@@ -531,7 +567,7 @@ impl Log {
                         worker_committed_lsn.store(current_lsn, Ordering::Release);
                     }
 
-                    for flush_tx in stashed_flushes {
+                    for flush_tx in stashed_flushes.drain(..) {
                         let _ = flush_tx.send(Ok(()));
                     }
                 }
@@ -663,14 +699,10 @@ impl Log {
         
         match format::decode_record(format::FORMAT_VERSION, &buf) {
             Decoded::Record(rlsn, _hlc, payload, _) => {
-                let storage_payload: StoragePayload = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
+                let (storage_payload, _): (StoragePayload, usize) = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
                         .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
                 
-                let mut ep = Episode {
-                    agent_id: storage_payload.agent_id,
-                    ts_hlc: storage_payload.ts_hlc,
-                    content: storage_payload.content,
-                };
+                let mut ep = storage_payload.into_episode();
                 self.decrypt_in_place(&mut ep)?;
                 Ok(Some((rlsn, ep)))
             }
@@ -759,14 +791,10 @@ impl Log {
                         match format::decode_record(format::FORMAT_VERSION, &record_buf) {
                             Decoded::Record(rlsn, _hlc, payload, _) => {
                                 if rlsn == scan_lsn {
-                                    let storage_payload: StoragePayload = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
+                                    let (storage_payload, _): (StoragePayload, usize) = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
                                         .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
                                     
-                                    let mut ep = Episode {
-                                        agent_id: storage_payload.agent_id,
-                                        ts_hlc: storage_payload.ts_hlc,
-                                        content: storage_payload.content,
-                                    };
+                                    let mut ep = storage_payload.into_episode();
                                     
                                     self.decrypt_in_place(&mut ep)?;
                                     out.push((rlsn, ep));
@@ -826,6 +854,46 @@ impl Log {
         self.cmd_tx.send(LogCommand::Flush { resp_tx: tx })
             .map_err(|_| HeraclitusError::StorageEngine("Pipeline abortado na injeção de Flush".into()))?;
         rx.recv().map_err(|_| HeraclitusError::StorageEngine("A thread principal do worker falhou em processar o Flush".into()))?
+    }
+
+    /// Caminho de escrita público: envia um `LogCommand::Append` e devolve o LSN
+    /// atribuído. Modelado em `append_raft_entry`; `opaque_meta` transporta o
+    /// `EventId` (Ulid, 16 bytes) para reconstrução do `id` na leitura.
+    pub fn append(&self, episode: Episode) -> Result<Lsn, HeraclitusError> {
+        self.check_poison()?;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let opaque_meta = episode.id.0.to_bytes();
+        self.cmd_tx.send_timeout(LogCommand::Append {
+            opaque_meta,
+            episode: Arc::new(episode),
+            expected_lsn: None,
+            resp_tx: tx,
+        }, std::time::Duration::from_secs(10))
+        .map_err(|_| HeraclitusError::StorageEngine("Timeout de canal: pipeline saturado".into()))?;
+        rx.recv().map_err(|_| HeraclitusError::StorageEngine("Worker interrompido no append".into()))?
+    }
+
+    /// Append com compare-and-append (OCC): só grava se o head do log for
+    /// exatamente `expected`, senão devolve `CasConflict`. Usado por `heraclitus-txn`.
+    pub fn append_cas(&self, expected: Lsn, episode: Episode) -> Result<Lsn, HeraclitusError> {
+        self.check_poison()?;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let opaque_meta = episode.id.0.to_bytes();
+        self.cmd_tx.send_timeout(LogCommand::Append {
+            opaque_meta,
+            episode: Arc::new(episode),
+            expected_lsn: Some(expected),
+            resp_tx: tx,
+        }, std::time::Duration::from_secs(10))
+        .map_err(|_| HeraclitusError::StorageEngine("Timeout de canal: pipeline saturado".into()))?;
+        rx.recv().map_err(|_| HeraclitusError::StorageEngine("Worker interrompido no append_cas".into()))?
+    }
+
+    /// Aplicação replicada (follower): grava a entrada do líder na posição exata
+    /// `lsn`. Implementado como CAS com `expected = lsn` — falha se o head divergir,
+    /// garantindo ordem estrita. NOTA: rever semântica de replicação (gaps/idempotência).
+    pub fn append_replicated(&self, lsn: Lsn, episode: Episode) -> Result<Lsn, HeraclitusError> {
+        self.append_cas(lsn, episode)
     }
 
     pub fn sealed_segments(&self) -> Vec<SegmentMeta> {
@@ -904,7 +972,7 @@ impl RaftLogStorage for Log {
                 f.read_exact(&mut buf)?;
 
                 if let Decoded::Record(_, _, payload, _) = format::decode_record(format::FORMAT_VERSION, &buf) {
-                    let storage_payload: StoragePayload = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
+                    let (storage_payload, _): (StoragePayload, usize) = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
                         .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
                     
                     let term = u64::from_le_bytes(entry.opaque_meta[..8].try_into().unwrap_or([0u8; 8]));
@@ -913,11 +981,7 @@ impl RaftLogStorage for Log {
                     return Ok(Some((lsn, RaftEntry {
                         term,
                         index,
-                        payload: Arc::new(Episode {
-                            agent_id: storage_payload.agent_id,
-                            ts_hlc: storage_payload.ts_hlc,
-                            content: storage_payload.content,
-                        }),
+                        payload: Arc::new(storage_payload.into_episode()),
                     })));
                 }
             }
@@ -1258,7 +1322,7 @@ fn scan_segment_file(path: &Path, _id: SegmentId) -> Result<SegmentScan, Heracli
                     }
                     last_lsn = Some(lsn);
 
-                    let storage_payload: StoragePayload = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
+                    let (storage_payload, _): (StoragePayload, usize) = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
                         .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
 
                     hashes.push(format::record_leaf(version, &record_buf[..consumed]));
@@ -1334,7 +1398,7 @@ fn segment_id_from_path(path: &Path) -> Result<SegmentId, HeraclitusError> {
         })
 }
 
-fn merkle_root(hashes: &[[u8; 32]]) -> [u8; 32] {
+pub fn merkle_root(hashes: &[[u8; 32]]) -> [u8; 32] {
     if hashes.is_empty() { return [0u8; 32]; }
     let mut current = hashes.to_vec();
     let mut len = current.len();

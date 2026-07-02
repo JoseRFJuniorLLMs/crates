@@ -75,7 +75,7 @@ pub fn commit_at(log: &Log, watermark_lsn: Lsn) -> Commitment {
         .into_iter()
         .filter(|s| s.max_lsn <= watermark_lsn && s.blake3_root.is_some())
         .collect();
-    segs.sort_by_key(|s| s.min_lsn);
+    segs.sort_by_key(|s| s.base_lsn);
     let roots: Vec<[u8; 32]> = segs.iter().map(|s| s.blake3_root.unwrap()).collect();
     Commitment {
         lsn: watermark_lsn,

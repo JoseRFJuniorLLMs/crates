@@ -68,7 +68,7 @@ impl ColdTier {
             segment_id,
             object_path: obj_path.to_string(),
             record_count: count,
-            min_lsn: meta.min_lsn,
+            min_lsn: meta.base_lsn,
             max_lsn: meta.max_lsn,
             blake3_root: hex(&root),
         };

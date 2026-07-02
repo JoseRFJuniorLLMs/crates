@@ -25,3 +25,8 @@ gpu = ["heraclitus-gpu/gpu"]
 [dev-dependencies]
 tempfile = { workspace = true }
 ulid = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "hnsw_search"
+harness = false

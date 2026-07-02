@@ -61,16 +61,26 @@ fn norm(a: &[f64]) -> f64 {
     dot(a, a).sqrt()
 }
 
-fn sub(a: &[f64], b: &[f64]) -> Vec<f64> {
-    a.iter().zip(b).map(|(x, y)| x - y).collect()
-}
-
 fn scale(a: &[f64], s: f64) -> Vec<f64> {
     a.iter().map(|x| x * s).collect()
 }
 
 fn add(a: &[f64], b: &[f64]) -> Vec<f64> {
     a.iter().zip(b).map(|(x, y)| x + y).collect()
+}
+
+// ---------- allocation-free f32 helpers (hot path) ----------
+// The component-distance functions run once per neighbour visit during an HNSW
+// search. Promoting each element to f64 inline (instead of materializing two
+// `Vec<f64>` via `to64` on every call) keeps the math identical while removing
+// the per-call heap traffic that dominated the ANN hot path.
+
+fn dot_f32(a: &[f32], b: &[f32]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| (*x as f64) * (*y as f64)).sum()
+}
+
+fn norm_f32(a: &[f32]) -> f64 {
+    dot_f32(a, a).sqrt()
 }
 
 /// Clamp a point strictly inside the unit ball.
@@ -110,21 +120,21 @@ pub fn dist_hyp(u: &[f32], v: &[f32], c: f64) -> f64 {
     if u.is_empty() {
         return 0.0;
     }
-    let (u, v) = (to64(u), to64(v));
     let max_norm = (1.0 - BALL_EPS) / c.sqrt(); // boundary of the curvature-c ball
-    let clamp = |w: &[f64]| -> Vec<f64> {
-        let n = norm(w);
-        if n > max_norm {
-            scale(w, max_norm / n) // n > max_norm >= 0 implies n > 0
-        } else {
-            w.to_vec()
-        }
-    };
-    let u = clamp(&u);
-    let v = clamp(&v);
-    let nu = norm(&u);
-    let nv = norm(&v);
-    let diff2 = dot(&sub(&u, &v), &sub(&u, &v));
+    // Fold the boundary clamp into per-element scale factors instead of
+    // materializing clamped vectors: a point whose norm exceeds `max_norm` is
+    // scaled by `max_norm / n` (n > max_norm >= 0 implies n > 0), otherwise 1.
+    let nu_raw = norm_f32(u);
+    let nv_raw = norm_f32(v);
+    let su = if nu_raw > max_norm { max_norm / nu_raw } else { 1.0 };
+    let sv = if nv_raw > max_norm { max_norm / nv_raw } else { 1.0 };
+    let nu = su * nu_raw; // norm(scale(u, su)) == su * norm(u)
+    let nv = sv * nv_raw;
+    let mut diff2 = 0.0f64; // |su*u - sv*v|^2 in a single pass
+    for (x, y) in u.iter().zip(v) {
+        let t = su * (*x as f64) - sv * (*y as f64);
+        diff2 += t * t;
+    }
     let denom = (1.0 - c * nu * nu) * (1.0 - c * nv * nv); // > 0 by the clamp above
     let arg = 1.0 + (2.0 * c * diff2 / denom);
     (1.0 / c.sqrt()) * arg.max(1.0).acosh()
@@ -135,12 +145,11 @@ pub fn dist_sph(u: &[f32], v: &[f32], k2: f64) -> f64 {
     if u.is_empty() {
         return 0.0;
     }
-    let (u, v) = (to64(u), to64(v));
-    let (nu, nv) = (norm(&u), norm(&v));
+    let (nu, nv) = (norm_f32(u), norm_f32(v));
     if nu == 0.0 || nv == 0.0 {
         return 0.0;
     }
-    let cos = (dot(&u, &v) / (nu * nv)).clamp(-1.0, 1.0);
+    let cos = (dot_f32(u, v) / (nu * nv)).clamp(-1.0, 1.0);
     cos.acos() / k2.sqrt()
 }
 
@@ -149,8 +158,12 @@ pub fn dist_euc(u: &[f32], v: &[f32]) -> f64 {
     if u.is_empty() {
         return 0.0;
     }
-    let (u, v) = (to64(u), to64(v));
-    norm(&sub(&u, &v))
+    let mut s = 0.0f64;
+    for (x, y) in u.iter().zip(v) {
+        let t = *x as f64 - *y as f64;
+        s += t * t;
+    }
+    s.sqrt()
 }
 
 impl ProductMetric {

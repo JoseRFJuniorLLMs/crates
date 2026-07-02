@@ -10,6 +10,7 @@ description = "Cypher/GQL-subset parser + temporal AS OF, rule-based planner wit
 heraclitus-core = { workspace = true }
 heraclitus-log = { workspace = true }
 heraclitus-index-graph = { workspace = true }
+arc-swap = { workspace = true }
 pest = { workspace = true }
 pest_derive = { workspace = true }
 serde_json = { workspace = true }

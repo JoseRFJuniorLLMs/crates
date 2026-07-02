@@ -91,9 +91,11 @@ pub fn replay_vm(log: &Log, vm: &ConsistencyVirtualMachine) -> Result<VmState, H
 pub fn replay_vm_to_btree(
     log: &Log,
     vm: &ConsistencyVirtualMachine,
+    path: &std::path::Path,
 ) -> Result<heraclitus_btree::BEpsilonTree, HeraclitusError> {
     let state = replay_vm(log, vm)?;
-    Ok(heraclitus_btree::BEpsilonTree::from_map(state.memory_layers))
+    // O btree passou a ser file-backed: from_map(path, map) -> io::Result.
+    Ok(heraclitus_btree::BEpsilonTree::from_map(path, state.memory_layers)?)
 }
 
 #[cfg(test)]
@@ -213,7 +215,7 @@ mod tests {
 
         let vm = ConsistencyVirtualMachine::new(ver);
         let state = replay_vm(&log, &vm).unwrap();
-        let tree = replay_vm_to_btree(&log, &vm).unwrap();
+        let tree = replay_vm_to_btree(&log, &vm, &dir.path().join("replay.hbt")).unwrap();
         assert_eq!(tree.materialize(), state.memory_layers, "tree == replayed ledger");
 
         // Persist + reload the checkpoint.

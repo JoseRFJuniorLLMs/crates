@@ -53,6 +53,14 @@ pub struct VectorIndex {
     lsns: Vec<Lsn>,
     watermark: Lsn,
     rng: StdRng,
+    // #8 — arena contígua de coordenadas para o hot-path de distância. Em vez de
+    // ler os 3 `Vec<f32>` dispersos de cada `ProductPoint` (pointer chasing na
+    // travessia HNSW), as coordenadas de todos os nós vivem num único buffer
+    // linear. `coords_off[i]` marca o início do nó i; `coords_len[i] = [a,b,c]`
+    // as dimensões (variáveis) das 3 componentes. Espelha `Node.point`.
+    coords: Vec<f32>,
+    coords_off: Vec<u32>,
+    coords_len: Vec<[u32; 3]>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +85,9 @@ impl VectorIndex {
             // Determinism requirement (§3.5): RNG seeded from a constant; the
             // level sequence is then a pure function of insertion order.
             rng: StdRng::seed_from_u64(0x48524B4C),
+            coords: Vec::new(),
+            coords_off: Vec::new(),
+            coords_len: Vec::new(),
         }
     }
 
@@ -166,6 +177,14 @@ impl VectorIndex {
             level,
             neighbors: vec![Vec::new(); level + 1],
         });
+        // #8 — espelha as coordenadas do ponto na arena contígua (mesma ordem
+        // hyp|sph|euc que o hot-path `dist` espera).
+        self.coords_off.push(self.coords.len() as u32);
+        self.coords_len
+            .push([point.hyp.len() as u32, point.sph.len() as u32, point.euc.len() as u32]);
+        self.coords.extend_from_slice(&point.hyp);
+        self.coords.extend_from_slice(&point.sph);
+        self.coords.extend_from_slice(&point.euc);
         self.by_event.insert(event_id, id);
         self.ids.push(event_id);
         self.lsns.push(lsn);
