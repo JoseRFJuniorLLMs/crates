@@ -42,6 +42,10 @@ pub struct SegmentMeta {
     pub max_lsn: Lsn,
     pub sealed: bool,
     pub blake3_root: Option<[u8; 32]>,
+    /// FORMAT_VERSION do segmento no disco. Segmentos antigos permanecem
+    /// legíveis: a versão decide a regra de CRC/leaf E o layout do payload
+    /// (v<=2: `Episode` serializado direto; v3+: `StoragePayload`).
+    pub version: u16,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -139,6 +143,104 @@ struct StoragePayload {
     pub embedding: Option<ProductPoint>,
     pub attrs: std::collections::BTreeMap<String, String>,
     pub parents: Vec<EventId>,
+    /// FORMAT v4: valid time nativo (mundo real), distinto do transaction time.
+    pub valid_from: Option<u64>,
+    pub valid_to: Option<u64>,
+}
+
+/// Layout EXATO do payload FORMAT v3 (pré-Valid-Time). O bincode não é
+/// autodescritivo: cada geração de formato precisa da sua réplica de struct.
+/// (`pub` + Serialize só para os testes de compat fabricarem segmentos v3.)
+#[doc(hidden)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct StoragePayloadV3 {
+    pub opaque_meta: [u8; 16],
+    pub id: EventId,
+    pub agent_id: String,
+    pub session_id: String,
+    pub ts_hlc: u64,
+    pub kind: EventKind,
+    pub content: Vec<u8>,
+    pub embedding: Option<ProductPoint>,
+    pub attrs: std::collections::BTreeMap<String, String>,
+    pub parents: Vec<EventId>,
+}
+
+/// Layout EXATO do `Episode` como era persistido DIRETO nos payloads v<=2
+/// (pré-M30): id, ts_hlc, agent, session, kind, content, embedding, attrs,
+/// parents — sem opaque_meta e sem valid time.
+#[derive(serde::Deserialize)]
+struct EpisodeV2 {
+    pub id: EventId,
+    pub ts_hlc: u64,
+    pub agent_id: String,
+    pub session_id: String,
+    pub kind: EventKind,
+    pub content: Vec<u8>,
+    pub embedding: Option<ProductPoint>,
+    pub attrs: std::collections::BTreeMap<String, String>,
+    pub parents: Vec<EventId>,
+}
+
+impl EpisodeV2 {
+    fn into_episode(self) -> Episode {
+        Episode {
+            id: self.id,
+            ts_hlc: self.ts_hlc,
+            agent_id: self.agent_id,
+            session_id: self.session_id,
+            kind: self.kind,
+            content: self.content,
+            embedding: self.embedding,
+            attrs: self.attrs,
+            parents: self.parents,
+            valid_from: None,
+            valid_to: None,
+        }
+    }
+}
+
+impl StoragePayloadV3 {
+    fn into_episode(self) -> Episode {
+        Episode {
+            id: self.id,
+            ts_hlc: self.ts_hlc,
+            agent_id: self.agent_id,
+            session_id: self.session_id,
+            kind: self.kind,
+            content: self.content,
+            embedding: self.embedding,
+            attrs: self.attrs,
+            parents: self.parents,
+            valid_from: None,
+            valid_to: None,
+        }
+    }
+}
+
+/// Descodifica o payload bincode de um registo físico para o `Episode`
+/// completo, conforme a VERSÃO do segmento — o bincode não é autodescritivo,
+/// por isso cada geração tem a sua réplica de layout:
+/// - v<=2 (pré-M30): `Episode` (sem valid time) serializado direto;
+/// - v3: `StoragePayloadV3` (opaque_meta + episódio completo, sem valid time);
+/// - v4+: `StoragePayload` (com `valid_from`/`valid_to` nativos).
+/// Descodificar com o layout errado desaloca os campos (Utf8Error).
+/// Consumidores: read/scan internos e o tier (recall-on-demand). O `content`
+/// volta como foi persistido (cifrado se havia keystore).
+pub fn decode_episode_payload(version: u16, payload: &[u8]) -> Result<Episode, HeraclitusError> {
+    if version >= 4 {
+        let (sp, _): (StoragePayload, usize) = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
+            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+        Ok(sp.into_episode())
+    } else if version == 3 {
+        let (sp, _): (StoragePayloadV3, usize) = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
+            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+        Ok(sp.into_episode())
+    } else {
+        let (ep, _): (EpisodeV2, usize) = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
+            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+        Ok(ep.into_episode())
+    }
 }
 
 impl StoragePayload {
@@ -155,6 +257,8 @@ impl StoragePayload {
             embedding: self.embedding,
             attrs: self.attrs,
             parents: self.parents,
+            valid_from: self.valid_from,
+            valid_to: self.valid_to,
         }
     }
 }
@@ -223,6 +327,10 @@ impl Log {
             let is_last = Some(*id) == ids.last().copied();
             
             let scan = scan_segment_file(&path, *id)?;
+            // O relógio HLC nunca arranca ATRÁS do que já está persistido:
+            // sem isto, um wall clock que recuasse entre execuções quebraria
+            // a monotonicidade de ts por LSN (o contrato do AS OF TIMESTAMP).
+            hlc.observe(scan.max_hlc);
             if scan.corruption_detected || scan.valid_len < scan.file_len {
                 execute_physical_repair(&path, scan.valid_len)?;
             }
@@ -244,6 +352,7 @@ impl Log {
                         max_lsn: scan.max_lsn.unwrap_or(base_l),
                         sealed: true,
                         blake3_root: scan.blake3_root,
+                        version: scan.version,
                     },
                     index: Arc::new(SegmentIndex { entries: Arc::new(entries) }),
                 }));
@@ -259,6 +368,7 @@ impl Log {
                         max_lsn: scan.max_lsn.unwrap_or(base_l),
                         sealed: true,
                         blake3_root: Some(merkle_root(&scan.record_hashes)),
+                        version: scan.version,
                     },
                     index: Arc::new(SegmentIndex { entries: Arc::new(entries) }),
                 }));
@@ -283,6 +393,8 @@ impl Log {
                         max_lsn: u64::MAX,
                         sealed: false,
                         blake3_root: None,
+                        // tail_scan só é aceite quando scan.version == FORMAT_VERSION
+                        version: format::FORMAT_VERSION,
                     },
                     index: Arc::new(SegmentIndex { entries: Arc::new(entries) }),
                 });
@@ -311,6 +423,7 @@ impl Log {
                         max_lsn: u64::MAX,
                         sealed: false,
                         blake3_root: None,
+                        version: format::FORMAT_VERSION,
                     },
                     index: Arc::new(SegmentIndex { entries: Arc::new(Vec::new()) }),
                 });
@@ -437,6 +550,8 @@ impl Log {
                                     embedding: episode.embedding.clone(),
                                     attrs: episode.attrs.clone(),
                                     parents: episode.parents.clone(),
+                                    valid_from: episode.valid_from,
+                                    valid_to: episode.valid_to,
                                 };
 
                                 scratch_buffer.clear();
@@ -555,16 +670,22 @@ impl Log {
 
                     std::sync::atomic::compiler_fence(Ordering::Release);
 
-                    // PIPELINE — FASE 5: REPLICATION ROUTER STREAM
-                    for update in &stashed_updates {
-                        let _ = worker_tail_tx.send((update.lsn, update.episode.clone()));
-                        let _ = update.resp_tx.send(Ok(update.lsn));
-                    }
-
-                    // PIPELINE — FASE 6: PONTEIRO LINEARIZÁVEL E LIBERAÇÃO DE BARREIRAS DE FLUSH
+                    // PIPELINE — FASE 5: PONTEIRO LINEARIZÁVEL. Publica o
+                    // committed_lsn ANTES de responder aos clientes: quem
+                    // recebe o ACK de um append tem de conseguir ler o próprio
+                    // registo de imediato (read-your-writes). Responder
+                    // primeiro, como antes, deixava head()/scan() atrasados
+                    // face ao ACK — uma corrida de visibilidade real.
                     if let Some(highest_lsn) = highest_committed_lsn_in_batch {
                         current_lsn = highest_lsn + 1;
                         worker_committed_lsn.store(current_lsn, Ordering::Release);
+                    }
+
+                    // PIPELINE — FASE 6: REPLICATION ROUTER STREAM, ACKs E
+                    // LIBERAÇÃO DE BARREIRAS DE FLUSH
+                    for update in &stashed_updates {
+                        let _ = worker_tail_tx.send((update.lsn, update.episode.clone()));
+                        let _ = update.resp_tx.send(Ok(update.lsn));
                     }
 
                     for flush_tx in stashed_flushes.drain(..) {
@@ -697,12 +818,18 @@ impl Log {
             return Ok(None);
         }
         
-        match format::decode_record(format::FORMAT_VERSION, &buf) {
+        // Versão do SEGMENTO (não a corrente): decide a regra de CRC e o
+        // layout do payload. read_at recebe só (seg, off), por isso lê o
+        // header do próprio ficheiro — barato: já está aberto.
+        let version = {
+            let mut hdr = [0u8; HEADER_LEN];
+            f.seek(SeekFrom::Start(0))?;
+            f.read_exact(&mut hdr)?;
+            format::SegmentHeader::decode(&hdr)?.version
+        };
+        match format::decode_record(version, &buf) {
             Decoded::Record(rlsn, _hlc, payload, _) => {
-                let (storage_payload, _): (StoragePayload, usize) = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
-                        .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-                
-                let mut ep = storage_payload.into_episode();
+                let mut ep = decode_episode_payload(version, payload)?;
                 self.decrypt_in_place(&mut ep)?;
                 Ok(Some((rlsn, ep)))
             }
@@ -770,10 +897,21 @@ impl Log {
                     }
 
                     while scan_lsn < effective_to && out.len() < max {
-                        if file_ref.read_exact(&mut record_header_buffer).is_err() {
-                            break; 
+                        // Fronteira de segmento SELADO: depois do último registo
+                        // vem o FOOTER — lê-lo como header de registo fazia o
+                        // guard de payload explodir com falso "Corruption" em
+                        // qualquer scan que atravessasse segmentos. Sai para o
+                        // loop externo escolher o próximo container.
+                        if container.meta.sealed && scan_lsn > container.meta.max_lsn {
+                            break;
                         }
-                        
+                        if file_ref.read_exact(&mut record_header_buffer).is_err() {
+                            break;
+                        }
+                        if record_header_buffer[..4] == format::FOOTER_MAGIC {
+                            break;
+                        }
+
                         let len = u32::from_le_bytes(record_header_buffer[..4].try_into().unwrap_or([0u8; 4])) as usize;
                         if len > 512 * 1024 * 1024 {
                             return Err(HeraclitusError::Corruption {
@@ -788,14 +926,11 @@ impl Log {
                             break; 
                         }
 
-                        match format::decode_record(format::FORMAT_VERSION, &record_buf) {
+                        match format::decode_record(container.meta.version, &record_buf) {
                             Decoded::Record(rlsn, _hlc, payload, _) => {
                                 if rlsn == scan_lsn {
-                                    let (storage_payload, _): (StoragePayload, usize) = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
-                                        .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-                                    
-                                    let mut ep = storage_payload.into_episode();
-                                    
+                                    let mut ep = decode_episode_payload(container.meta.version, payload)?;
+
                                     self.decrypt_in_place(&mut ep)?;
                                     out.push((rlsn, ep));
                                     scan_lsn += 1;
@@ -816,6 +951,41 @@ impl Log {
             scan_lsn += 1;
         }
         Ok(out)
+    }
+
+    /// Verificação pontual de UM segmento (introspecção operacional, padrão
+    /// immudb `verify_row`): re-varre o ficheiro, recomputa a raiz Merkle com
+    /// a regra de leaf da versão do segmento e compara com o rodapé/catálogo.
+    /// `None` se o id não existir no catálogo.
+    pub fn verify_segment(&self, id: SegmentId) -> Result<Option<SegmentVerifyReport>, HeraclitusError> {
+        let catalog = self.catalog.load();
+        let meta = catalog
+            .sealed
+            .iter()
+            .map(|c| &c.meta)
+            .chain(std::iter::once(&catalog.active.meta))
+            .find(|m| m.id == id)
+            .cloned();
+        let Some(meta) = meta else { return Ok(None) };
+        let scan = scan_segment_file(&meta.path, id)?;
+        let computed_root = merkle_root(&scan.record_hashes);
+        let stored_root = scan.blake3_root.or(meta.blake3_root);
+        // Um segmento selado é válido se a raiz recomputada bate com a do
+        // rodapé; o ativo (sem rodapé ainda) é válido se a varredura não
+        // detectou corrupção física.
+        let valid = !scan.corruption_detected
+            && stored_root.map_or(!meta.sealed, |s| s == computed_root);
+        Ok(Some(SegmentVerifyReport {
+            id,
+            version: scan.version,
+            sealed: meta.sealed,
+            records: scan.record_hashes.len() as u64,
+            base_lsn: meta.base_lsn,
+            max_lsn: scan.max_lsn.unwrap_or(meta.base_lsn),
+            computed_root,
+            stored_root,
+            valid,
+        }))
     }
 
     pub fn verify(&self) -> Result<VerifyReport, HeraclitusError> {
@@ -857,43 +1027,46 @@ impl Log {
     }
 
     /// Caminho de escrita público: envia um `LogCommand::Append` e devolve o LSN
-    /// atribuído. Modelado em `append_raft_entry`; `opaque_meta` transporta o
-    /// `EventId` (Ulid, 16 bytes) para reconstrução do `id` na leitura.
-    pub fn append(&self, episode: Episode) -> Result<Lsn, HeraclitusError> {
-        self.check_poison()?;
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        let opaque_meta = episode.id.0.to_bytes();
-        self.cmd_tx.send_timeout(LogCommand::Append {
-            opaque_meta,
-            episode: Arc::new(episode),
-            expected_lsn: None,
-            resp_tx: tx,
-        }, std::time::Duration::from_secs(10))
-        .map_err(|_| HeraclitusError::StorageEngine("Timeout de canal: pipeline saturado".into()))?;
-        rx.recv().map_err(|_| HeraclitusError::StorageEngine("Worker interrompido no append".into()))?
+    /// atribuído. O `ts_hlc` do episódio é carimbado pelo HLC do log — o
+    /// produtor não manda no relógio (`Episode::new` deixa 0); a monotonicidade
+    /// estrita de ts por LSN é o contrato de que `lsn_for_timestamp` (AS OF
+    /// TIMESTAMP) depende. `opaque_meta` transporta o `EventId` (Ulid, 16 bytes)
+    /// para reconstrução do `id` na leitura.
+    pub fn append(&self, mut episode: Episode) -> Result<Lsn, HeraclitusError> {
+        episode.ts_hlc = self.hlc.now();
+        self.enqueue_append(episode, None, "append")
     }
 
     /// Append com compare-and-append (OCC): só grava se o head do log for
     /// exatamente `expected`, senão devolve `CasConflict`. Usado por `heraclitus-txn`.
-    pub fn append_cas(&self, expected: Lsn, episode: Episode) -> Result<Lsn, HeraclitusError> {
+    /// Carimba o `ts_hlc` como `append`.
+    pub fn append_cas(&self, expected: Lsn, mut episode: Episode) -> Result<Lsn, HeraclitusError> {
+        episode.ts_hlc = self.hlc.now();
+        self.enqueue_append(episode, Some(expected), "append_cas")
+    }
+
+    /// Aplicação replicada (follower): grava a entrada do líder na posição exata
+    /// `lsn` (CAS com `expected = lsn` — falha se o head divergir, garantindo
+    /// ordem estrita). PRESERVA o carimbo HLC do líder — replicar não re-carimba
+    /// — e fá-lo observar pelo HLC local para manter o relógio monotónico.
+    /// NOTA: rever semântica de replicação (gaps/idempotência).
+    pub fn append_replicated(&self, lsn: Lsn, episode: Episode) -> Result<Lsn, HeraclitusError> {
+        self.hlc.observe(episode.ts_hlc);
+        self.enqueue_append(episode, Some(lsn), "append_replicated")
+    }
+
+    fn enqueue_append(&self, episode: Episode, expected_lsn: Option<Lsn>, ctx: &str) -> Result<Lsn, HeraclitusError> {
         self.check_poison()?;
         let (tx, rx) = crossbeam_channel::bounded(1);
         let opaque_meta = episode.id.0.to_bytes();
         self.cmd_tx.send_timeout(LogCommand::Append {
             opaque_meta,
             episode: Arc::new(episode),
-            expected_lsn: Some(expected),
+            expected_lsn,
             resp_tx: tx,
         }, std::time::Duration::from_secs(10))
-        .map_err(|_| HeraclitusError::StorageEngine("Timeout de canal: pipeline saturado".into()))?;
-        rx.recv().map_err(|_| HeraclitusError::StorageEngine("Worker interrompido no append_cas".into()))?
-    }
-
-    /// Aplicação replicada (follower): grava a entrada do líder na posição exata
-    /// `lsn`. Implementado como CAS com `expected = lsn` — falha se o head divergir,
-    /// garantindo ordem estrita. NOTA: rever semântica de replicação (gaps/idempotência).
-    pub fn append_replicated(&self, lsn: Lsn, episode: Episode) -> Result<Lsn, HeraclitusError> {
-        self.append_cas(lsn, episode)
+        .map_err(|_| HeraclitusError::StorageEngine(format!("Timeout de canal: pipeline saturado ({ctx})")))?;
+        rx.recv().map_err(|_| HeraclitusError::StorageEngine(format!("Worker interrompido no {ctx}")))?
     }
 
     pub fn sealed_segments(&self) -> Vec<SegmentMeta> {
@@ -925,8 +1098,10 @@ impl Log {
 impl RaftLogStorage for Log {
     fn append_raft_entry(&self, term: u64, index: u64, episode: Episode) -> Result<Lsn, HeraclitusError> {
         self.check_poison()?;
+        // Entrada expedida pelo líder: preserva o carimbo dele, observa-o localmente.
+        self.hlc.observe(episode.ts_hlc);
         let (tx, rx) = crossbeam_channel::bounded(1);
-        
+
         let mut opaque_meta = [0u8; 16];
         opaque_meta[..8].copy_from_slice(&term.to_le_bytes());
         opaque_meta[8..16].copy_from_slice(&index.to_le_bytes());
@@ -971,17 +1146,16 @@ impl RaftLogStorage for Log {
                 f.seek(SeekFrom::Start(entry.offset))?;
                 f.read_exact(&mut buf)?;
 
-                if let Decoded::Record(_, _, payload, _) = format::decode_record(format::FORMAT_VERSION, &buf) {
-                    let (storage_payload, _): (StoragePayload, usize) = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
-                        .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-                    
+                if let Decoded::Record(_, _, payload, _) = format::decode_record(container.meta.version, &buf) {
+                    let ep = decode_episode_payload(container.meta.version, payload)?;
+
                     let term = u64::from_le_bytes(entry.opaque_meta[..8].try_into().unwrap_or([0u8; 8]));
                     let index = u64::from_le_bytes(entry.opaque_meta[8..16].try_into().unwrap_or([0u8; 8]));
 
                     return Ok(Some((lsn, RaftEntry {
                         term,
                         index,
-                        payload: Arc::new(storage_payload.into_episode()),
+                        payload: Arc::new(ep),
                     })));
                 }
             }
@@ -1058,6 +1232,7 @@ fn roll_segment(
             max_lsn: footer.max_lsn,
             sealed: true,
             blake3_root: Some(footer.blake3_root),
+            version: format::FORMAT_VERSION,
         },
         index: current_catalog.active.index.clone(),
     }));
@@ -1073,10 +1248,11 @@ fn roll_segment(
             max_lsn: u64::MAX,
             sealed: false,
             blake3_root: None,
+            version: format::FORMAT_VERSION,
         },
         index: Arc::new(SegmentIndex { entries: Arc::new(Vec::new()) }),
     });
-    
+
     catalog_swap.store(Arc::new(LogCatalog {
         sealed: Arc::new(new_sealed),
         active: next_active_container,
@@ -1132,7 +1308,7 @@ fn handle_truncation_protected(
         let mut buf = vec![0u8; format::RECORD_HEADER_LEN + len];
         file.seek(SeekFrom::Start(entry.offset))?;
         file.read_exact(&mut buf)?;
-        hashes.push(format::record_leaf(format::FORMAT_VERSION, &buf));
+        hashes.push(format::record_leaf(target_container.meta.version, &buf));
         
         valid_len = entry.offset + format::RECORD_HEADER_LEN as u64 + len as u64;
     }
@@ -1174,6 +1350,7 @@ fn handle_truncation_protected(
             max_lsn: u64::MAX,
             sealed: false,
             blake3_root: None,
+            version: target_container.meta.version,
         },
         index: Arc::new(SegmentIndex { entries: Arc::new(new_entries) }),
     });
@@ -1227,6 +1404,11 @@ struct SegmentScan {
     blake3_root: Option<[u8; 32]>,
     version: u16,
     corruption_detected: bool,
+    /// Maior HLC persistido no segmento — o `open` observa-o para que o
+    /// relógio NUNCA arranque atrás do que já está no disco (a monotonicidade
+    /// de ts por LSN é o contrato do `AS OF TIMESTAMP`; um wall clock que
+    /// recuasse entre execuções quebrá-la-ia sem isto).
+    max_hlc: u64,
 }
 
 /// PASSADA ÚNICA ( BufReader streaming): Varre o log de forma estritamente sequencial sem seek recursivo O(N²).
@@ -1246,6 +1428,7 @@ fn scan_segment_file(path: &Path, _id: SegmentId) -> Result<SegmentScan, Heracli
             blake3_root: None,
             version: format::FORMAT_VERSION,
             corruption_detected: file_len > 0,
+            max_hlc: 0,
         });
     }
 
@@ -1263,6 +1446,7 @@ fn scan_segment_file(path: &Path, _id: SegmentId) -> Result<SegmentScan, Heracli
     let mut root = None;
     let mut last_lsn: Option<Lsn> = None;
     let mut corruption = false;
+    let mut max_hlc = 0u64;
 
     while offset < file_len {
         let mut magic_peek = [0u8; 4];
@@ -1313,7 +1497,7 @@ fn scan_segment_file(path: &Path, _id: SegmentId) -> Result<SegmentScan, Heracli
             record_buf[4..].copy_from_slice(&remainder_buf);
 
             match format::decode_record(version, &record_buf) {
-                Decoded::Record(lsn, _hlc, payload, consumed) => {
+                Decoded::Record(lsn, hlc, payload, consumed) => {
                     if let Some(prev) = last_lsn {
                         if lsn <= prev {
                             corruption = true;
@@ -1321,12 +1505,26 @@ fn scan_segment_file(path: &Path, _id: SegmentId) -> Result<SegmentScan, Heracli
                         }
                     }
                     last_lsn = Some(lsn);
+                    max_hlc = max_hlc.max(hlc);
 
-                    let (storage_payload, _): (StoragePayload, usize) = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
-                        .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+                    // Versão do segmento decide o layout: v3+ traz opaque_meta
+                    // no payload; v<=2 deriva-o do EventId do Episode.
+                    let opaque_meta = if version >= 4 {
+                        let (sp, _): (StoragePayload, usize) = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
+                            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+                        sp.opaque_meta
+                    } else if version == 3 {
+                        let (sp, _): (StoragePayloadV3, usize) = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
+                            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+                        sp.opaque_meta
+                    } else {
+                        let (ep, _): (EpisodeV2, usize) = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
+                            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+                        ep.id.0.to_bytes()
+                    };
 
                     hashes.push(format::record_leaf(version, &record_buf[..consumed]));
-                    locs.push((lsn, offset, storage_payload.opaque_meta));
+                    locs.push((lsn, offset, opaque_meta));
                     min_lsn = Some(min_lsn.map_or(lsn, |m: u64| m.min(lsn)));
                     max_lsn = Some(max_lsn.map_or(lsn, |m: u64| m.max(lsn)));
                     offset += consumed as u64;
@@ -1350,6 +1548,7 @@ fn scan_segment_file(path: &Path, _id: SegmentId) -> Result<SegmentScan, Heracli
         blake3_root: root,
         version,
         corruption_detected: corruption,
+        max_hlc,
     })
 }
 
@@ -1426,5 +1625,19 @@ pub struct VerifyReport {
     pub segments: u64,
     pub records: u64,
     pub merkle_ok: u64,
+}
+
+/// Relatório da verificação pontual de um segmento ([`Log::verify_segment`]).
+#[derive(Debug, Clone)]
+pub struct SegmentVerifyReport {
+    pub id: SegmentId,
+    pub version: u16,
+    pub sealed: bool,
+    pub records: u64,
+    pub base_lsn: Lsn,
+    pub max_lsn: Lsn,
+    pub computed_root: [u8; 32],
+    pub stored_root: Option<[u8; 32]>,
+    pub valid: bool,
 }
 

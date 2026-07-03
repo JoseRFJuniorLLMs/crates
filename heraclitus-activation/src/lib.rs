@@ -169,9 +169,57 @@ impl ActivationStore {
     }
 }
 
+/// Snapshot serializável (fast boot): o `ArrayVec` do registo vira `Vec`
+/// no disco e é reconstruído no restore (evita depender da feature serde do
+/// arrayvec).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ActivationSnapshot {
+    decay: f64,
+    watermark: Lsn,
+    records: Vec<(EventId, Vec<u64>, u64, u64)>, // (id, recent, n, first_access)
+}
+
 impl View for ActivationStore {
     fn name(&self) -> &str {
         "activation"
+    }
+
+    fn checkpoint(&self, dir: &std::path::Path) -> Result<(), heraclitus_core::HeraclitusError> {
+        let records = self
+            .records
+            .iter()
+            .map(|e| {
+                let r = e.value();
+                (*e.key(), r.recent.to_vec(), r.n, r.first_access)
+            })
+            .collect();
+        heraclitus_views::ckpt::save(
+            dir,
+            "activation",
+            &ActivationSnapshot { decay: self.decay, watermark: self.watermark, records },
+        )
+    }
+
+    fn restore(&mut self, dir: &std::path::Path) -> Result<bool, heraclitus_core::HeraclitusError> {
+        let Some(snap) = heraclitus_views::ckpt::load::<ActivationSnapshot>(dir, "activation")?
+        else {
+            return Ok(false);
+        };
+        self.records = snap
+            .records
+            .into_iter()
+            .map(|(id, recent, n, first_access)| {
+                let mut rec = ActivationRecord { n, first_access, ..Default::default() };
+                for t in recent.into_iter().take(RECENT_K) {
+                    rec.recent.push(t);
+                }
+                (id, rec)
+            })
+            .collect();
+        // O decay é configuração de runtime (config.activation_decay), não
+        // estado derivado: mantém o do processo atual.
+        self.watermark = snap.watermark;
+        Ok(true)
     }
 
     /// Determinism note (§3.5): the "access time" used during replay is the

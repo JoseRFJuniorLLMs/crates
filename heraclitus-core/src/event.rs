@@ -57,6 +57,13 @@ pub struct Episode {
     pub attrs: BTreeMap<String, String>,
     /// Causal parents (explicit provenance edges between episodes).
     pub parents: Vec<EventId>,
+    /// Bi-temporalidade NATIVA (FORMAT v4, SQL:2011/XTDB): desde quando o
+    /// facto é válido NO MUNDO (valid time), distinto do `ts_hlc`/LSN
+    /// (transaction time — quando foi gravado). `None` = desde sempre.
+    /// Intervalo meio-aberto `[valid_from, valid_to)`.
+    pub valid_from: Option<u64>,
+    /// Fim da validade no mundo. `None` = ainda válido.
+    pub valid_to: Option<u64>,
 }
 
 impl Episode {
@@ -71,6 +78,8 @@ impl Episode {
             embedding: None,
             attrs: BTreeMap::new(),
             parents: Vec::new(),
+            valid_from: None,
+            valid_to: None,
         }
     }
 }

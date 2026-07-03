@@ -25,7 +25,7 @@ pub type EntityId = String; // canonical entity id
 
 /// One canonical assignment of a key, valid over the half-open LSN interval
 /// `[valid_from_lsn, valid_to_lsn)`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntityInterval {
     pub entity_id: EntityId,
     pub valid_from_lsn: Lsn,
@@ -39,7 +39,7 @@ impl EntityInterval {
 }
 
 /// Deterministic temporal entity resolver (M11). Materialized view over the log.
-#[derive(Default)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EntityResolver {
     /// Append-only temporal record: key → its assignment intervals.
     pub mappings: BTreeMap<Key, Vec<EntityInterval>>,
@@ -221,6 +221,18 @@ impl heraclitus_views::View for EntityResolver {
     }
     fn watermark(&self) -> heraclitus_core::Lsn {
         self.watermark
+    }
+    fn checkpoint(&self, dir: &std::path::Path) -> Result<(), heraclitus_core::HeraclitusError> {
+        heraclitus_views::ckpt::save(dir, "entity", self)
+    }
+    fn restore(&mut self, dir: &std::path::Path) -> Result<bool, heraclitus_core::HeraclitusError> {
+        match heraclitus_views::ckpt::load::<EntityResolver>(dir, "entity")? {
+            Some(r) => {
+                *self = r;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
     fn reset(&mut self) {
         *self = EntityResolver::new();

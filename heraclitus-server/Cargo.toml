@@ -40,6 +40,13 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+[features]
+# Real wgpu dispatch for exact RECALL (M20.3.1): forwards down the chain
+# server -> index-vector -> heraclitus-gpu. Validated on hardware by the
+# self-checks `gpu_matches_cpu_on_hardware` / `product_gpu_matches_cpu_on_hardware`
+# (the CPU f64 rescore always has the final say, so results stay exact).
+gpu = ["heraclitus-index-vector/gpu"]
+
 # Only the service binary needs these, and only on Windows.
 [target.'cfg(windows)'.dependencies]
 windows-service = { workspace = true }

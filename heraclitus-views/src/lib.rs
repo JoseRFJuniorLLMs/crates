@@ -14,6 +14,53 @@ use heraclitus_log::Log;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Helpers partilhados de checkpoint (§fast boot): cada view persiste um
+/// snapshot bincode do estado derivado em `<views>/<nome>.ckpt` com escrita
+/// atómica (tmp + fsync + rename). A correção NUNCA depende disto — sem
+/// checkpoint a view reconstrói-se do LSN 0; com ele, o boot replaya só a
+/// cauda `(watermark, head]` em vez do log inteiro (a lição operacional da
+/// carga massiva de 2026-07-02: replay total não escala).
+pub mod ckpt {
+    use super::HeraclitusError;
+    use std::io::Write as _;
+    use std::path::Path;
+
+    pub fn save<T: serde::Serialize>(
+        dir: &Path,
+        name: &str,
+        value: &T,
+    ) -> Result<(), HeraclitusError> {
+        let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard())
+            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+        let tmp = dir.join(format!("{name}.ckpt.tmp"));
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, dir.join(format!("{name}.ckpt")))?;
+        Ok(())
+    }
+
+    /// `Ok(None)` = sem checkpoint OU checkpoint ilegível (formato antigo /
+    /// corrompido) — a view nasce vazia e o registry força replay desde 0.
+    /// Um snapshot ilegível NUNCA pode impedir o boot: o estado é derivado e
+    /// o log é a verdade; degradar para rebuild é correto por construção.
+    pub fn load<T: serde::de::DeserializeOwned>(
+        dir: &Path,
+        name: &str,
+    ) -> Result<Option<T>, HeraclitusError> {
+        let bytes = match std::fs::read(dir.join(format!("{name}.ckpt"))) {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        match bincode::serde::decode_from_slice::<T, _>(&bytes, bincode::config::standard()) {
+            Ok((value, _)) => Ok(Some(value)),
+            Err(_) => Ok(None),
+        }
+    }
+}
+
 /// A materialized view over the log.
 pub trait View: Send + Sync {
     fn name(&self) -> &str;
@@ -24,6 +71,14 @@ pub trait View: Send + Sync {
     /// Persist derived state (optional; views may be RAM-only).
     fn checkpoint(&self, _dir: &Path) -> Result<(), HeraclitusError> {
         Ok(())
+    }
+    /// Restaura o estado derivado persistido por [`checkpoint`](View::checkpoint).
+    /// Devolve `true` se restaurou (o watermark persistido passa a ser válido) ou
+    /// `false` (default) se a view nasce vazia — nesse caso o registry FORÇA o
+    /// replay desde 0 para não perder `(0, watermark]`. Sem este par
+    /// checkpoint+restore, confiar no watermark persistido esvazia a view no restart.
+    fn restore(&mut self, _dir: &Path) -> Result<bool, HeraclitusError> {
+        Ok(false)
     }
     /// Reset internal state ahead of a rebuild from `lsn`.
     fn reset(&mut self);
@@ -69,6 +124,11 @@ impl ViewRegistry {
         }
     }
 
+    /// Watermarks por view (introspecção: `heraclitus_state()`).
+    pub fn watermarks(&self) -> &HashMap<String, Lsn> {
+        &self.watermarks
+    }
+
     /// Minimum watermark across views (safe prune point for the memtable).
     pub fn min_watermark(&self) -> Lsn {
         self.views
@@ -80,6 +140,21 @@ impl ViewRegistry {
 
     /// On startup: replay `(watermark, head]` for each view.
     pub fn catch_up(&mut self, log: &Log) -> Result<u64, HeraclitusError> {
+        // Correção de correção (não só perf): um watermark persistido só é válido
+        // se o ESTADO da view também tiver sido restaurado. Views que nascem vazias
+        // (restore()==false, o default) têm o watermark forçado a 0 aqui, senão o
+        // replay `(watermark, head]` deixá-las-ia sem `(0, watermark]` no restart.
+        let dir = self.dir.clone();
+        let mut to_reset = Vec::new();
+        for v in self.views.iter_mut() {
+            if !v.restore(&dir)? {
+                to_reset.push(v.name().to_string());
+            }
+        }
+        for name in to_reset {
+            self.watermarks.remove(&name);
+        }
+
         let from = self
             .views
             .iter()
@@ -232,5 +307,40 @@ mod tests {
 
         assert_eq!(first.0, 50);
         assert_eq!(first, second, "replay must be deterministic");
+    }
+
+    #[test]
+    fn empty_view_replays_from_zero_despite_persisted_watermark() {
+        // Regressão: watermarks.json persiste watermarks avançados, mas se a view
+        // nasce vazia (restore()==false) e catch_up confiasse no watermark, ela
+        // ficaria sem `(0, watermark]` no restart. O fix força replay desde 0.
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::open(dir.path().join("log"), 1 << 20, FsyncPolicy::Always).unwrap();
+        for i in 0..50 {
+            log.append(Episode::new("a", EventKind::Observation, format!("e{i}").into_bytes()))
+                .unwrap();
+        }
+
+        // 1ª sessão: aplica tudo e persiste watermarks.json (= head).
+        {
+            let state = Arc::new(Mutex::new((0u64, 0u64)));
+            let mut reg = ViewRegistry::open(dir.path()).unwrap();
+            reg.register(Box::new(CountView { state: state.clone(), wm: 0 }));
+            reg.catch_up(&log).unwrap();
+            assert_eq!(state.lock().unwrap().0, 50);
+        }
+
+        // Restart: NOVO registry lê watermarks.json (avançado), view NASCE VAZIA.
+        let state2 = Arc::new(Mutex::new((0u64, 0u64)));
+        let mut reg2 = ViewRegistry::open(dir.path()).unwrap();
+        reg2.register(Box::new(CountView { state: state2.clone(), wm: 0 }));
+        reg2.catch_up(&log).unwrap();
+
+        // Sem o fix isto seria 0 (view vazia, replay saltado). Com o fix: 50.
+        assert_eq!(
+            state2.lock().unwrap().0,
+            50,
+            "view vazia (restore=false) tem de replayar TODO o histórico desde 0"
+        );
     }
 }

@@ -95,9 +95,72 @@ impl GraphIndex {
     }
 }
 
+/// Snapshot serializável (fast boot). DashMaps viram Vec de pares; bitmaps
+/// roaring vão no formato nativo (portável); `internal` reconstrói-se de
+/// `by_internal` no restore.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct GraphSnapshot {
+    out: Vec<(EventId, Vec<EventId>)>,
+    inn: Vec<(EventId, Vec<EventId>)>,
+    attr: Vec<(String, Vec<u8>)>,
+    by_internal: Vec<EventId>,
+    lsn_of: Vec<(EventId, Lsn)>,
+    watermark: Lsn,
+}
+
 impl View for GraphIndex {
     fn name(&self) -> &str {
         "graph"
+    }
+
+    fn checkpoint(&self, dir: &std::path::Path) -> Result<(), heraclitus_core::HeraclitusError> {
+        let mut attr = Vec::with_capacity(self.attr_idx.len());
+        for e in self.attr_idx.iter() {
+            let mut bytes = Vec::with_capacity(e.value().serialized_size());
+            e.value()
+                .serialize_into(&mut bytes)
+                .map_err(|err| heraclitus_core::HeraclitusError::Serialization(err.to_string()))?;
+            attr.push((e.key().clone(), bytes));
+        }
+        heraclitus_views::ckpt::save(
+            dir,
+            "graph",
+            &GraphSnapshot {
+                out: self.out.iter().map(|e| (*e.key(), e.value().clone())).collect(),
+                inn: self.inn.iter().map(|e| (*e.key(), e.value().clone())).collect(),
+                attr,
+                by_internal: self.by_internal.clone(),
+                lsn_of: self.lsn_of.iter().map(|(k, v)| (*k, *v)).collect(),
+                watermark: self.watermark,
+            },
+        )
+    }
+
+    fn restore(&mut self, dir: &std::path::Path) -> Result<bool, heraclitus_core::HeraclitusError> {
+        let Some(snap) = heraclitus_views::ckpt::load::<GraphSnapshot>(dir, "graph")? else {
+            return Ok(false);
+        };
+        self.out = snap.out.into_iter().collect();
+        self.inn = snap.inn.into_iter().collect();
+        self.attr_idx = snap
+            .attr
+            .into_iter()
+            .map(|(k, bytes)| {
+                RoaringBitmap::deserialize_from(&bytes[..])
+                    .map(|b| (k, b))
+                    .map_err(|e| heraclitus_core::HeraclitusError::Serialization(e.to_string()))
+            })
+            .collect::<Result<_, _>>()?;
+        self.internal = snap
+            .by_internal
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, i as u32))
+            .collect();
+        self.by_internal = snap.by_internal;
+        self.lsn_of = snap.lsn_of.into_iter().collect();
+        self.watermark = snap.watermark;
+        Ok(true)
     }
 
     fn apply(&mut self, lsn: Lsn, event: &Episode) {

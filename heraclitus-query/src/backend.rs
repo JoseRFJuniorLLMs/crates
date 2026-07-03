@@ -8,6 +8,7 @@ use crate::fusion::{FusedHit, FusionInput, FusionWeights};
 use heraclitus_core::{Episode, EventId, EventKind, HeraclitusError, Lsn};
 use heraclitus_index_graph::adaptive::{self, LabeledFlag, PolicyEval};
 use heraclitus_index_graph::decision::{self, DecisionPolicy};
+use heraclitus_index_graph::entity::EntityResolver;
 use heraclitus_index_graph::temporal::{Edge, EdgeType, EdgeVersion, TemporalGraph};
 use heraclitus_log::Log;
 use std::collections::{BTreeMap, HashMap, BinaryHeap, BTreeSet};
@@ -34,6 +35,10 @@ pub struct EdgeRow {
     pub to: String,
     pub etype: String,
     pub belief: f32,
+    /// Bi-temporal (V2.4): validade do facto no mundo real, herdada do
+    /// episódio que assertou a aresta (`None` = aberto/atemporal).
+    pub world_valid_from: Option<u64>,
+    pub world_valid_to: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -130,63 +135,12 @@ impl PartialOrd for MinScoreEntry {
     }
 }
 
-// =========================================================================
-// M29: ENTITY RESOLVER HISTÓRICO COM DEDUP COMPACTO EM TEMPO DE EXECUÇÃO
-// =========================================================================
-
-#[derive(Clone, Default)]
-pub struct EntityResolver {
-    pub watermark: Lsn,
-    pub mappings: HashMap<String, Arc<Vec<(Lsn, String)>>>,
-    pub clusters: HashMap<String, Arc<Vec<(Lsn, String)>>>,
-}
-
-impl EntityResolver {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn apply_episode(&mut self, lsn: Lsn, ep: &Episode) {
-        if let (Some(key), Some(entity_id)) = (ep.attrs.get("resolved_key"), ep.attrs.get("entity_id")) {
-            // CoW parcial para mitigar alocações redundantes
-            let map_vec = self.mappings.entry(key.clone()).or_default();
-            Arc::make_mut(map_vec).push((lsn, entity_id.clone()));
-
-            let cluster_vec = self.clusters.entry(entity_id.clone()).or_default();
-            Arc::make_mut(cluster_vec).push((lsn, key.clone()));
-        }
-    }
-
-    pub fn resolve(&self, key: &str, bound: Lsn) -> Option<String> {
-        let history = self.mappings.get(key)?;
-        let idx = match history.binary_search_by_key(&bound, |&(l, _)| l) {
-            Ok(found) => found,
-            Err(ins) => { if ins == 0 { return None; } ins - 1 }
-        };
-        history.get(idx).map(|(_, id)| id.clone())
-    }
-
-    pub fn cluster(&self, entity_id: &str, bound: Lsn) -> Vec<String> {
-        let history = match self.clusters.get(entity_id) {
-            Some(h) => h,
-            None => return Vec::new(),
-        };
-        
-        let idx = match history.binary_search_by_key(&bound, |&(l, _)| l) {
-            Ok(found) => found + 1,
-            Err(ins) => ins,
-        };
-        
-        let mut seen = BTreeSet::new();
-        let mut unique_keys = Vec::with_capacity(idx);
-        for &(_, ref key) in &history[..idx] {
-            if seen.insert(key) {
-                unique_keys.push(key.clone());
-            }
-        }
-        unique_keys
-    }
-}
+// NOTA (fix pós-M30): o "EntityResolver histórico" local que vivia aqui foi
+// removido — ele só entendia attrs pré-processados (`resolved_key`/`entity_id`)
+// que nenhum produtor emite, por isso RESOLVE/CLUSTER devolviam sempre vazio.
+// O bundle usa agora o resolver canónico do index-graph (M11), que processa os
+// eventos reais (`entity_key`, `er_op=merge/split`) e é o mesmo que o server
+// materializa — uma única semântica de resolução em todo o sistema.
 
 // =========================================================================
 // M29: VECTOR SEARCH ENGINE (HNSW SEGURO, HEURÍSTICA DE DIVERSIDADE E GRAU)
@@ -500,6 +454,20 @@ pub trait QueryBackend {
     fn append(&self, label: Option<&str>, props: &[(String, Value)]) -> Result<Lsn, HeraclitusError>;
     
     fn attr_lookup(&self, field: &str, value: &str, as_of: Option<Lsn>) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError>;
+    /// Range NUMÉRICO sobre um atributo (`WHERE n.campo > x AND n.campo < y`)
+    /// resolvido pelo índice ordenado em vez do scan. Bounds `(valor,
+    /// inclusivo?)`. Default `Ok(None)` = backend sem a capacidade → o planner
+    /// cai no scan por janela (o pós-filtro revalida tudo; correção nunca
+    /// depende do hint).
+    fn attr_range_lookup(
+        &self,
+        _field: &str,
+        _min: Option<(f64, bool)>,
+        _max: Option<(f64, bool)>,
+        _as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+        Ok(None)
+    }
     fn recall(&self, text: &str, k: usize, as_of: Option<Lsn>) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError>;
     fn nearest(&self, vector: &[f32], k: usize, as_of: Option<Lsn>) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError>;
     
@@ -508,6 +476,12 @@ pub trait QueryBackend {
     fn traverse(&self, start: &str, max_depth: usize, as_of: Option<Lsn>, min_confidence: f32) -> Result<Vec<(String, usize)>, HeraclitusError>;
     fn match_edges(&self, src: Option<&str>, etype: Option<&str>, dst: Option<&str>, as_of: Option<Lsn>) -> Result<Vec<EdgeRow>, HeraclitusError>;
     fn community(&self, node: &str, as_of: Option<Lsn>) -> Result<Option<CommunityResult>, HeraclitusError>;
+    /// Comunidades por LEIDEN (modularidade) — `COMMUNITY ("n", LEIDEN)`.
+    /// Default: cai nas componentes conexas do `community` (backends sem a
+    /// capacidade continuam corretos, só menos finos).
+    fn community_leiden(&self, node: &str, as_of: Option<Lsn>) -> Result<Option<CommunityResult>, HeraclitusError> {
+        self.community(node, as_of)
+    }
     fn node_metrics(&self, node: &str, as_of: Option<Lsn>) -> Result<Option<MetricsResult>, HeraclitusError>;
     fn edge_hypotheses(&self, from: &str, to: &str, etype: &str, as_of: Option<Lsn>) -> Result<Option<EdgeHypotheses>, HeraclitusError>;
     fn lsn_for_timestamp(&self, ts_ms: u64) -> Result<Lsn, HeraclitusError>;
@@ -729,23 +703,21 @@ impl LogBackend {
                 updated_graph.apply_episode(lsn, &ep);
                 updated_resolver.apply_episode(lsn, &ep);
                 
-                // Ingestão incremental com CoW granular
+                // Ingestão incremental com CoW granular. O tf persistido é a
+                // contagem BRUTA do termo (não normalizada pelo comprimento do
+                // doc): a semântica de referência do RECALL — e o gate M10 de
+                // fusão — pontua repetição ("fraude fraude" > "fraude").
                 updated_text.total_docs += 1;
                 let content_str = String::from_utf8_lossy(&ep.content).to_lowercase();
                 let mut local_frequencies: HashMap<String, f32> = HashMap::new();
-                let mut total_tokens = 0usize;
 
                 for token in content_str.split(|c: char| !c.is_alphanumeric()).filter(|s| !s.is_empty()) {
                     *local_frequencies.entry(token.to_string()).or_insert(0.0f32) += 1.0f32;
-                    total_tokens += 1;
                 }
 
-                if total_tokens > 0 {
-                    for (token, raw_count) in local_frequencies {
-                        let precomputed_tf = raw_count / (total_tokens as f32);
-                        let postings = updated_text.inverted_text.entry(token).or_default();
-                        Arc::make_mut(postings).push((lsn, precomputed_tf));
-                    }
+                for (token, raw_count) in local_frequencies {
+                    let postings = updated_text.inverted_text.entry(token).or_default();
+                    Arc::make_mut(postings).push((lsn, raw_count));
                 }
 
                 for (field, value) in &ep.attrs {
@@ -814,6 +786,53 @@ impl QueryBackend for LogBackend {
 
         let mut results = Vec::with_capacity(target_lsns.len());
         for &lsn in target_lsns {
+            if let Some((_, ep)) = self.log.read(lsn)? {
+                results.push((lsn, ep));
+            }
+        }
+        Ok(Some(results))
+    }
+
+    /// Range numérico de referência: varre os VALORES distintos do campo no
+    /// índice em RAM (O(#valores), exato) — o backend real usa o BTreeMap
+    /// ordenado do heraclitus-index-attr.
+    fn attr_range_lookup(
+        &self,
+        field: &str,
+        min: Option<(f64, bool)>,
+        max: Option<(f64, bool)>,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+        let b = self.sync_bundle()?;
+        let bound = self.resolve_as_of_bound(as_of)?;
+
+        let Some(values_map) = b.attr_index.attributes.get(field) else { return Ok(None); };
+
+        let in_range = |n: f64| {
+            min.map_or(true, |(m, inc)| if inc { n >= m } else { n > m })
+                && max.map_or(true, |(m, inc)| if inc { n <= m } else { n < m })
+        };
+
+        let mut lsns: Vec<Lsn> = Vec::new();
+        for (value, postings) in values_map.iter() {
+            let Ok(n) = value.trim().parse::<f64>() else { continue };
+            if !n.is_finite() || !in_range(n) {
+                continue;
+            }
+            let idx = match postings.binary_search(&bound) {
+                Ok(found) => found,
+                Err(ins) => ins,
+            };
+            lsns.extend_from_slice(&postings[..idx]);
+        }
+        if lsns.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        lsns.sort_unstable();
+        lsns.dedup();
+
+        let mut results = Vec::with_capacity(lsns.len());
+        for lsn in lsns {
             if let Some((_, ep)) = self.log.read(lsn)? {
                 results.push((lsn, ep));
             }
@@ -927,27 +946,33 @@ impl QueryBackend for LogBackend {
         Ok(final_hits)
     }
 
-    /// K-NN CORRIGIDO: Utilização estrita da estrutura MinScoreEntry unificada mitigando drifts de vizinhança
+    /// K-NN CORRIGIDO (fix pós-M30): (1) o nó de routing entra nos resultados —
+    /// antes o melhor hit era descartado e a fusão perdia o vencedor do canal
+    /// vetorial; (2) o heap de top-k é um MAX-heap por distância (via `Reverse`),
+    /// para que `peek` devolva o PIOR hit retido — era um min-heap, o que fazia
+    /// o corte usar o MELHOR hit como limite e a eviction expulsar o mais próximo.
     fn nearest(&self, vector: &[f32], k: usize, as_of: Option<Lsn>) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
+        if k == 0 { return Ok(Vec::new()); }
         let b = self.sync_bundle()?;
         let bound = self.resolve_as_of_bound(as_of)?;
-        
+
         let Some(best_routing_node) = b.vector_index.search_layer_greedy(vector, bound) else {
             return Ok(Vec::new());
         };
 
         let mut visited = BTreeSet::new();
         let mut candidate_heap: BinaryHeap<MinScoreEntry> = BinaryHeap::new();
-        let mut top_hits_heap: BinaryHeap<MinScoreEntry> = BinaryHeap::new();
+        let mut top_hits_heap: BinaryHeap<Reverse<MinScoreEntry>> = BinaryHeap::new();
 
         if let Some(first_vec) = b.vector_index.nodes.get(&best_routing_node) {
             let initial_dist = b.vector_index.compute_distance(vector, first_vec);
             candidate_heap.push(MinScoreEntry { score: initial_dist, lsn: best_routing_node });
+            top_hits_heap.push(Reverse(MinScoreEntry { score: initial_dist, lsn: best_routing_node }));
             visited.insert(best_routing_node);
         }
 
         while let Some(MinScoreEntry { score: curr_dist, lsn: current_node }) = candidate_heap.pop() {
-            let limit_dist = if top_hits_heap.len() >= k { top_hits_heap.peek().unwrap().score } else { f32::MAX };
+            let limit_dist = if top_hits_heap.len() >= k { top_hits_heap.peek().unwrap().0.score } else { f32::MAX };
             if curr_dist > limit_dist { break; }
 
             if let Some(neighbors) = b.vector_index.layers.get(0).and_then(|l| l.get(&current_node)) {
@@ -956,14 +981,13 @@ impl QueryBackend for LogBackend {
                     if visited.insert(neighbor) {
                         if let Some(n_vec) = b.vector_index.nodes.get(&neighbor) {
                             let dist = b.vector_index.compute_distance(vector, n_vec);
-                            let entry = MinScoreEntry { score: dist, lsn: neighbor };
-                            
+
                             if top_hits_heap.len() < k {
-                                top_hits_heap.push(entry);
+                                top_hits_heap.push(Reverse(MinScoreEntry { score: dist, lsn: neighbor }));
                                 candidate_heap.push(MinScoreEntry { score: dist, lsn: neighbor });
-                            } else if dist < top_hits_heap.peek().unwrap().score {
+                            } else if dist < top_hits_heap.peek().unwrap().0.score {
                                 top_hits_heap.pop();
-                                top_hits_heap.push(entry);
+                                top_hits_heap.push(Reverse(MinScoreEntry { score: dist, lsn: neighbor }));
                                 candidate_heap.push(MinScoreEntry { score: dist, lsn: neighbor });
                             }
                         }
@@ -972,7 +996,7 @@ impl QueryBackend for LogBackend {
             }
         }
 
-        let mut raw_hits: Vec<(Lsn, f32)> = top_hits_heap.into_iter().map(|MinScoreEntry { score, lsn }| (lsn, score)).collect();
+        let mut raw_hits: Vec<(Lsn, f32)> = top_hits_heap.into_iter().map(|Reverse(MinScoreEntry { score, lsn })| (lsn, score)).collect();
         raw_hits.sort_by(|a, b| a.1.total_cmp(&b.1));
 
         let mut final_hydrated_hits = Vec::with_capacity(raw_hits.len());
@@ -995,94 +1019,56 @@ impl QueryBackend for LogBackend {
         Ok(Vec::new())
     }
 
+    // Leituras de grafo/entidade (fix pós-M30): delegam nas funções livres
+    // `*_of`, que aplicam o contrato MVCC "AS OF LSN b = visível se lsn < b"
+    // via `as_of_point` (b-1 inclusivo; b=0 ⇒ snapshot vazio). A impl anterior
+    // passava o bound EXCLUSIVO como ponto INCLUSIVO ao TemporalGraph — um
+    // off-by-one que fazia `AS OF LSN n` ver eventos do próprio lsn n (e
+    // `AS OF LSN 0` devolver dados). Uma única semântica: LogBackend, server
+    // e VirtualBackend usam o mesmo caminho.
     fn neighbors(&self, node: &str, etype: Option<&str>, as_of: Option<Lsn>, min_confidence: f32) -> Result<Vec<NeighborRow>, HeraclitusError> {
         let b = self.sync_bundle()?;
-        let bound = self.resolve_as_of_bound(as_of)?;
-        let et = etype.map(EdgeType::from_attr);
-        Ok(b.graph.neighbors(&node.to_string(), et.as_ref(), bound, min_confidence, 0.0)
-            .into_iter()
-            .map(|n| NeighborRow {
-                edge_id: n.edge_id, to: n.to, etype: n.etype.key(),
-                belief: n.belief, weight: n.weight, lsn: n.lsn,
-            })
-            .collect())
+        Ok(neighbors_of(&b.graph, node, etype, as_of, min_confidence))
     }
 
     fn traverse(&self, start: &str, max_depth: usize, as_of: Option<Lsn>, min_confidence: f32) -> Result<Vec<(String, usize)>, HeraclitusError> {
         let b = self.sync_bundle()?;
-        let bound = self.resolve_as_of_bound(as_of)?;
-        Ok(b.graph.traverse(&start.to_string(), max_depth, bound, min_confidence, 0.0))
+        Ok(traverse_of(&b.graph, start, max_depth, as_of, min_confidence))
     }
 
     fn match_edges(&self, src: Option<&str>, etype: Option<&str>, dst: Option<&str>, as_of: Option<Lsn>) -> Result<Vec<EdgeRow>, HeraclitusError> {
         let b = self.sync_bundle()?;
-        let bound = self.resolve_as_of_bound(as_of)?;
-        let et = etype.map(EdgeType::from_attr);
-        Ok(b.graph.match_edges(src, et.as_ref(), dst, bound, 0.0)
-            .into_iter()
-            .map(|m| EdgeRow {
-                edge_id: m.edge_id, from: m.from, to: m.to, etype: m.etype.key(), belief: m.belief,
-            })
-            .collect())
+        Ok(match_edges_of(&b.graph, src, etype, dst, as_of))
     }
 
     fn edge_hypotheses(&self, from: &str, to: &str, etype: &str, as_of: Option<Lsn>) -> Result<Option<EdgeHypotheses>, HeraclitusError> {
         let b = self.sync_bundle()?;
-        let bound = self.resolve_as_of_bound(as_of)?;
-        let et = EdgeType::from_attr(etype);
-        let edge_id = TemporalGraph::edge_id(from, to, &et);
-        let edge = match b.graph.edges.get(&edge_id) {
-            Some(e) => e,
-            None => return Ok(None)
-        };
-        let alive = edge.alive_at(bound);
-        let belief = b.graph.belief_at(&edge_id, bound);
-        let versions = b.graph.hypotheses_at(&edge_id, bound)
-            .into_iter()
-            .map(|v| HypothesisRow {
-                hypothesis_id: v.hypothesis_id, confidence: v.confidence, polarity: v.polarity, source: v.source,
-            })
-            .collect();
-        Ok(Some(EdgeHypotheses { edge_id, alive, belief, versions }))
+        Ok(hypotheses_of(&b.graph, from, to, etype, as_of))
     }
 
     fn community(&self, node: &str, as_of: Option<Lsn>) -> Result<Option<CommunityResult>, HeraclitusError> {
         let b = self.sync_bundle()?;
-        let bound = self.resolve_as_of_bound(as_of)?;
-        let a = b.graph.analyze(bound, 0.0);
-        let community = match a.community.get(node) {
-            Some(c) => c.clone(),
-            None => return Ok(None)
-        };
-        let members = a.members(&community);
-        Ok(Some(CommunityResult { node: node.to_string(), community, members }))
+        Ok(community_of(&b.graph, node, as_of))
+    }
+
+    fn community_leiden(&self, node: &str, as_of: Option<Lsn>) -> Result<Option<CommunityResult>, HeraclitusError> {
+        let b = self.sync_bundle()?;
+        Ok(community_leiden_of(&b.graph, node, as_of))
     }
 
     fn node_metrics(&self, node: &str, as_of: Option<Lsn>) -> Result<Option<MetricsResult>, HeraclitusError> {
         let b = self.sync_bundle()?;
-        let bound = self.resolve_as_of_bound(as_of)?;
-        let a = b.graph.analyze(bound, 0.0);
-        let m = match a.metrics.get(node) {
-            Some(metrics) => metrics,
-            None => return Ok(None)
-        };
-        let community = a.community.get(node).cloned().unwrap_or_default();
-        Ok(Some(MetricsResult {
-            node: node.to_string(), community,
-            degree: m.degree, centrality: m.centrality, anomaly_score: m.anomaly_score,
-        }))
+        Ok(node_metrics_of(&b.graph, node, as_of))
     }
 
     fn resolve_entity(&self, key: &str, as_of: Option<Lsn>) -> Result<Option<String>, HeraclitusError> {
         let b = self.sync_bundle()?;
-        let bound = self.resolve_as_of_bound(as_of)?;
-        Ok(b.resolver.resolve(key, bound))
+        Ok(resolve_of(&b.resolver, key, as_of))
     }
 
     fn entity_cluster(&self, entity_id: &str, as_of: Option<Lsn>) -> Result<Vec<String>, HeraclitusError> {
         let b = self.sync_bundle()?;
-        let bound = self.resolve_as_of_bound(as_of)?;
-        Ok(b.resolver.cluster(entity_id, bound))
+        Ok(cluster_of(&b.resolver, entity_id, as_of))
     }
 
     fn lsn_for_timestamp(&self, ts_ms: u64) -> Result<Lsn, HeraclitusError> {
@@ -1197,5 +1183,349 @@ pub fn trace_causes(parents: &BTreeMap<String, Vec<String>>, target: &str, max_d
     roots.sort();
     roots.dedup();
     Trace { target: target.to_string(), steps, roots }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Funções de grafo/entidade recuperadas (M30): o refactor moveu a query para
+// métodos de trait mas o `heraclitus-server` ainda consome estas funções livres
+// sobre `TemporalGraph`/`EntityResolver`. Restauradas do git (ae08c8b~1) para
+// destravar o `server`. Semântica MVCC "AS OF" preservada por `as_of_point`.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Strict MVCC Snapshot Contract: visible if lsn < bound.
+fn as_of_point(as_of: Option<Lsn>) -> Option<Lsn> {
+    match as_of {
+        None => Some(u64::MAX),
+        Some(0) => None,        // estado vazio (lsn < 0 não existe)
+        Some(b) => Some(b - 1), // fronteira exclusiva
+    }
+}
+
+// `EntityResolver` do index-graph (M11) — o mesmo que o server materializa e
+// que o LogBackend agrega no bundle: uma única semântica de resolução.
+pub fn resolve_of(
+    r: &EntityResolver,
+    key: &str,
+    as_of: Option<Lsn>,
+) -> Option<String> {
+    r.resolve(key, as_of_point(as_of)?)
+}
+
+pub fn cluster_of(
+    r: &EntityResolver,
+    entity_id: &str,
+    as_of: Option<Lsn>,
+) -> Vec<String> {
+    let Some(point) = as_of_point(as_of) else {
+        return Vec::new();
+    };
+    r.cluster(entity_id, point)
+}
+
+pub fn neighbors_of(
+    g: &TemporalGraph,
+    node: &str,
+    etype: Option<&str>,
+    as_of: Option<Lsn>,
+    min_confidence: f32,
+) -> Vec<NeighborRow> {
+    let Some(point) = as_of_point(as_of) else {
+        return Vec::new();
+    };
+    let et = etype.map(EdgeType::from_attr);
+    g.neighbors(&node.to_string(), et.as_ref(), point, min_confidence, 0.0)
+        .into_iter()
+        .map(|n| NeighborRow {
+            edge_id: n.edge_id,
+            to: n.to,
+            etype: n.etype.key(),
+            belief: n.belief,
+            weight: n.weight,
+            lsn: n.lsn,
+        })
+        .collect()
+}
+
+pub fn traverse_of(
+    g: &TemporalGraph,
+    start: &str,
+    max_depth: usize,
+    as_of: Option<Lsn>,
+    min_confidence: f32,
+) -> Vec<(String, usize)> {
+    let Some(point) = as_of_point(as_of) else {
+        return Vec::new();
+    };
+    g.traverse(&start.to_string(), max_depth, point, min_confidence, 0.0)
+}
+
+pub fn community_of(g: &TemporalGraph, node: &str, as_of: Option<Lsn>) -> Option<CommunityResult> {
+    let point = as_of_point(as_of)?;
+    let a = g.analyze(point, 0.0);
+    let community = a.community.get(node)?.clone();
+    let members = a.members(&community);
+    Some(CommunityResult {
+        node: node.to_string(),
+        community,
+        members,
+    })
+}
+
+pub fn node_metrics_of(g: &TemporalGraph, node: &str, as_of: Option<Lsn>) -> Option<MetricsResult> {
+    let point = as_of_point(as_of)?;
+    let a = g.analyze(point, 0.0);
+    let m = a.metrics.get(node)?;
+    let community = a.community.get(node).cloned().unwrap_or_default();
+    Some(MetricsResult {
+        node: node.to_string(),
+        community,
+        degree: m.degree,
+        centrality: m.centrality,
+        anomaly_score: m.anomaly_score,
+    })
+}
+
+pub fn hypotheses_of(
+    g: &TemporalGraph,
+    from: &str,
+    to: &str,
+    etype: &str,
+    as_of: Option<Lsn>,
+) -> Option<EdgeHypotheses> {
+    let point = as_of_point(as_of)?;
+    let et = EdgeType::from_attr(etype);
+    let edge_id = TemporalGraph::edge_id(from, to, &et);
+    let edge = g.edges.get(&edge_id)?;
+    let alive = edge.alive_at(point);
+    let belief = g.belief_at(&edge_id, point);
+    let versions = g
+        .hypotheses_at(&edge_id, point)
+        .into_iter()
+        .map(|v| HypothesisRow {
+            hypothesis_id: v.hypothesis_id,
+            confidence: v.confidence,
+            polarity: v.polarity,
+            source: v.source,
+        })
+        .collect();
+    Some(EdgeHypotheses {
+        edge_id,
+        alive,
+        belief,
+        versions,
+    })
+}
+
+pub fn match_edges_of(
+    g: &TemporalGraph,
+    src: Option<&str>,
+    etype: Option<&str>,
+    dst: Option<&str>,
+    as_of: Option<Lsn>,
+) -> Vec<EdgeRow> {
+    let Some(point) = as_of_point(as_of) else {
+        return Vec::new();
+    };
+    let et = etype.map(EdgeType::from_attr);
+    g.match_edges(src, et.as_ref(), dst, point, 0.0)
+        .into_iter()
+        .map(|m| EdgeRow {
+            edge_id: m.edge_id,
+            from: m.from,
+            to: m.to,
+            etype: m.etype.key(),
+            belief: m.belief,
+            world_valid_from: m.world_valid_from,
+            world_valid_to: m.world_valid_to,
+        })
+        .collect()
+}
+
+/// Comunidades por LEIDEN (V2.4) — a mesma convenção do `community_of` (id =
+/// menor nó), mas com a partição de modularidade do `communities_leiden`.
+pub fn community_leiden_of(
+    g: &TemporalGraph,
+    node: &str,
+    as_of: Option<Lsn>,
+) -> Option<CommunityResult> {
+    let point = as_of_point(as_of)?;
+    let communities = g.communities_leiden(point, 0.0);
+    let community = communities.get(node)?.clone();
+    let members: Vec<String> = communities
+        .iter()
+        .filter(|(_, c)| **c == community)
+        .map(|(n, _)| n.clone())
+        .collect();
+    Some(CommunityResult { node: node.to_string(), community, members })
+}
+
+/// Replay de referência (recuperado pós-M30): reconstrói o grafo temporal a
+/// partir do log inteiro, em janelas para limitar RAM. O backend de referência
+/// e as verificações de consistência das views (server) partilham isto — a
+/// regra de derivação tem uma única fonte de verdade.
+pub fn replay_graph(log: &Log) -> Result<TemporalGraph, HeraclitusError> {
+    let mut g = TemporalGraph::new();
+    let head = log.head();
+    let mut cur: Lsn = 0;
+    while cur < head {
+        let batch = log.scan_capped(cur, head, 2048)?;
+        let Some(&(last_lsn, _)) = batch.last() else { break; };
+        for (lsn, e) in &batch {
+            g.apply_episode(*lsn, e);
+        }
+        cur = last_lsn + 1;
+    }
+    Ok(g)
+}
+
+/// Reconstrói o resolver de entidades a partir do log inteiro (referência M11).
+pub fn replay_resolver(log: &Log) -> Result<EntityResolver, HeraclitusError> {
+    let mut r = EntityResolver::new();
+    let head = log.head();
+    let mut cur: Lsn = 0;
+    while cur < head {
+        let batch = log.scan_capped(cur, head, 2048)?;
+        let Some(&(last_lsn, _)) = batch.last() else { break; };
+        for (lsn, e) in &batch {
+            r.apply_episode(*lsn, e);
+        }
+        cur = last_lsn + 1;
+    }
+    Ok(r)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// M16: motor contrafactual (SIMULATE) — reintroduzido pós-M30 (do git 41480b6).
+// SIMULATE ADD/REMOVE EDGE (...) THEN <query> sobrepõe uma mutação de aresta
+// numa CÓPIA do grafo e executa a query interna contra ela. O grafo base e o
+// log nunca são tocados — a divergência fica isolada na cópia.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Materializa um grafo **virtual** = `base` com uma aresta adicionada ou
+/// removida. Devolve um grafo novo; `base` (e portanto o log) fica intacto.
+pub fn materialize_virtual(
+    base: &TemporalGraph,
+    op: SimulateOp,
+    from: &str,
+    to: &str,
+    etype: &str,
+) -> TemporalGraph {
+    let et = EdgeType::from_attr(etype);
+    let edge_id = TemporalGraph::edge_id(from, to, &et);
+    let remove = op == SimulateOp::RemoveEdge;
+
+    let mut g = TemporalGraph::new();
+    for (id, edge) in &base.edges {
+        if remove && *id == edge_id {
+            continue; // a remoção contrafactual
+        }
+        g.upsert_edge(edge.clone(), base.versions.get(id).cloned().unwrap_or_default());
+    }
+    if op == SimulateOp::AddEdge {
+        let version = EdgeVersion {
+            hypothesis_id: edge_id.clone(),
+            confidence: 1.0,
+            source: "simulate".into(),
+            provenance: vec![],
+            polarity: et.polarity(),
+            valid_from_lsn: 0,
+        };
+        g.upsert_edge(
+            Edge {
+                id: edge_id,
+                from: from.to_string(),
+                to: to.to_string(),
+                etype: et,
+                valid_from_lsn: 0,
+                valid_to_lsn: None,
+                world_valid_from: None,
+                world_valid_to: None,
+            },
+            vec![version],
+        );
+    }
+    g.watermark = base.watermark;
+    g
+}
+
+/// Vista contrafactual: leituras de grafo servidas pelo overlay virtual; tudo
+/// o resto (texto, vetor, entidades, o próprio log) delega no backend real.
+/// `append` é no-op para que `SIMULATE ... THEN` nunca escreva no log — o
+/// ponto inteiro do M16. `graph()` devolve o overlay, por isso um SIMULATE
+/// aninhado compõe sobre a mutação do exterior (audit bug B) em vez de
+/// reconstruir a partir do log real.
+pub struct VirtualBackend<'a> {
+    base: &'a dyn QueryBackend,
+    graph: TemporalGraph,
+}
+
+impl<'a> VirtualBackend<'a> {
+    pub fn new(base: &'a dyn QueryBackend, graph: TemporalGraph) -> Self {
+        Self { base, graph }
+    }
+}
+
+impl QueryBackend for VirtualBackend<'_> {
+    // --- delegadas: um contrafactual de aresta não as afeta ---
+    fn scan(&self, as_of: Option<Lsn>) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
+        self.base.scan(as_of)
+    }
+    fn scan_range(&self, from: Lsn, to: Lsn) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
+        self.base.scan_range(from, to)
+    }
+    fn head(&self) -> Result<Lsn, HeraclitusError> {
+        self.base.head()
+    }
+    fn attr_lookup(&self, field: &str, value: &str, as_of: Option<Lsn>) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+        self.base.attr_lookup(field, value, as_of)
+    }
+    fn recall(&self, t: &str, k: usize, a: Option<Lsn>) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
+        self.base.recall(t, k, a)
+    }
+    fn nearest(&self, v: &[f32], k: usize, a: Option<Lsn>) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
+        self.base.nearest(v, k, a)
+    }
+    fn provenance(&self, id: &str) -> Result<Vec<String>, HeraclitusError> {
+        self.base.provenance(id)
+    }
+    fn lsn_for_timestamp(&self, ts: u64) -> Result<Lsn, HeraclitusError> {
+        self.base.lsn_for_timestamp(ts)
+    }
+    fn resolve_entity(&self, key: &str, a: Option<Lsn>) -> Result<Option<String>, HeraclitusError> {
+        self.base.resolve_entity(key, a)
+    }
+    fn entity_cluster(&self, id: &str, a: Option<Lsn>) -> Result<Vec<String>, HeraclitusError> {
+        self.base.entity_cluster(id, a)
+    }
+    /// No-op: um contrafactual nunca escreve no log real.
+    fn append(&self, _label: Option<&str>, _props: &[(String, Value)]) -> Result<Lsn, HeraclitusError> {
+        Ok(Lsn::MAX)
+    }
+
+    // --- leituras de grafo servidas pelo overlay virtual ---
+    fn graph(&self) -> Result<TemporalGraph, HeraclitusError> {
+        Ok(self.graph.clone())
+    }
+    fn neighbors(&self, node: &str, etype: Option<&str>, a: Option<Lsn>, mc: f32) -> Result<Vec<NeighborRow>, HeraclitusError> {
+        Ok(neighbors_of(&self.graph, node, etype, a, mc))
+    }
+    fn traverse(&self, start: &str, d: usize, a: Option<Lsn>, mc: f32) -> Result<Vec<(String, usize)>, HeraclitusError> {
+        Ok(traverse_of(&self.graph, start, d, a, mc))
+    }
+    fn match_edges(&self, src: Option<&str>, et: Option<&str>, dst: Option<&str>, a: Option<Lsn>) -> Result<Vec<EdgeRow>, HeraclitusError> {
+        Ok(match_edges_of(&self.graph, src, et, dst, a))
+    }
+    fn edge_hypotheses(&self, f: &str, t: &str, et: &str, a: Option<Lsn>) -> Result<Option<EdgeHypotheses>, HeraclitusError> {
+        Ok(hypotheses_of(&self.graph, f, t, et, a))
+    }
+    fn community(&self, node: &str, a: Option<Lsn>) -> Result<Option<CommunityResult>, HeraclitusError> {
+        Ok(community_of(&self.graph, node, a))
+    }
+    fn community_leiden(&self, node: &str, a: Option<Lsn>) -> Result<Option<CommunityResult>, HeraclitusError> {
+        Ok(community_leiden_of(&self.graph, node, a))
+    }
+    fn node_metrics(&self, node: &str, a: Option<Lsn>) -> Result<Option<MetricsResult>, HeraclitusError> {
+        Ok(node_metrics_of(&self.graph, node, a))
+    }
 }
 

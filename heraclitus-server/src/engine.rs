@@ -48,6 +48,10 @@ pub struct Engine {
     /// RAM). Liga com HERACLITUS_LOG_ONLY=1 — permite cargas massivas (centenas
     /// de GB) com RAM limitada; as views se constroem depois via `view rebuild`.
     log_only: bool,
+    /// Meta-auditoria de acessos (padrão immudb): cada query GQL executada
+    /// gera um evento `AuditQuery` no próprio log — quem consultou o quê é,
+    /// ele próprio, evidência imutável. Liga por config (audit_queries).
+    audit_queries: bool,
 }
 
 /// Wrapper so the same index object can be both registered as a View and
@@ -75,6 +79,14 @@ impl<T: View> View for Shared<T> {
     }
     fn watermark(&self) -> Lsn {
         self.0.lock().unwrap().watermark()
+    }
+    // Sem estes forwards, o wrapper engolia os defaults do trait (no-op) e
+    // NENHUMA view persistia/restaurava — todo o boot era replay desde 0.
+    fn checkpoint(&self, dir: &std::path::Path) -> Result<(), HeraclitusError> {
+        self.0.lock().unwrap().checkpoint(dir)
+    }
+    fn restore(&mut self, dir: &std::path::Path) -> Result<bool, HeraclitusError> {
+        self.0.lock().unwrap().restore(dir)
     }
     fn reset(&mut self) {
         self.0.lock().unwrap().reset();
@@ -209,7 +221,15 @@ impl Engine {
             } else {
                 registry.catch_up(&log)?;
                 let wm = registry.min_watermark();
-                p.ok(format!("6 views materializadas @ LSN {}", group(wm)));
+                // Fast boot: persiste já o estado materializado — o próximo
+                // arranque restaura os snapshots e replaya SÓ a cauda
+                // `(watermark, head]` em vez do log inteiro (a lição da carga
+                // massiva de 2026-07-02: replay total não escala).
+                registry.checkpoint()?;
+                p.ok(format!(
+                    "6 views materializadas @ LSN {} · checkpoint gravado",
+                    group(wm)
+                ));
             }
             registry
         };
@@ -269,13 +289,44 @@ impl Engine {
             metric,
             keystore,
             log_only,
+            audit_queries: config.audit_queries,
         })
+    }
+
+    /// Meta-auditoria: regista a execução de uma query como EVENTO no log
+    /// (best-effort — auditar nunca pode falhar a query auditada). O texto é
+    /// truncado para não inchar o log com queries gigantes.
+    pub fn audit_query(&self, gql: &str, ok: bool) {
+        if !self.audit_queries {
+            return;
+        }
+        let mut text: String = gql.chars().take(500).collect();
+        if gql.len() > text.len() {
+            text.push('…');
+        }
+        let mut e = Episode::new(
+            "server",
+            EventKind::Custom("AuditQuery".into()),
+            text.into_bytes(),
+        );
+        e.attrs.insert("audit".into(), "query".into());
+        e.attrs.insert("ok".into(), if ok { "true".into() } else { "false".into() });
+        let _ = self.append(e);
     }
 
     /// Grava o checkpoint do índice de atributos (o servidor pode chamar
     /// periodicamente / no shutdown para o arranque seguinte só replayar a cauda).
     pub fn checkpoint_attr(&self) -> Result<(), HeraclitusError> {
         self.attr.lock().unwrap().save(&self.attr_dir)
+    }
+
+    /// Fast boot: persiste o snapshot de TODAS as views (vector/text/graph/
+    /// tgraph/entity/activation) + índice de atributos + watermarks. Chamado
+    /// no shutdown gracioso e disponível para checkpoints periódicos — o
+    /// arranque seguinte restaura e replaya só a cauda `(watermark, head]`.
+    pub fn checkpoint_views(&self) -> Result<(), HeraclitusError> {
+        self.views.lock().unwrap().checkpoint()?;
+        self.checkpoint_attr()
     }
 
     // ── H-VM ledger (M20) ────────────────────────────────────────────────────
@@ -310,8 +361,9 @@ impl Engine {
     /// atomically as a checkpoint. Reload with `heraclitus_btree::BEpsilonTree::load`.
     pub fn hvm_checkpoint(&self, path: &std::path::Path) -> Result<(), HeraclitusError> {
         let vm = ConsistencyVirtualMachine::new(VmVersion(1));
-        let tree = vm_bridge::replay_vm_to_btree(&self.log, &vm)?;
-        tree.save(path)?;
+        // replay_vm_to_btree agora é file-backed: constrói e persiste a árvore no
+        // `path` (from_map opens+upsert+commit); o save separado ficou redundante.
+        let _tree = vm_bridge::replay_vm_to_btree(&self.log, &vm, path)?;
         Ok(())
     }
 
@@ -369,6 +421,57 @@ impl Engine {
         Ok(serde_json::json!({
             "segments": r.segments, "records": r.records, "merkle_ok": r.merkle_ok
         }))
+    }
+
+    /// `heraclitus_state()` — introspecção operacional num só JSON: head,
+    /// segmentos (id/versão/selado/raiz Merkle) e watermarks das views. O que
+    /// um operador precisa para diagnosticar um boot/replay sem ir a logs.
+    pub fn state(&self) -> serde_json::Value {
+        let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let sealed = self.log.sealed_segments();
+        let segments: Vec<serde_json::Value> = sealed
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "id": m.id,
+                    "version": m.version,
+                    "sealed": m.sealed,
+                    "base_lsn": m.base_lsn,
+                    "max_lsn": m.max_lsn,
+                    "blake3_root": m.blake3_root.as_ref().map(hex),
+                })
+            })
+            .collect();
+        let views = self.views.lock().unwrap();
+        serde_json::json!({
+            "head_lsn": self.log.head(),
+            "sealed_segments": segments,
+            "views": {
+                "watermarks": views.watermarks(),
+                "min_watermark": views.min_watermark(),
+            },
+            "log_only": self.log_only,
+        })
+    }
+
+    /// `heraclitus_verify_segment(id)` — prova de integridade pontual.
+    pub fn verify_segment(&self, id: heraclitus_core::SegmentId) -> Result<serde_json::Value, HeraclitusError> {
+        let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        match self.log.verify_segment(id)? {
+            None => Ok(serde_json::json!({ "found": false, "id": id })),
+            Some(r) => Ok(serde_json::json!({
+                "found": true,
+                "id": r.id,
+                "version": r.version,
+                "sealed": r.sealed,
+                "records": r.records,
+                "base_lsn": r.base_lsn,
+                "max_lsn": r.max_lsn,
+                "computed_root": hex(&r.computed_root),
+                "stored_root": r.stored_root.as_ref().map(hex),
+                "valid": r.valid,
+            })),
+        }
     }
 
     /// Two-stage recall (§3.8) over the real indexes + memtable merge.
@@ -441,6 +544,11 @@ impl QueryBackend for Engine {
         self.log.scan(0, as_of.unwrap_or(u64::MAX))
     }
 
+    /// Snapshot do grafo temporal materializado (a view incremental, sem replay).
+    fn graph(&self) -> Result<TemporalGraph, HeraclitusError> {
+        Ok(self.tgraph.lock().unwrap().clone())
+    }
+
     fn scan_range(&self, from: Lsn, to: Lsn) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
         // Windowed + capped: segment pruning makes a time slice cheap, and the
         // QUERY_SCAN_CAP keeps a broad scan from exhausting memory (§query guard).
@@ -464,6 +572,41 @@ impl QueryBackend for Engine {
             lsns.retain(|l| *l < bound);
         }
         lsns.sort_unstable();
+        let mut out: Vec<(Lsn, Episode)> = Vec::with_capacity(lsns.len());
+        for l in lsns {
+            if let Some(hit) = self.log.read(l)? {
+                out.push(hit);
+            }
+            if out.len() >= heraclitus_query::backend::QUERY_SCAN_CAP {
+                break;
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// Range numérico (C1.6): resolvido pelo BTreeMap ordenado do índice de
+    /// atributos — `WHERE n.valor > x AND n.valor < y` vira `range()` +
+    /// hidratação O(1)/LSN, sem scan do log.
+    fn attr_range_lookup(
+        &self,
+        field: &str,
+        min: Option<(f64, bool)>,
+        max: Option<(f64, bool)>,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+        use std::ops::Bound;
+        let to_bound = |b: Option<(f64, bool)>| match b {
+            None => Bound::Unbounded,
+            Some((v, true)) => Bound::Included(v),
+            Some((v, false)) => Bound::Excluded(v),
+        };
+        let mut lsns: Vec<Lsn> = {
+            let idx = self.attr.lock().unwrap();
+            idx.lookup_range(field, to_bound(min), to_bound(max))
+        };
+        if let Some(bound) = as_of {
+            lsns.retain(|l| *l < bound);
+        }
         let mut out: Vec<(Lsn, Episode)> = Vec::with_capacity(lsns.len());
         for l in lsns {
             if let Some(hit) = self.log.read(l)? {
@@ -623,16 +766,26 @@ impl QueryBackend for Engine {
         Ok(community_of(&self.tgraph.lock().unwrap(), node, as_of))
     }
 
+    fn community_leiden(&self, node: &str, as_of: Option<Lsn>) -> Result<Option<CommunityResult>, HeraclitusError> {
+        Ok(heraclitus_query::backend::community_leiden_of(
+            &self.tgraph.lock().unwrap(),
+            node,
+            as_of,
+        ))
+    }
+
     fn node_metrics(&self, node: &str, as_of: Option<Lsn>) -> Result<Option<MetricsResult>, HeraclitusError> {
         Ok(node_metrics_of(&self.tgraph.lock().unwrap(), node, as_of))
     }
 
     fn resolve_entity(&self, key: &str, as_of: Option<Lsn>) -> Result<Option<String>, HeraclitusError> {
-        Ok(resolve_of(&self.entity.lock().unwrap(), key, as_of))
+        let er = self.entity.lock().unwrap();
+        Ok(resolve_of(&*er, key, as_of))
     }
 
     fn entity_cluster(&self, entity_id: &str, as_of: Option<Lsn>) -> Result<Vec<String>, HeraclitusError> {
-        Ok(cluster_of(&self.entity.lock().unwrap(), entity_id, as_of))
+        let er = self.entity.lock().unwrap();
+        Ok(cluster_of(&*er, entity_id, as_of))
     }
 
     fn append(

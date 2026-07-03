@@ -15,6 +15,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 bincode = { workspace = true }
+parquet = "59.0.0"
+arrow-array = "59.0.0"
+arrow-schema = "59.0.0"
 
 [dev-dependencies]
 tempfile = { workspace = true }

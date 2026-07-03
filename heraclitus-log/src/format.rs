@@ -36,7 +36,11 @@ pub const FOOTER_MAGIC: [u8; 4] = *b"HFTR";
 /// just the payload. v1 segments remain readable.
 /// Bumped 2 → 3: StoragePayload now persists the full Episode (id, session_id,
 /// kind, embedding, attrs, parents) — the log is the complete source of truth.
-pub const FORMAT_VERSION: u16 = 3;
+/// Bumped 3 → 4: native bi-temporal Valid Time — StoragePayload carries the
+/// episode's `valid_from`/`valid_to` (world time, SQL:2011-style), orthogonal
+/// to the LSN/HLC transaction time. v2 and v3 segments remain readable
+/// (per-version payload decode in `decode_episode_payload`).
+pub const FORMAT_VERSION: u16 = 4;
 pub const HEADER_LEN: usize = 4 + 2 + 8 + 8;
 pub const RECORD_HEADER_LEN: usize = 4 + 4 + 8 + 8;
 pub const FOOTER_LEN: usize = 4 + 8 + 8 + 8 + 32;

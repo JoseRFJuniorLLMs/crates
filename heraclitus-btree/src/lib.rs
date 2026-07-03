@@ -1,11 +1,11 @@
-//! heraclitus-btree — Motor de Árvore Bᵋ-tree (Fractal Tree) de Classe Comercial.
+﻿//! heraclitus-btree â€” Motor de Ãrvore Báµ‹-tree (Fractal Tree) de Classe Comercial.
 //!
-//! Implementação definitiva, de nível de produção e totalmente endurecida para o marco M22.
+//! ImplementaÃ§Ã£o definitiva, de nÃ­vel de produÃ§Ã£o e totalmente endurecida para o marco M22.
 //! Fornece suporte completo a Shadow Paging puro (Copy-on-Write de dados e metadados), 
-//! Tabela de Páginas Sujas (Dirty Page Table) dedicada O(1), Filtros de Bloom por amostragem 
-//! criptográfica independente por página, Sharding de Cache (Lock Striping) contra concorrência,
-//! Compressão por Prefixo defensiva, CoW estrito para a FreeList e Garbage Collection 
-//! automatizado de versões obsoletas do MVCC. Totalmente livre de comportamento indefinido e unsafe.
+//! Tabela de PÃ¡ginas Sujas (Dirty Page Table) dedicada O(1), Filtros de Bloom por amostragem 
+//! criptogrÃ¡fica independente por pÃ¡gina, Sharding de Cache (Lock Striping) contra concorrÃªncia,
+//! CompressÃ£o por Prefixo defensiva, CoW estrito para a FreeList e Garbage Collection 
+//! automatizado de versÃµes obsoletas do MVCC. Totalmente livre de comportamento indefinido e unsafe.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -19,17 +19,22 @@ pub type Val = Vec<u8>;
 
 pub const PAGE_SIZE: usize = 4096;
 const MAGIC: &[u8; 4] = b"HRKL";
-const VERSION: u16 = 4; // Versão de layout do Marco M22
+/// VersÃ£o de layout. 4â†’5 (V2.2): o slot de valor da folha passa de 6 para
+/// 8 bytes (`v_off u16 | v_len u16 | ov_len u32`) â€” cadeias overflow deixam
+/// de estar limitadas a 64 KB. Ficheiros v4 nÃ£o sÃ£o migrados: o checkpoint Ã©
+/// estado DERIVADO (regenerÃ¡vel do log via from_map), entÃ£o `deserialize`
+/// rejeita versÃµes estranhas com erro claro e o chamador reconstrÃ³i.
+const VERSION: u16 = 5;
 const MAX_SB_FREE_LIST: usize = 32;
 const FRAGMENTATION_THRESHOLD: f32 = 0.25;
 const OVERFLOW_THRESHOLD: usize = 512;
 const HASH_LEN: usize = 28;
 const CACHE_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024; // 64MB Cache
-const BLOOM_FILTER_SIZE_BYTES: usize = 64; // Filtro de Bloom de 512 bits por página
+const BLOOM_FILTER_SIZE_BYTES: usize = 64; // Filtro de Bloom de 512 bits por pÃ¡gina
 const SIG_SIZE: usize = 32;
-const NUM_SHARDS: usize = 32; // Expandido para 32 shards para alta concorrência multi-core
+const NUM_SHARDS: usize = 32; // Expandido para 32 shards para alta concorrÃªncia multi-core
 
-// Constantes de layout auto-documentadas para offsets físicos da página
+// Constantes de layout auto-documentadas para offsets fÃ­sicos da pÃ¡gina
 const OFF_PAGE_TYPE: usize = 0;
 const OFF_VERSION: usize = 1;
 const OFF_GENERATION: usize = 3;
@@ -42,13 +47,21 @@ const OFF_LOW_LEN: usize = 27;
 const OFF_HIGH_OFF: usize = 29;
 const OFF_HIGH_LEN: usize = 31;
 const OFF_BLOOM: usize = 33;
-// Prefixo comum (compressão por prefixo): ocupa os 4 bytes livres entre o bloom
-// (33..97, 512 bits) e o início dos slots (101). Dois u16: offset e comprimento
-// do prefixo no payload da página.
+// Prefixo comum (compressÃ£o por prefixo): ocupa os 4 bytes livres entre o bloom
+// (33..97, 512 bits) e o inÃ­cio dos slots (101). Dois u16: offset e comprimento
+// do prefixo no payload da pÃ¡gina.
 const OFF_PFX_OFF: usize = 97;
 const OFF_PFX_LEN: usize = 99;
 const OFF_SLOTS_START: usize = 101;
 const PAYLOAD_END_MAX: usize = PAGE_SIZE - SIG_SIZE;
+// Limiar BRANDO de ocupaÃ§Ã£o fÃ­sica por nÃ³: split/flush disparam por bytes
+// estimados, nÃ£o sÃ³ por contagem. node_cap/buffer_cap por contagem sÃ£o
+// fisicamente impossÃ­veis numa pÃ¡gina de 4 KB com chaves/valores reais
+// (128 chaves Ã— ~56 B â‰ˆ 7 KB) â€” era a fonte do "Estouro fÃ­sico da PÃ¡gina"
+// no ciclo upsertâ†’commit do from_map (bug M30, btree file-backed).
+// 1536 B deixa margem para o pior caso de um cascade (buffer da raiz + folha
+// alvo â‰ˆ 2Ã—limiar) caber na pÃ¡gina apÃ³s um Ãºnico split.
+const PAGE_SOFT_BUDGET: usize = 1536;
 
 #[inline]
 fn read_u16(slice: &[u8], offset: usize) -> io::Result<u16> {
@@ -79,9 +92,9 @@ fn read_u64(slice: &[u8], offset: usize) -> io::Result<u64> {
 
 #[inline]
 fn safe_slice(data: &[u8], start: usize, len: usize) -> io::Result<&[u8]> {
-    let end = start.checked_add(len).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Estouro de offset aritmético"))?;
+    let end = start.checked_add(len).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Estouro de offset aritmÃ©tico"))?;
     if end > data.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Tentativa de fatiamento fora dos limites da página física"));
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Tentativa de fatiamento fora dos limites da pÃ¡gina fÃ­sica"));
     }
     Ok(&data[start..end])
 }
@@ -169,13 +182,13 @@ impl FilePageStore {
 impl PageStore for FilePageStore {
     fn read_page(&self, page_id: u64, buf: &mut [u8]) -> io::Result<()> {
         let mut f = self.file.lock().map_err(|_| io::Error::new(io::ErrorKind::Other, "Lock envenenado"))?;
-        let offset = page_id.checked_mul(PAGE_SIZE as u64).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Estouro aritmético no ID da página lida"))?;
+        let offset = page_id.checked_mul(PAGE_SIZE as u64).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Estouro aritmÃ©tico no ID da pÃ¡gina lida"))?;
         f.seek(SeekFrom::Start(offset))?;
         f.read_exact(buf)
     }
     fn write_page(&self, page_id: u64, buf: &[u8]) -> io::Result<()> {
         let mut f = self.file.lock().map_err(|_| io::Error::new(io::ErrorKind::Other, "Lock envenenado"))?;
-        let offset = page_id.checked_mul(PAGE_SIZE as u64).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Estouro aritmético no ID da página escrita"))?;
+        let offset = page_id.checked_mul(PAGE_SIZE as u64).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Estouro aritmÃ©tico no ID da pÃ¡gina escrita"))?;
         f.seek(SeekFrom::Start(offset))?;
         f.write_all(buf)
     }
@@ -206,7 +219,9 @@ pub const FLAG_OVERFLOW: u16 = 0x04;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Slot {
     pub offset: u16,
-    pub length: u16,
+    /// Para slots overflow: comprimento REAL da cadeia (u32 desde o layout v5
+    /// â€” valores deixam de estar limitados a 64 KB). Para inline: len do valor.
+    pub length: u32,
     pub flags: u16,
     pub overflow_page: u64,
     pub cumulative_hash: [u8; HASH_LEN],
@@ -265,7 +280,7 @@ impl Superblock {
         let crc = read_u32(sig, 0)?;
         if crc32fast::hash(data) != crc { return Err(io::Error::new(io::ErrorKind::InvalidData, "Falha CRC32C SB")); }
         if blake3::hash(data).as_bytes()[..HASH_LEN] != sig[4..32] { return Err(io::Error::new(io::ErrorKind::InvalidData, "Falha Blake3 SB")); }
-        if data[0..4] != *MAGIC { return Err(io::Error::new(io::ErrorKind::InvalidData, "Mágica inválida SB")); }
+        if data[0..4] != *MAGIC { return Err(io::Error::new(io::ErrorKind::InvalidData, "MÃ¡gica invÃ¡lida SB")); }
         
         let version = read_u16(data, 4)?;
         let generation = read_u64(data, 6)?;
@@ -359,8 +374,8 @@ impl DiskNode {
         let mut size = std::mem::size_of::<Self>();
         size += self.slots.len() * std::mem::size_of::<Slot>();
         size += self.children.len() * 8;
-        size += std::mem::size_of::<std::sync::RwLock<Self>>(); // Inclusão do overhead do lock do cache
-        size += 32; // Overhead base estimado para alocações de nós de BTreeMap internos
+        size += std::mem::size_of::<std::sync::RwLock<Self>>(); // InclusÃ£o do overhead do lock do cache
+        size += 32; // Overhead base estimado para alocaÃ§Ãµes de nÃ³s de BTreeMap internos
         for k in &self.keys { size += k.len().checked_add(8).unwrap_or(k.len()); }
         for v in &self.vals { size += v.len().checked_add(8).unwrap_or(v.len()); }
         for (k, v_list) in &self.buffer {
@@ -380,12 +395,58 @@ impl DiskNode {
         for key in self.keys.iter().skip(1) {
             let match_len = key.iter().zip(first.iter()).take_while(|(a, b)| a == b).count();
             prefix_len = prefix_len.min(match_len);
-            if prefix_len == 0 { break; } 
+            if prefix_len == 0 { break; }
         }
         first[..prefix_len].to_vec()
     }
 
-    // Decomposição modular da serialização em sub-rotinas limpas
+    /// Estimativa (majorante) dos bytes que `serialize` vai ocupar â€” espelha o
+    /// modelo de custo do serializador, sem descontar a compressÃ£o por prefixo.
+    /// Ã‰ o gatilho byte-aware de split/flush (ver `PAGE_SOFT_BUDGET`).
+    pub fn estimate_serialized_size(&self) -> usize {
+        let mut size = OFF_SLOTS_START + SIG_SIZE;
+        size += self.low_key.as_ref().map_or(0, |k| k.len());
+        size += self.high_key.as_ref().map_or(0, |k| k.len());
+        for (i, k) in self.keys.iter().enumerate() {
+            size += 42 + k.len();
+            if self.header.page_type == PageType::Leaf as u8 {
+                // Slots overflow nÃ£o inline-izam o valor (sÃ³ a cadeia externa).
+                let inline = self.slots.get(i)
+                    .map_or(true, |s| (s.flags & FLAG_OVERFLOW) == 0);
+                size += 6 + if inline { self.vals.get(i).map_or(0, |v| v.len()) } else { 0 };
+            }
+        }
+        if self.header.page_type == PageType::Internal as u8 {
+            size += self.children.len() * 8 + 4;
+            for (k, msgs) in &self.buffer {
+                size += 8 + k.len();
+                for m in msgs {
+                    size += match m { Msg::Upsert(v, _) => 13 + v.len(), Msg::Delete(_) => 9 };
+                }
+            }
+        }
+        size
+    }
+
+    /// Ponto de split balanceado por BYTES (nÃ£o por contagem): com valores de
+    /// tamanho variÃ¡vel, o meio por contagem pode deixar uma metade ainda acima
+    /// do orÃ§amento fÃ­sico. Devolve um Ã­ndice em 1..len-1.
+    fn byte_balanced_mid(&self) -> usize {
+        let n = self.keys.len();
+        if n < 2 { return n / 2; }
+        let cost = |i: usize| 48 + self.keys[i].len() + self.vals.get(i).map_or(0, |v: &Val| v.len());
+        let total: usize = (0..n).map(cost).sum();
+        let mut acc = 0usize;
+        for i in 0..n {
+            acc += cost(i);
+            if acc * 2 >= total {
+                return (i + 1).clamp(1, n - 1);
+            }
+        }
+        n / 2
+    }
+
+    // DecomposiÃ§Ã£o modular da serializaÃ§Ã£o em sub-rotinas limpas
     fn serialize_header(&self, buf: &mut [u8]) {
         buf[OFF_PAGE_TYPE] = self.header.page_type;
         buf[OFF_VERSION..OFF_VERSION+2].copy_from_slice(&self.header.version.to_le_bytes());
@@ -397,10 +458,10 @@ impl DiskNode {
 
     fn serialize_slots_and_payload(&self, buf: &mut [u8], prefix: &[u8], slot_pos: &mut usize, payload_pos: &mut usize) -> io::Result<()> {
         for (i, k) in self.keys.iter().enumerate() {
-            if *slot_pos + 42 > *payload_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro físico da Página")); }
+            if *slot_pos + 42 > *payload_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro fÃ­sico da PÃ¡gina")); }
             let suffix = &k[prefix.len()..];
             
-            if suffix.len() > *payload_pos || *payload_pos - suffix.len() < *slot_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro físico da Página")); }
+            if suffix.len() > *payload_pos || *payload_pos - suffix.len() < *slot_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro fÃ­sico da PÃ¡gina")); }
             *payload_pos -= suffix.len();
             buf[*payload_pos..*payload_pos + suffix.len()].copy_from_slice(suffix);
             let k_off = *payload_pos as u16;
@@ -418,9 +479,12 @@ impl DiskNode {
             *slot_pos += 42;
             
             if self.header.page_type == PageType::Leaf as u8 {
-                if *slot_pos + 6 > *payload_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro físico da Página")); }
-                let v = &self.vals[i];
-                if v.len() > *payload_pos || *payload_pos - v.len() < *slot_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro físico da Página")); }
+                if *slot_pos + 8 > *payload_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro fÃ­sico da PÃ¡gina")); }
+                // Valor em overflow vive na cadeia externa (FLAG_OVERFLOW):
+                // inline-izÃ¡-lo tambÃ©m, como antes, estourava a pÃ¡gina para
+                // qualquer valor grande. get() lÃª a cadeia quando a flag estÃ¡ on.
+                let v: &[u8] = if (flags & FLAG_OVERFLOW) != 0 { &[] } else { &self.vals[i] };
+                if v.len() > *payload_pos || *payload_pos - v.len() < *slot_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro fÃ­sico da PÃ¡gina")); }
                 *payload_pos -= v.len();
                 buf[*payload_pos..*payload_pos + v.len()].copy_from_slice(v);
                 let v_off = *payload_pos as u16;
@@ -428,8 +492,15 @@ impl DiskNode {
 
                 buf[*slot_pos..*slot_pos+2].copy_from_slice(&v_off.to_le_bytes());
                 buf[*slot_pos+2..*slot_pos+4].copy_from_slice(&v_len.to_le_bytes());
-                buf[*slot_pos+4..*slot_pos+6].copy_from_slice(&0u16.to_le_bytes());
-                *slot_pos += 6;
+                // ov_len (u32, layout v5): comprimento REAL da cadeia overflow
+                // (slot.length). Sem persisti-lo, um get() pÃ³s-reopen validava
+                // a cadeia contra o comprimento errado; em u16 (v4) as cadeias
+                // ficavam limitadas a 64 KB.
+                let ov_len: u32 = if (flags & FLAG_OVERFLOW) != 0 {
+                    self.slots.get(i).map(|s| s.length).unwrap_or(0)
+                } else { 0 };
+                buf[*slot_pos+4..*slot_pos+8].copy_from_slice(&ov_len.to_le_bytes());
+                *slot_pos += 8;
             }
         }
         Ok(())
@@ -438,15 +509,15 @@ impl DiskNode {
     fn serialize_children_and_buffer(&self, buf: &mut [u8], prefix: &[u8], slot_pos: &mut usize, payload_pos: &mut usize) -> io::Result<()> {
         if self.header.page_type == PageType::Internal as u8 {
             for &child in &self.children {
-                if *slot_pos + 8 > *payload_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro físico da Página")); }
+                if *slot_pos + 8 > *payload_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro fÃ­sico da PÃ¡gina")); }
                 buf[*slot_pos..*slot_pos+8].copy_from_slice(&child.to_le_bytes()); *slot_pos += 8;
             }
-            if *slot_pos + 4 > *payload_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro físico da Página")); }
+            if *slot_pos + 4 > *payload_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro fÃ­sico da PÃ¡gina")); }
             buf[*slot_pos..*slot_pos+4].copy_from_slice(&(self.buffer.len() as u32).to_le_bytes());
             *slot_pos += 4;
             for (bk, msg_vec) in &self.buffer {
                 let bk_suffix = if bk.starts_with(prefix) { &bk[prefix.len()..] } else { bk.as_slice() };
-                if bk_suffix.len() > *payload_pos || *payload_pos - bk_suffix.len() < *slot_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro físico da Página")); }
+                if bk_suffix.len() > *payload_pos || *payload_pos - bk_suffix.len() < *slot_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro fÃ­sico da PÃ¡gina")); }
                 *payload_pos -= bk_suffix.len();
                 buf[*payload_pos..*payload_pos + bk_suffix.len()].copy_from_slice(bk_suffix);
                 let bk_off = *payload_pos as u16;
@@ -461,10 +532,10 @@ impl DiskNode {
                 for msg in msg_vec {
                     match msg {
                         Msg::Upsert(v, lsn) => {
-                            if *slot_pos + 13 > *payload_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro físico da Página")); }
+                            if *slot_pos + 13 > *payload_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro fÃ­sico da PÃ¡gina")); }
                             buf[*slot_pos] = 1; *slot_pos += 1;
                             buf[*slot_pos..*slot_pos+8].copy_from_slice(&lsn.to_le_bytes()); *slot_pos += 8;
-                            if v.len() > *payload_pos || *payload_pos - v.len() < *slot_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro físico da Página")); }
+                            if v.len() > *payload_pos || *payload_pos - v.len() < *slot_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro fÃ­sico da PÃ¡gina")); }
                             *payload_pos -= v.len();
                             buf[*payload_pos..*payload_pos + v.len()].copy_from_slice(v);
                             let v_off = *payload_pos as u16;
@@ -475,7 +546,7 @@ impl DiskNode {
                             *slot_pos += 4;
                         }
                         Msg::Delete(lsn) => {
-                            if *slot_pos + 9 > *payload_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro físico da Página")); }
+                            if *slot_pos + 9 > *payload_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro fÃ­sico da PÃ¡gina")); }
                             buf[*slot_pos] = 0; *slot_pos += 1;
                             buf[*slot_pos..*slot_pos+8].copy_from_slice(&lsn.to_le_bytes()); *slot_pos += 8;
                         }
@@ -493,7 +564,7 @@ impl DiskNode {
         let mut slot_pos = OFF_SLOTS_START;
         let mut payload_pos = PAYLOAD_END_MAX;
         let mut write_payload = |b: &mut [u8], item: &[u8], p: &mut usize| -> io::Result<(u16, u16)> {
-            if item.len() > *p || *p - item.len() < slot_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro físico da Página")); }
+            if item.len() > *p || *p - item.len() < slot_pos { return Err(io::Error::new(io::ErrorKind::InvalidData, "Estouro fÃ­sico da PÃ¡gina")); }
             *p -= item.len();
             b[*p..*p + item.len()].copy_from_slice(item);
             Ok((*p as u16, item.len() as u16))
@@ -532,20 +603,29 @@ impl DiskNode {
         if blake3::hash(data).as_bytes()[..HASH_LEN] != sig[4..32] { return Err(io::Error::new(io::ErrorKind::InvalidData, "Blake3 Falhou")); }
         let page_type = data[OFF_PAGE_TYPE];
         let version = read_u16(data, OFF_VERSION)?;
+        // O layout fÃ­sico muda entre versÃµes (v5: slot de valor 8B). O
+        // checkpoint Ã© estado DERIVADO: uma versÃ£o estranha rejeita-se com
+        // erro claro e o chamador reconstrÃ³i do log (from_map/replay).
+        if version != VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("layout de pÃ¡gina v{version} incompatÃ­vel (esperado v{VERSION}); reconstruir o checkpoint do log"),
+            ));
+        }
         let generation = read_u64(data, OFF_GENERATION)?;
         let lsn = read_u64(data, OFF_LSN)?;
         let slot_count = read_u16(data, OFF_SLOT_COUNT)? as usize;
-        
+
         let free_start = read_u16(data, OFF_FREE_START)? as usize;
         let payload_end = read_u16(data, OFF_PAYLOAD_END)? as usize;
         if free_start > payload_end || payload_end > PAYLOAD_END_MAX {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Offsets estruturais da página física corrompidos ou sobrepostos"));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Offsets estruturais da pÃ¡gina fÃ­sica corrompidos ou sobrepostos"));
         }
 
-        let step = if page_type == PageType::Leaf as u8 { 48 } else { 42 };
-        let slots_size = slot_count.checked_mul(step).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Slot count inválido ou corrompido"))?;
+        let step = if page_type == PageType::Leaf as u8 { 50 } else { 42 };
+        let slots_size = slot_count.checked_mul(step).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Slot count invÃ¡lido ou corrompido"))?;
         if OFF_SLOTS_START.checked_add(slots_size).map_or(true, |end| end > PAGE_SIZE) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Slot count transborda o espaço livre físico da página"));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Slot count transborda o espaÃ§o livre fÃ­sico da pÃ¡gina"));
         }
 
         let pfx_off = read_u16(data, OFF_PFX_OFF)? as usize;
@@ -570,8 +650,8 @@ impl DiskNode {
         let mut buffer = BTreeMap::new();
         
         // Payloads crescem para baixo a partir de PAYLOAD_END_MAX, logo os offsets
-        // dos sufixos de chave são NÃO-CRESCENTES entre slots consecutivos. Um
-        // offset maior que o anterior denuncia corrupção/sobreposição física.
+        // dos sufixos de chave sÃ£o NÃƒO-CRESCENTES entre slots consecutivos. Um
+        // offset maior que o anterior denuncia corrupÃ§Ã£o/sobreposiÃ§Ã£o fÃ­sica.
         let mut last_offset = usize::MAX;
         for _ in 0..slot_count {
             let suf_off = read_u16(data, pos)? as usize;
@@ -583,7 +663,7 @@ impl DiskNode {
             pos += 42;
             
             if last_offset != usize::MAX && suf_off > last_offset {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "Inconsistência de ordenação ou sobreposição física detectada nos slots"));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "InconsistÃªncia de ordenaÃ§Ã£o ou sobreposiÃ§Ã£o fÃ­sica detectada nos slots"));
             }
             last_offset = suf_off;
             
@@ -591,12 +671,20 @@ impl DiskNode {
             full_key.extend_from_slice(safe_slice(data, suf_off, suf_len)?);
             
             keys.push(full_key);
-            slots.push(Slot { offset: suf_off as u16, length: suf_len as u16, flags, overflow_page, cumulative_hash });
+            slots.push(Slot { offset: suf_off as u16, length: suf_len as u32, flags, overflow_page, cumulative_hash });
             if page_type == PageType::Leaf as u8 {
                 let v_off = read_u16(data, pos)? as usize;
                 let v_len = read_u16(data, pos + 2)? as usize;
-                pos += 6;
+                let ov_len = read_u32(data, pos + 4)?;
+                pos += 8;
                 vals.push(safe_slice(data, v_off, v_len)?.to_vec());
+                // Restaura o comprimento real da cadeia overflow (u32 no
+                // layout v5) para a validaÃ§Ã£o do get() pÃ³s-reopen.
+                if (flags & FLAG_OVERFLOW) != 0 {
+                    if let Some(s) = slots.last_mut() { s.length = ov_len; }
+                } else if let Some(s) = slots.last_mut() {
+                    s.length = v_len as u32;
+                }
             }
         }
         if page_type == PageType::Internal as u8 {
@@ -745,10 +833,22 @@ impl BEpsilonTree {
         Ok(t)
     }
 
+    /// Checkpoint auto-contido: copia pÃ¡gina a pÃ¡gina o Ãºltimo estado
+    /// COMMITADO do store para `path`. O shadow paging garante que o
+    /// superbloco durÃ¡vel sÃ³ referencia pÃ¡ginas jÃ¡ persistidas, por isso a
+    /// cÃ³pia Ã© um snapshot consistente (estado sujo nÃ£o commitado fica de
+    /// fora â€” o mesmo que uma reabertura pÃ³s-crash veria). Gravar sÃ³ o
+    /// superbloco, como antes, produzia um ficheiro sem as pÃ¡ginas da Ã¡rvore,
+    /// ilegÃ­vel pelo `load`.
     pub fn save(&self, path: &Path) -> io::Result<()> {
+        self.store.sync()?;
         let mut f = File::create(path)?;
-        let sb = self.superblock.read().unwrap();
-        f.write_all(&sb.serialize()?)?;
+        let total = self.store.total_pages()?;
+        let mut buf = vec![0u8; PAGE_SIZE];
+        for id in 0..total {
+            self.store.read_page(id, &mut buf)?;
+            f.write_all(&buf)?;
+        }
         f.sync_all()
     }
 
@@ -761,6 +861,36 @@ impl BEpsilonTree {
             frame.is_dirty.store(true, Ordering::Release);
             self.dirty_page_table.lock().unwrap().insert(id);
         }
+    }
+
+    /// Re-identificaÃ§Ã£o CoW: move o frame de cache de `old_id` para `new_id`,
+    /// preservando pins e o estado sujo. O invariante do cache Ã© chave ==
+    /// node.id; sem esta migraÃ§Ã£o o novo id ia ao disco ler uma pÃ¡gina nunca
+    /// escrita (EOF) e o id antigo continuava a servir o nÃ³ obsoleto â€” a causa
+    /// do bug M30 do `from_map` (Storage(EOF) no 2.Âº upsert em ficheiro fresco).
+    fn rekey_cache_frame(&self, old_id: u64, new_id: u64) {
+        if old_id == new_id { return; }
+        let old_shard = ((old_id ^ (old_id >> 16)) % NUM_SHARDS as u64) as usize;
+        let frame = self.cache_shards[old_shard].lock().unwrap().remove(&old_id);
+        if let Some(frame) = frame {
+            let was_dirty = frame.is_dirty.load(Ordering::Acquire);
+            let new_shard = ((new_id ^ (new_id >> 16)) % NUM_SHARDS as u64) as usize;
+            self.cache_shards[new_shard].lock().unwrap().insert(new_id, frame);
+            let mut dpt = self.dirty_page_table.lock().unwrap();
+            dpt.remove(&old_id);
+            if was_dirty { dpt.insert(new_id); }
+        }
+    }
+
+    /// Remove do cache (e da tabela de sujas) um frame cujo nÃ³ deixou de
+    /// existir na Ã¡rvore (ex.: filho absorvido num merge). Sem isto, se o id
+    /// fosse reciclado e realocado, o cache serviria o nÃ³ morto.
+    fn evict_cache_frame(&self, id: u64) {
+        let shard_idx = ((id ^ (id >> 16)) % NUM_SHARDS as u64) as usize;
+        if let Some(frame) = self.cache_shards[shard_idx].lock().unwrap().remove(&id) {
+            self.current_cache_bytes.fetch_sub(frame.byte_size, Ordering::Release);
+        }
+        self.dirty_page_table.lock().unwrap().remove(&id);
     }
 
     fn acquire_node_guard(&self, id: u64) -> io::Result<PageGuard> {
@@ -853,12 +983,12 @@ impl BEpsilonTree {
             next_head
         } else {
             let r_id = sb.next_page_id;
-            sb.next_page_id = sb.next_page_id.checked_add(1).ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Overflow de ID de página lógicos"))?;
+            sb.next_page_id = sb.next_page_id.checked_add(1).ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Overflow de ID de pÃ¡gina lÃ³gicos"))?;
             r_id
         };
 
         if epoch.contains(&id) {
-            return Err(io::Error::new(io::ErrorKind::Other, "Alocação dupla interceptada no epoch corrente"));
+            return Err(io::Error::new(io::ErrorKind::Other, "AlocaÃ§Ã£o dupla interceptada no epoch corrente"));
         }
         epoch.insert(id);
         Ok(id)
@@ -866,10 +996,12 @@ impl BEpsilonTree {
 
     fn recycle_id(&self, id: u64) -> io::Result<()> {
         if id <= 2 { return Ok(()); }
-        let epoch = self.allocated_this_epoch.lock().unwrap();
-        if epoch.contains(&id) {
-            return Err(io::Error::new(io::ErrorKind::Other, "Reciclagem dupla proibida no mesmo epoch transacional"));
-        }
+        // PÃ¡gina alocada NESTE epoch nunca fez parte de um estado durÃ¡vel:
+        // Ã© seguro devolvÃª-la jÃ¡ Ã  free list e realocÃ¡-la (o CoW da raiz
+        // recicla o id da geraÃ§Ã£o anterior a cada upsert â€” errar aqui, como
+        // o cÃ³digo fazia, rebentava qualquer sequÃªncia de 2+ upserts).
+        // RemovÃª-la do epoch mantÃ©m o guard de alocaÃ§Ã£o dupla coerente.
+        self.allocated_this_epoch.lock().unwrap().remove(&id);
 
         let mut sb = self.superblock.write().unwrap();
         if (sb.free_list_len as usize) < MAX_SB_FREE_LIST {
@@ -976,11 +1108,14 @@ impl BEpsilonTree {
         let root_guard = self.acquire_node_guard(root_id)?;
         let mut root = root_guard.node.write().unwrap();
         let old_root_id = root.id;
-        
+
         root.id = self.allocate_id()?;
+        // CoW re-identificado â‡’ o frame de cache migra jÃ¡ para o novo id,
+        // senÃ£o mark_dirty(novo id) Ã© no-op e o prÃ³ximo acquire vai ao disco.
+        self.rekey_cache_frame(old_root_id, root.id);
         let generation = self.superblock.read().unwrap().generation;
         root.header.generation = generation + 1;
-        
+
         if root.is_leaf() {
             root.bloom.insert(&key); 
             match &msg {
@@ -1037,13 +1172,13 @@ impl BEpsilonTree {
                             }
                             root.vals[i] = v.clone();
                             let f = if target_ov_id > 0 { FLAG_ACTIVE | FLAG_OVERFLOW } else { FLAG_ACTIVE };
-                            root.slots[i] = Slot { offset: 0, length: v.len() as u16, flags: f, overflow_page: target_ov_id, cumulative_hash: trunc_hash };
+                            root.slots[i] = Slot { offset: 0, length: v.len() as u32, flags: f, overflow_page: target_ov_id, cumulative_hash: trunc_hash };
                         }
                         Err(i) => {
                             root.keys.insert(i, key);
                             root.vals.insert(i, v.clone());
                             let f = if target_ov_id > 0 { FLAG_ACTIVE | FLAG_OVERFLOW } else { FLAG_ACTIVE };
-                            root.slots.insert(i, Slot { offset: 0, length: v.len() as u16, flags: f, overflow_page: target_ov_id, cumulative_hash: trunc_hash });
+                            root.slots.insert(i, Slot { offset: 0, length: v.len() as u32, flags: f, overflow_page: target_ov_id, cumulative_hash: trunc_hash });
                         }
                     }
                 }
@@ -1057,10 +1192,18 @@ impl BEpsilonTree {
                     }
                 }
             }
-            if root.keys.len() > self.node_cap {
+            // Split por contagem OU por bytes: node_cap por contagem Ã©
+            // fisicamente impossÃ­vel numa pÃ¡gina de 4 KB com payloads reais.
+            if root.keys.len() >= 2
+                && (root.keys.len() > self.node_cap
+                    || root.estimate_serialized_size() > PAGE_SOFT_BUDGET)
+            {
                 self.split_root_node(&mut root)?;
+                // O split publica a NOVA raiz interna e recicla o id CoW
+                // intermÃ©dio; a raiz prÃ©-CoW deste push tambÃ©m Ã© reciclada.
+                self.recycle_id(old_root_id)?;
             } else {
-                if root.calculate_fragmentation_ratio() > FRAGMENTATION_THRESHOLD { 
+                if root.calculate_fragmentation_ratio() > FRAGMENTATION_THRESHOLD {
                     let _ = root.compact_and_defragment();
                 }
                 root.rebuild_bloom_filter();
@@ -1071,9 +1214,27 @@ impl BEpsilonTree {
         } else {
             self.fuse_message(&mut root.buffer, key, msg);
             self.total_pending_messages.fetch_add(1, Ordering::Release);
-            if root.buffer.len() > self.buffer_cap {
+            // Drena por contagem OU por bytes; cada cascade esvazia o filho
+            // mais denso, por isso itera (limitado pelo fanout) atÃ© caber.
+            let mut cascades = 0usize;
+            while !root.buffer.is_empty()
+                && (root.buffer.len() > self.buffer_cap
+                    || root.estimate_serialized_size() > PAGE_SOFT_BUDGET)
+                && cascades <= root.children.len()
+            {
                 self.partial_flush_cascade(&mut root)?;
+                cascades += 1;
+            }
+            // Os separadores acumulados pelos splits dos filhos tambÃ©m tÃªm de
+            // caber na pÃ¡gina: a raiz INTERNA divide-se quando excede o orÃ§amento.
+            if root.keys.len() >= 2 && root.estimate_serialized_size() > PAGE_SOFT_BUDGET {
+                self.split_root_node(&mut root)?;
+                self.recycle_id(old_root_id)?;
             } else {
+                // A raiz CoW Ã© publicada nos DOIS ramos. Antes, o ramo do cascade
+                // nÃ£o atualizava sb.root_id nem reciclava a raiz antiga: o
+                // superbloco ficava a apontar para o id velho e a Ã¡rvore lia a
+                // pÃ¡gina obsoleta do disco no acesso seguinte.
                 self.mark_dirty(root.id);
                 self.superblock.write().unwrap().root_id = root.id;
                 self.recycle_id(old_root_id)?;
@@ -1083,7 +1244,7 @@ impl BEpsilonTree {
     }
 
     fn split_root_node(&mut self, root: &mut DiskNode) -> io::Result<()> {
-        let mid = root.keys.len() / 2;
+        let mid = root.byte_balanced_mid();
         let pivot = root.keys[mid].clone();
         let left_id = self.allocate_id()?;
         let right_id = self.allocate_id()?;
@@ -1105,7 +1266,7 @@ impl BEpsilonTree {
         let right_vals = if root.is_leaf() { old_vals.split_off(mid) } else { Vec::new() };
         let right_children = if !root.is_leaf() { old_children.split_off(mid + 1) } else { Vec::new() };
         
-        // CORREÇÃO E ENRIJECIMENTO DO SPLIT INTERNAL: O pivot sobe e é removido da chave do filho direito
+        // CORREÃ‡ÃƒO E ENRIJECIMENTO DO SPLIT INTERNAL: O pivot sobe e Ã© removido da chave do filho direito
         if !root.is_leaf() && !right_keys.is_empty() {
             right_keys.remove(0);
         }
@@ -1139,7 +1300,8 @@ impl BEpsilonTree {
         root.children = vec![left_id, right_id];
         root.buffer = BTreeMap::new();
         root.id = self.allocate_id()?;
-        
+        self.rekey_cache_frame(old_root_id, root.id);
+
         self.store.write_page(root.id, &root.serialize()?)?;
         self.metrics.write_amplification_count.fetch_add(1, Ordering::Relaxed);
         self.superblock.write().unwrap().root_id = root.id;
@@ -1162,9 +1324,10 @@ impl BEpsilonTree {
         let old_child_id = child.id;
         
         child.id = self.allocate_id()?;
+        self.rekey_cache_frame(old_child_id, child.id);
         child.header.generation = node.header.generation;
         node.children[target_idx] = child.id;
-        
+
         let mut rem_buf = BTreeMap::new();
         for (k, msg_vec) in std::mem::take(&mut node.buffer) {
             let idx = node.keys.partition_point(|p| p <= &k);
@@ -1204,21 +1367,35 @@ impl BEpsilonTree {
         }
         node.buffer = rem_buf;
         
-        if child.is_leaf() && child.keys.len() > self.node_cap {
+        if child.is_leaf()
+            && child.keys.len() >= 2
+            && (child.keys.len() > self.node_cap
+                || child.estimate_serialized_size() > PAGE_SOFT_BUDGET)
+        {
             self.split_child_node(node, target_idx, &mut child)?;
+            self.recycle_id(old_child_id)?;
         } else if child.is_leaf() && child.keys.len() < self.node_cap / 3 {
             self.merge_or_borrow_cascade(node, target_idx, &mut child)?;
+            // Sem irmÃ£o Ã  esquerda (idx 0) o merge Ã© no-op: o filho CoW
+            // continua vivo e tem de ser persistido pelo commit. (Se o merge
+            // aconteceu, o frame foi removido e isto Ã© no-op.)
+            self.mark_dirty(child.id);
+            self.recycle_id(old_child_id)?;
         } else {
             child.rebuild_bloom_filter();
             self.store.write_page(child.id, &child.serialize()?)?;
             self.metrics.write_amplification_count.fetch_add(1, Ordering::Relaxed);
             self.recycle_id(old_child_id)?;
         }
+        // O pai foi mutado (ponteiro do filho CoW + buffer drenado): tem de ir
+        // para a tabela de sujas, senÃ£o o commit persiste o filho novo mas o
+        // pai em disco continua a apontar para o filho antigo/reciclado.
+        self.mark_dirty(node.id);
         Ok(())
     }
 
     fn split_child_node(&mut self, parent: &mut DiskNode, idx: usize, child: &mut DiskNode) -> io::Result<()> {
-        let mid = child.keys.len() / 2; 
+        let mid = child.byte_balanced_mid();
         let pivot = child.keys[mid].clone();
         let right_id = self.allocate_id()?;
         
@@ -1243,7 +1420,7 @@ impl BEpsilonTree {
         let right_vals = if child.is_leaf() { old_vals.split_off(mid) } else { Vec::new() };
         let right_children = if !child.is_leaf() { old_children.split_off(mid + 1) } else { Vec::new() };
 
-        // CORREÇÃO E ENRIJECIMENTO DO SPLIT DE FILHO INTERNAL: Remove o pivot do filho direito
+        // CORREÃ‡ÃƒO E ENRIJECIMENTO DO SPLIT DE FILHO INTERNAL: Remove o pivot do filho direito
         if !child.is_leaf() && !right_keys.is_empty() {
             right_keys.remove(0);
         }
@@ -1267,6 +1444,10 @@ impl BEpsilonTree {
         self.metrics.write_amplification_count.fetch_add(2, Ordering::Relaxed);
         parent.keys.insert(idx, pivot);
         parent.children.insert(idx + 1, right_id);
+        // O frame de cache keyed child.id ainda aponta para este DiskNode, que
+        // foi esvaziado pelos mem::take acima. RepÃµe nele a metade esquerda
+        // (mesmo id), senÃ£o o prÃ³ximo acquire devolvia um nÃ³ vazio do cache.
+        *child = left;
         Ok(())
     }
 
@@ -1276,6 +1457,13 @@ impl BEpsilonTree {
             let left_guard = self.acquire_node_guard(left_id)?;
             let mut left = left_guard.node.write().unwrap();
             let old_child_id = child.id;
+
+            // O merge sÃ³ acontece se o resultado couber no orÃ§amento fÃ­sico da
+            // pÃ¡gina â€” fundir Ã s cegas estourava a folha esquerda em serialize.
+            // No-op â‡’ o chamador persiste o filho como estÃ¡ (mark_dirty).
+            if left.estimate_serialized_size() + child.estimate_serialized_size() > PAGE_SOFT_BUDGET {
+                return Ok(());
+            }
 
             // REAL FRAC TREE MERGE BEHAVIOR COMPLETO: Redistribui simetricamente e preserva os buffers de chaves e de mensagens pendentes
             left.keys.extend(std::mem::take(&mut child.keys));
@@ -1296,6 +1484,9 @@ impl BEpsilonTree {
             parent.keys.remove(idx - 1);
             parent.children.remove(idx);
             self.recycle_id(old_child_id)?;
+            // O filho foi absorvido: remove o frame morto para que uma futura
+            // realocaÃ§Ã£o deste id nÃ£o sirva o nÃ³ obsoleto do cache.
+            self.evict_cache_frame(old_child_id);
             let root_id = self.superblock.read().unwrap().root_id;
             if parent.id == root_id && parent.keys.is_empty() { 
                 self.superblock.write().unwrap().root_id = left.id;
@@ -1304,7 +1495,7 @@ impl BEpsilonTree {
         Ok(())
     }
 
-    fn read_overflow_chain(&self, first_page_id: u64, expected_length: u16, expected_hash: [u8; HASH_LEN]) -> io::Result<Vec<u8>> {
+    fn read_overflow_chain(&self, first_page_id: u64, expected_length: u32, expected_hash: [u8; HASH_LEN]) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();
         let mut curr_id = first_page_id;
         let mut visited = HashSet::new();
@@ -1329,7 +1520,7 @@ impl BEpsilonTree {
             curr_id = next_id;
         }
         if out.len() != expected_length as usize {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Tamanho total da cadeia não confere com slot.length"));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Tamanho total da cadeia nÃ£o confere com slot.length"));
         }
         let fin_hash = chain_hash.finalize();
         if fin_hash.as_bytes()[..HASH_LEN] != expected_hash {
@@ -1380,12 +1571,32 @@ impl BEpsilonTree {
 
     pub fn commit(&mut self) -> io::Result<()> {
         while self.total_pending_messages.load(Ordering::Acquire) > 0 {
+            // Numa Ã¡rvore de 3+ nÃ­veis as mensagens podem estar num interno
+            // ABAIXO da raiz (o cascade sÃ³ empurra um nÃ­vel por chamada), por
+            // isso desce-se atÃ© ao primeiro nÃ³ interno com buffer pendente â€”
+            // cascatar sÃ³ a raiz (buffer vazio) nÃ£o progredia e o loop pendurava.
             let root_id = self.superblock.read().unwrap().root_id;
-            let root_guard = self.acquire_node_guard(root_id)?;
-            let mut root = root_guard.node.write().unwrap();
-            self.partial_flush_cascade(&mut root)?;
+            let mut queue = vec![root_id];
+            let mut target = None;
+            while let Some(id) = queue.pop() {
+                let guard = self.acquire_node_guard(id)?;
+                let node = guard.node.read().unwrap();
+                if node.is_leaf() { continue; }
+                if !node.buffer.is_empty() { target = Some(id); break; }
+                queue.extend(node.children.iter().copied());
+            }
+            let Some(target_id) = target else {
+                // Buffers todos vazios mas contador > 0: mensagens fundidas
+                // (fuse_message substitui sem decrementar). Re-sincroniza em
+                // vez de pendurar o commit para sempre.
+                self.total_pending_messages.store(0, Ordering::Release);
+                break;
+            };
+            let node_guard = self.acquire_node_guard(target_id)?;
+            let mut node = node_guard.node.write().unwrap();
+            self.partial_flush_cascade(&mut node)?;
         }
-        
+
         let dirty_set = std::mem::take(&mut *self.dirty_page_table.lock().unwrap());
         if !dirty_set.is_empty() {
             for id in dirty_set {
@@ -1501,9 +1712,9 @@ impl BEpsilonTree {
 
 #[cfg(test)]
 mod page_roundtrip_tests {
-    //! Round-trip da (de)serialização física da página, com foco na compressão
+    //! Round-trip da (de)serializaÃ§Ã£o fÃ­sica da pÃ¡gina, com foco na compressÃ£o
     //! por prefixo (feature M22: OFF_PFX_OFF/OFF_PFX_LEN). Sem estes testes a
-    //! feature de formato de página ficava sem rede de segurança.
+    //! feature de formato de pÃ¡gina ficava sem rede de seguranÃ§a.
     use super::*;
 
     fn leaf(keys: &[&str], vals: &[&str]) -> DiskNode {
@@ -1533,7 +1744,7 @@ mod page_roundtrip_tests {
     fn common_prefix_extraction() {
         let n = leaf(&["prefix_alpha", "prefix_beta", "prefix_gamma"], &["1", "2", "3"]);
         assert_eq!(n.calculate_common_prefix(), b"prefix_".to_vec());
-        // No shared prefix → empty.
+        // No shared prefix â†’ empty.
         let m = leaf(&["apple", "banana"], &["1", "2"]);
         assert_eq!(m.calculate_common_prefix(), Vec::<u8>::new());
     }
@@ -1548,12 +1759,12 @@ mod page_roundtrip_tests {
         assert_eq!(pfx_len, b"prefix_".len(), "OFF_PFX_LEN deve refletir o prefixo comum");
 
         let n2 = DiskNode::deserialize(n.id, &buf).unwrap();
-        assert_eq!(n2.keys, n.keys, "chaves reconstruídas com prefixo devem bater");
+        assert_eq!(n2.keys, n.keys, "chaves reconstruÃ­das com prefixo devem bater");
         assert_eq!(n2.vals, n.vals);
         assert_eq!(n2.low_key, n.low_key);
         assert_eq!(n2.high_key, n.high_key);
-        // Serialização determinística: re-serializar deve dar bytes idênticos.
-        assert_eq!(n2.serialize().unwrap(), buf, "round-trip não é byte-idêntico");
+        // SerializaÃ§Ã£o determinÃ­stica: re-serializar deve dar bytes idÃªnticos.
+        assert_eq!(n2.serialize().unwrap(), buf, "round-trip nÃ£o Ã© byte-idÃªntico");
     }
 
     #[test]
@@ -1593,10 +1804,56 @@ mod page_roundtrip_tests {
         };
         let buf = node.serialize().unwrap();
         let n2 = DiskNode::deserialize(node.id, &buf).unwrap();
-        assert_eq!(n2.keys, node.keys, "separadores reconstruídos");
+        assert_eq!(n2.keys, node.keys, "separadores reconstruÃ­dos");
         assert_eq!(n2.children, node.children, "ponteiros de filhos preservados");
         assert_eq!(n2.buffer, node.buffer, "mensagens do buffer (prefixo-stripped) preservadas");
         assert_eq!(n2.serialize().unwrap(), buf);
+    }
+
+    // RegressÃ£o do bug M30 (corrigido): o CoW re-identificava o nÃ³ mas o frame
+    // de cache ficava sob o id antigo â€” o 2.Âº upsert ia ao disco ler uma pÃ¡gina
+    // nunca escrita (Storage(EOF)). Ver `rekey_cache_frame`.
+    #[test]
+    fn from_map_fresh_path_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.hbt");
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(b"k1".to_vec(), b"v1".to_vec());
+        m.insert(b"k2".to_vec(), b"v2".to_vec());
+        let t = super::BEpsilonTree::from_map(&path, m).unwrap();
+        assert_eq!(t.get(b"k1"), Some(b"v1".to_vec()));
+        assert_eq!(t.get(b"k2"), Some(b"v2".to_vec()));
+    }
+
+    // Exercita os caminhos profundos que o roundtrip pequeno nÃ£o toca:
+    // split da raiz (>node_cap=128), buffer da raiz interna, cascade no
+    // commit, split de filho â€” e depois reabre do disco para provar que o
+    // estado commitado Ã© completo e navegÃ¡vel.
+    #[test]
+    fn from_map_many_keys_splits_and_survives_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.hbt");
+        let mut m = std::collections::BTreeMap::new();
+        for i in 0..500u32 {
+            m.insert(format!("k{i:04}").into_bytes(), format!("v{i:04}").into_bytes());
+        }
+        let t = super::BEpsilonTree::from_map(&path, m.clone()).unwrap();
+        for (k, v) in &m {
+            assert_eq!(t.get(k).as_ref(), Some(v), "chave presente apÃ³s from_map");
+        }
+        drop(t);
+        let t2 = super::BEpsilonTree::load(&path).unwrap();
+        for (k, v) in &m {
+            assert_eq!(t2.get(k).as_ref(), Some(v), "chave presente apÃ³s reload do disco");
+        }
+    }
+
+    #[test]
+    fn from_map_empty_fresh_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.hbt");
+        let t = super::BEpsilonTree::from_map(&path, std::collections::BTreeMap::new()).unwrap();
+        assert_eq!(t.get(b"nope"), None);
     }
 
     #[test]

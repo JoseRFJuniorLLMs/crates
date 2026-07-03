@@ -75,8 +75,11 @@ impl pb::heraclitus_server::Heraclitus for Service {
         req: Request<pb::QueryRequest>,
     ) -> Result<Response<pb::QueryResponse>, Status> {
         let gql = req.into_inner().gql;
-        let v = heraclitus_query::execute(&gql, self.engine.as_ref())
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let result = heraclitus_query::execute(&gql, self.engine.as_ref());
+        // Meta-auditoria (quando ligada por config): a execução — com sucesso
+        // OU falha — vira um evento AuditQuery no log, antes de responder.
+        self.engine.audit_query(&gql, result.is_ok());
+        let v = result.map_err(|e| Status::invalid_argument(e.to_string()))?;
         Ok(Response::new(pb::QueryResponse {
             json: v.to_string(),
         }))

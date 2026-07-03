@@ -12,3 +12,8 @@ heraclitus-views = { workspace = true }
 dashmap = { workspace = true }
 roaring = { workspace = true }
 blake3 = { workspace = true }
+serde = { workspace = true }
+leiden-rs = "0.8.1"
+
+[dev-dependencies]
+tempfile = { workspace = true }

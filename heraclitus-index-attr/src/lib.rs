@@ -17,7 +17,8 @@
 use heraclitus_core::{Episode, HeraclitusError, Lsn};
 use heraclitus_views::View;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
 use std::path::Path;
 
 const BINCODE_CFG: bincode::config::Configuration = bincode::config::standard();
@@ -38,6 +39,23 @@ struct Snapshot {
     applied: bool,
     /// `"campo\u{1f}valor" -> [LSN]` (postings em ordem crescente de LSN).
     exact: HashMap<String, Vec<Lsn>>,
+    /// Índice ORDENADO por valor numérico: `campo -> valor(f64 ordenável) ->
+    /// [LSN]` (padrão Qdrant de range filtering). A chave é o f64 mapeado num
+    /// u64 que preserva a ordem total, para o BTreeMap poder fazer `range()`.
+    /// Formato de checkpoint incompatível com o anterior: `open` degrada para
+    /// rebuild por replay (correto por construção).
+    numeric: HashMap<String, BTreeMap<u64, Vec<Lsn>>>,
+}
+
+/// Mapeia um f64 num u64 que preserva a ordem total (`a < b ⟺ enc(a) < enc(b)`):
+/// positivos: flip do bit de sinal; negativos: complemento de todos os bits.
+fn f64_ordered(v: f64) -> u64 {
+    let bits = v.to_bits();
+    if bits >> 63 == 0 {
+        bits | (1 << 63)
+    } else {
+        !bits
+    }
 }
 
 /// Índice invertido de atributos. Persistido e reconstruível por replay.
@@ -78,6 +96,27 @@ impl AttrIndex {
             .get(&ikey(field, value))
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// LSNs (ordenados, sem duplicados) dos eventos cujo valor NUMÉRICO de
+    /// `field` cai no intervalo `[min, max]` (bounds à la `BTreeMap::range`).
+    /// Vazio se o campo não tem valores numéricos indexados.
+    pub fn lookup_range(&self, field: &str, min: Bound<f64>, max: Bound<f64>) -> Vec<Lsn> {
+        let Some(by_value) = self.inner.numeric.get(field) else {
+            return Vec::new();
+        };
+        let enc = |b: Bound<f64>| match b {
+            Bound::Included(v) => Bound::Included(f64_ordered(v)),
+            Bound::Excluded(v) => Bound::Excluded(f64_ordered(v)),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let mut out: Vec<Lsn> = by_value
+            .range((enc(min), enc(max)))
+            .flat_map(|(_, postings)| postings.iter().copied())
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// Nº de pares (campo,valor) distintos indexados.
@@ -123,6 +162,20 @@ impl View for AttrIndex {
                 continue;
             }
             self.inner.exact.entry(ikey(field, v)).or_default().push(lsn);
+            // Valor numérico entra também no índice ordenado (range filtering).
+            // Os SKIP_VALUES continuam de fora — "0"/"-1" ubíquos gerariam
+            // postings gigantes sem poder discriminante.
+            if let Ok(n) = v.parse::<f64>() {
+                if n.is_finite() {
+                    self.inner
+                        .numeric
+                        .entry(field.clone())
+                        .or_default()
+                        .entry(f64_ordered(n))
+                        .or_default()
+                        .push(lsn);
+                }
+            }
         }
         self.inner.watermark = lsn;
         self.inner.applied = true;
@@ -198,6 +251,35 @@ mod tests {
         idx.apply(0, &e);
         assert!(idx.lookup("objeto", &desc).is_empty(), "texto livre não é indexado");
         assert_eq!(idx.lookup("cnpj", "11222333000144"), &[0], "identificador curto é indexado");
+    }
+
+    #[test]
+    fn range_lookup_over_numeric_values() {
+        // C1.6 (padrão Qdrant): WHERE n.valor > x AND n.valor < y sem scan.
+        let mut idx = AttrIndex::new();
+        let val = |v: &str| {
+            let mut e = Episode::new("etl", EventKind::Observation, vec![]);
+            e.attrs.insert("valor".into(), v.into());
+            e
+        };
+        for (lsn, v) in [(0, "-50.5"), (1, "10"), (2, "99.9"), (3, "100"), (4, "3000"), (5, "abc")] {
+            idx.apply(lsn, &val(v));
+        }
+
+        use std::ops::Bound::*;
+        assert_eq!(idx.lookup_range("valor", Included(10.0), Included(100.0)), &[1, 2, 3]);
+        assert_eq!(idx.lookup_range("valor", Excluded(10.0), Excluded(100.0)), &[2]);
+        // Negativos ordenam corretamente (f64_ordered preserva a ordem total).
+        assert_eq!(idx.lookup_range("valor", Unbounded, Excluded(0.0)), &[0]);
+        assert_eq!(idx.lookup_range("valor", Included(100.0), Unbounded), &[3, 4]);
+        // Não-numéricos ("abc") ficam fora do índice ordenado; campo inexistente = vazio.
+        assert!(idx.lookup_range("outro", Unbounded, Unbounded).is_empty());
+
+        // O checkpoint preserva o índice numérico.
+        let dir = tempfile::tempdir().unwrap();
+        idx.save(dir.path()).unwrap();
+        let re = AttrIndex::open(dir.path());
+        assert_eq!(re.lookup_range("valor", Included(10.0), Included(100.0)), &[1, 2, 3]);
     }
 
     #[test]

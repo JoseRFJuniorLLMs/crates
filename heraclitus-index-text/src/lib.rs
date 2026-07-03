@@ -73,9 +73,55 @@ impl TextIndex {
     }
 }
 
+/// Snapshot serializável do índice (fast boot): `by_event` é reconstruído de
+/// `ids` no restore, por isso não é persistido.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TextSnapshot {
+    postings: HashMap<String, Vec<(u32, u32)>>,
+    doc_len: Vec<u32>,
+    ids: Vec<EventId>,
+    lsns: Vec<Lsn>,
+    total_len: u64,
+    watermark: Lsn,
+}
+
 impl View for TextIndex {
     fn name(&self) -> &str {
         "text"
+    }
+
+    fn checkpoint(&self, dir: &std::path::Path) -> Result<(), heraclitus_core::HeraclitusError> {
+        heraclitus_views::ckpt::save(
+            dir,
+            "text",
+            &TextSnapshot {
+                postings: self.postings.clone(),
+                doc_len: self.doc_len.clone(),
+                ids: self.ids.clone(),
+                lsns: self.lsns.clone(),
+                total_len: self.total_len,
+                watermark: self.watermark,
+            },
+        )
+    }
+
+    fn restore(&mut self, dir: &std::path::Path) -> Result<bool, heraclitus_core::HeraclitusError> {
+        let Some(snap) = heraclitus_views::ckpt::load::<TextSnapshot>(dir, "text")? else {
+            return Ok(false);
+        };
+        self.by_event = snap
+            .ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, i as u32))
+            .collect();
+        self.postings = snap.postings;
+        self.doc_len = snap.doc_len;
+        self.ids = snap.ids;
+        self.lsns = snap.lsns;
+        self.total_len = snap.total_len;
+        self.watermark = snap.watermark;
+        Ok(true)
     }
 
     fn apply(&mut self, lsn: Lsn, event: &Episode) {

@@ -26,6 +26,7 @@ tempfile = { workspace = true }
 rand = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
+serde_json = { workspace = true }
 
 [[bench]]
 name = "append"

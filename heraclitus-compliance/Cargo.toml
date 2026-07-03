@@ -23,6 +23,7 @@ p256 = { workspace = true }
 # async daemon (carimbagem por linha d'água)
 tokio = { workspace = true }
 tracing = { workspace = true }
+fips204 = "0.4.6"
 
 [dev-dependencies]
 tempfile = { workspace = true }

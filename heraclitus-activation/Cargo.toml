@@ -11,7 +11,9 @@ heraclitus-core = { workspace = true }
 heraclitus-views = { workspace = true }
 dashmap = { workspace = true }
 arrayvec = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
 rand = { workspace = true }
+tempfile = { workspace = true }

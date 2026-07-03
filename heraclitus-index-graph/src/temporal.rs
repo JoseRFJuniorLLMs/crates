@@ -23,7 +23,7 @@ pub type HypothesisId = String;
 pub type RuleId = String;
 
 /// Tipo de relação. `NotRelated` é a hipótese **negativa** (RFC-004, sinal −1).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum EdgeType {
     FraudPartner,
     SocioDe,
@@ -72,7 +72,7 @@ impl EdgeType {
 /// Hipótese concorrente sobre uma aresta (RFC-004). É **evidência**, não veredito.
 /// Múltiplas versões da mesma aresta coexistem (M12): cada uma é uma afirmação
 /// independente, com a sua própria origem, confiança, polaridade e `valid_from`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EdgeVersion {
     pub hypothesis_id: HypothesisId,
     pub confidence: f32, // 0.0..=1.0
@@ -85,7 +85,7 @@ pub struct EdgeVersion {
 }
 
 /// Aresta puramente **topológica + temporal** (M8/M9). A confiança vive nas versions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Edge {
     pub id: EdgeId,
     pub from: EntityId,
@@ -93,16 +93,28 @@ pub struct Edge {
     pub etype: EdgeType,
     pub valid_from_lsn: Lsn,
     pub valid_to_lsn: Option<Lsn>,
+    /// Bi-temporal (V2.4): validade do FACTO no mundo real (`[from, to)`,
+    /// ausente = aberto) — vem do valid time do episódio que ASSERTOU a
+    /// aresta. Distinto de `valid_*_lsn` (transaction time do log).
+    pub world_valid_from: Option<u64>,
+    pub world_valid_to: Option<u64>,
 }
 
 impl Edge {
     pub fn alive_at(&self, at: Lsn) -> bool {
         self.valid_from_lsn <= at && self.valid_to_lsn.is_none_or(|to| at < to)
     }
+
+    /// O facto que a aresta representa é válido NO MUNDO em `t`?
+    /// (`VALID AT t` sobre arestas; sem valid time = atemporal, passa sempre.)
+    pub fn world_valid_at(&self, t: u64) -> bool {
+        self.world_valid_from.is_none_or(|from| from <= t)
+            && self.world_valid_to.is_none_or(|to| t < to)
+    }
 }
 
 /// Mapeamento evento→entidade **probabilístico e temporal** (RFC-005).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EntityMapping {
     pub entity_id: EntityId,
     pub confidence: f32,
@@ -114,7 +126,7 @@ pub struct EntityMapping {
 
 /// Métricas (RFC-007). `degree` é exato em qualquer `as_of`; `centrality`/`anomaly`
 /// refletem o checkpoint `computed_at_lsn` (staleness explícita).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct NodeMetrics {
     pub degree: u32,
     pub centrality: f32,
@@ -123,7 +135,7 @@ pub struct NodeMetrics {
 }
 
 /// Política de crença (RFC-004): log-odds. Versionada para reprodutibilidade.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BeliefPolicy {
     pub version: u32,
     pub eps: f32, // clamp de confidence antes do logit
@@ -194,6 +206,9 @@ pub struct EdgeMatch {
     pub to: EntityId,
     pub etype: EdgeType,
     pub belief: f32,
+    /// Valid time do mundo herdado da aresta (V2.4; `None` = aberto).
+    pub world_valid_from: Option<u64>,
+    pub world_valid_to: Option<u64>,
 }
 
 /// Resultado das métricas de grafo (M14). Tudo é função pura do estado do grafo
@@ -218,7 +233,7 @@ impl GraphAnalytics {
 }
 
 /// Índice de grafo temporal (M8). View materializada, determinística, reconstruível.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TemporalGraph {
     pub out: BTreeMap<EntityId, BTreeMap<EdgeType, Vec<EdgeId>>>,
     pub inn: BTreeMap<EntityId, BTreeMap<EdgeType, Vec<EdgeId>>>,
@@ -414,6 +429,8 @@ impl TemporalGraph {
                 to: edge.to.clone(),
                 etype: edge.etype.clone(),
                 belief,
+                world_valid_from: edge.world_valid_from,
+                world_valid_to: edge.world_valid_to,
             });
         };
         match src {
@@ -541,6 +558,74 @@ impl TemporalGraph {
         GraphAnalytics { community, metrics }
     }
 
+    /// Comunidades por LEIDEN (C2.3, qualidade de modularidade) sobre as
+    /// arestas vivas em `as_of` — upgrade opcional às componentes conexas do
+    /// [`analyze`](Self::analyze): separa sub-comunidades densas dentro de uma
+    /// mesma componente (anéis de fraude ligados por uma ponte fraca).
+    ///
+    /// Determinístico (§3.5): seed fixa no leiden-rs (que tem testes próprios
+    /// de reprodutibilidade por seed), nós ordenados (BTreeSet) e pesos =
+    /// crença agregada. Convenção de saída IGUAL ao `analyze`: nó → id da
+    /// comunidade, com id = menor nó da comunidade. Em erro interno do Leiden,
+    /// degrada para as componentes conexas — nunca pior que o baseline.
+    pub fn communities_leiden(&self, as_of: Lsn, min_confidence: f32) -> BTreeMap<EntityId, EntityId> {
+        // Arestas vivas com peso = crença; pares duplicados agregam pesos.
+        let mut nodes: BTreeSet<EntityId> = BTreeSet::new();
+        let mut weights: BTreeMap<(EntityId, EntityId), f64> = BTreeMap::new();
+        for e in self.edges.values() {
+            if !e.alive_at(as_of) {
+                continue;
+            }
+            let belief = self.belief_at(&e.id, as_of);
+            if belief < min_confidence || e.from == e.to {
+                continue;
+            }
+            nodes.insert(e.from.clone());
+            nodes.insert(e.to.clone());
+            let key = if e.from <= e.to {
+                (e.from.clone(), e.to.clone())
+            } else {
+                (e.to.clone(), e.from.clone())
+            };
+            *weights.entry(key).or_insert(0.0) += f64::from(belief.max(1e-6));
+        }
+        if nodes.is_empty() {
+            return BTreeMap::new();
+        }
+
+        let by_index: Vec<&EntityId> = nodes.iter().collect();
+        let index: BTreeMap<&EntityId, usize> =
+            by_index.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+
+        let run = || -> Option<Vec<(usize, Vec<usize>)>> {
+            let mut b = leiden_rs::GraphDataBuilder::new(by_index.len());
+            for ((f, t), w) in &weights {
+                b.add_edge(index[f], index[t], *w).ok()?;
+            }
+            let graph = b.build().ok()?;
+            let config = leiden_rs::LeidenConfig::builder().seed(0x4852_4B4C).build();
+            let out = leiden_rs::Leiden::new(config).run(&graph).ok()?;
+            Some(out.partition.communities())
+        };
+
+        match run() {
+            Some(communities) => {
+                let mut result = BTreeMap::new();
+                for (_cid, members) in communities {
+                    let mut names: Vec<&EntityId> = members.iter().map(|&i| by_index[i]).collect();
+                    names.sort();
+                    let Some(&community_id) = names.first() else { continue };
+                    for n in names {
+                        result.insert(n.clone(), community_id.clone());
+                    }
+                }
+                result
+            }
+            // Fallback honesto: componentes conexas (o baseline do analyze).
+            None => self.analyze(as_of, min_confidence).community,
+        }
+    }
+
     /// `edge_id` determinístico de uma aresta `from -[etype]-> to`. Estável entre
     /// replays e plataformas (alimenta o `state_hash`).
     pub fn edge_id(from: &str, to: &str, etype: &EdgeType) -> EdgeId {
@@ -630,6 +715,9 @@ impl TemporalGraph {
                         polarity,
                         valid_from_lsn: lsn,
                     };
+                    // Valid time do mundo: campos nativos (FORMAT v4) primeiro,
+                    // attrs como fallback de compatibilidade.
+                    let wnum = |k: &str| e.attrs.get(k).and_then(|v| v.trim().parse::<u64>().ok());
                     self.upsert_edge(
                         Edge {
                             id: edge_id,
@@ -638,6 +726,8 @@ impl TemporalGraph {
                             etype,
                             valid_from_lsn: lsn,
                             valid_to_lsn: None,
+                            world_valid_from: e.valid_from.or_else(|| wnum("valid_from")),
+                            world_valid_to: e.valid_to.or_else(|| wnum("valid_to")),
                         },
                         vec![version],
                     );
@@ -665,6 +755,8 @@ impl TemporalGraph {
                             etype: etype.clone(),
                             valid_from_lsn: lsn,
                             valid_to_lsn: None,
+                            world_valid_from: e.valid_from,
+                            world_valid_to: e.valid_to,
                         },
                         vec![version],
                     );
@@ -722,6 +814,20 @@ impl heraclitus_views::View for TemporalGraph {
         self.watermark
     }
 
+    fn checkpoint(&self, dir: &std::path::Path) -> Result<(), heraclitus_core::HeraclitusError> {
+        heraclitus_views::ckpt::save(dir, "tgraph", self)
+    }
+
+    fn restore(&mut self, dir: &std::path::Path) -> Result<bool, heraclitus_core::HeraclitusError> {
+        match heraclitus_views::ckpt::load::<TemporalGraph>(dir, "tgraph")? {
+            Some(g) => {
+                *self = g;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     fn reset(&mut self) {
         *self = TemporalGraph::new();
     }
@@ -743,7 +849,16 @@ mod tests {
     }
 
     fn edge(id: &str, from: &str, to: &str, etype: EdgeType, vf: Lsn) -> Edge {
-        Edge { id: id.into(), from: from.into(), to: to.into(), etype, valid_from_lsn: vf, valid_to_lsn: None }
+        Edge {
+            id: id.into(),
+            from: from.into(),
+            to: to.into(),
+            etype,
+            valid_from_lsn: vf,
+            valid_to_lsn: None,
+            world_valid_from: None,
+            world_valid_to: None,
+        }
     }
 
     #[test]
@@ -765,6 +880,60 @@ mod tests {
         let a = p.aggregate(&[ver("a", 0.7, &EdgeType::FraudPartner), ver("b", 0.6, &EdgeType::SimilarA)]);
         let b = p.aggregate(&[ver("b", 0.6, &EdgeType::SimilarA), ver("a", 0.7, &EdgeType::FraudPartner)]);
         assert!((a - b).abs() < 1e-6, "agregação deve ser determinística/independente de ordem");
+    }
+
+    #[test]
+    fn leiden_separa_sub_comunidades_que_componentes_conexas_fundem() {
+        // C2.3: duas cliques densas ligadas por UMA ponte fraca. Componentes
+        // conexas veem 1 comunidade; Leiden (modularidade) separa as duas.
+        let mut g = TemporalGraph::new();
+        let mut add = |id: &str, from: &str, to: &str, conf: f32| {
+            g.upsert_edge(
+                edge(id, from, to, EdgeType::SocioDe, 0),
+                vec![ver(id, conf, &EdgeType::SocioDe)],
+            );
+        };
+        // Clique A (A1..A4, todas as arestas, crença alta)
+        let a = ["A1", "A2", "A3", "A4"];
+        for i in 0..a.len() {
+            for j in (i + 1)..a.len() {
+                add(&format!("a{i}{j}"), a[i], a[j], 0.95);
+            }
+        }
+        // Clique B (B1..B4)
+        let b = ["B1", "B2", "B3", "B4"];
+        for i in 0..b.len() {
+            for j in (i + 1)..b.len() {
+                add(&format!("b{i}{j}"), b[i], b[j], 0.95);
+            }
+        }
+        // Ponte fraca única A1—B1
+        add("ponte", "A1", "B1", 0.2);
+
+        // Baseline: componentes conexas fundem tudo numa comunidade só.
+        let cc = g.analyze(100, 0.0).community;
+        assert_eq!(cc.get("A2"), cc.get("B2"), "componentes conexas: 1 comunidade");
+
+        // Leiden separa as cliques apesar da ponte.
+        let leiden = g.communities_leiden(100, 0.0);
+        assert_eq!(leiden.len(), 8, "todos os nós classificados");
+        assert_eq!(leiden.get("A1"), leiden.get("A4"), "clique A junta");
+        assert_eq!(leiden.get("B1"), leiden.get("B4"), "clique B junta");
+        assert_ne!(leiden.get("A2"), leiden.get("B2"), "cliques separadas pela modularidade");
+
+        // Determinismo (§3.5): mesma entrada, mesma partição — sempre.
+        let again = g.communities_leiden(100, 0.0);
+        assert_eq!(leiden, again, "seed fixa ⇒ partição reproduzível");
+
+        // AS OF respeitado: em LSN anterior às arestas, não há comunidades.
+        // (arestas com valid_from 0 ⇒ usa um grafo novo com arestas futuras)
+        let mut g2 = TemporalGraph::new();
+        g2.upsert_edge(
+            edge("late", "X", "Y", EdgeType::SocioDe, 50),
+            vec![EdgeVersion { valid_from_lsn: 50, ..ver("late", 0.9, &EdgeType::SocioDe) }],
+        );
+        assert!(g2.communities_leiden(10, 0.0).is_empty());
+        assert_eq!(g2.communities_leiden(50, 0.0).len(), 2);
     }
 
     #[test]

@@ -898,6 +898,204 @@ mod tests {
     }
 
     #[test]
+    fn native_valid_time_and_leiden_in_gql() {
+        // V2.4: (a) valid time NATIVO (FORMAT v4) alimenta o VALID AT — em nós
+        // E em arestas; (b) COMMUNITY ("n", LEIDEN) separa sub-comunidades.
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+
+        // Nó com valid time nos CAMPOS NATIVOS (sem attrs).
+        let mut n = Episode::new("ag", EventKind::Observation, b"mandato".to_vec());
+        n.valid_from = Some(1000);
+        n.valid_to = Some(2000);
+        log.append(n).unwrap();
+
+        // Aresta societária cujo FACTO valia no mundo de 1000 a 2000.
+        let mut edge = Episode::new("ag", EventKind::Observation, vec![]);
+        edge.attrs.insert("edge_from".into(), "Alfa".into());
+        edge.attrs.insert("edge_to".into(), "Maria".into());
+        edge.attrs.insert("edge_type".into(), "socio_de".into());
+        edge.valid_from = Some(1000);
+        edge.valid_to = Some(2000);
+        log.append(edge).unwrap();
+
+        // Duas cliques + ponte fraca (para o LEIDEN separar).
+        let mk = |f: &str, t: &str| {
+            let mut e = Episode::new("ag", EventKind::Observation, vec![]);
+            e.attrs.insert("edge_from".into(), f.into());
+            e.attrs.insert("edge_to".into(), t.into());
+            e.attrs.insert("edge_type".into(), "socio_de".into());
+            e
+        };
+        for (f, t) in [
+            ("A1", "A2"), ("A2", "A3"), ("A3", "A1"), ("A1", "A3"),
+            ("B1", "B2"), ("B2", "B3"), ("B3", "B1"), ("B1", "B3"),
+            ("A1", "B1"), // ponte
+        ] {
+            log.append(mk(f, t)).unwrap();
+        }
+        let be = LogBackend::new(log);
+
+        // Nó: campos nativos filtram sem attrs nenhum.
+        let v = execute("MATCH (n) VALID AT 1500 RETURN n", &be).unwrap();
+        assert!(v.as_array().unwrap().iter().any(|r| r["content"] == "mandato"));
+        let v = execute("MATCH (n) WHERE n.agent_id = \"ag\" VALID AT 2500 RETURN n", &be).unwrap();
+        assert!(
+            v.as_array().unwrap().iter().all(|r| r["content"] != "mandato"),
+            "fora do intervalo [1000, 2000) o mandato não é válido"
+        );
+
+        // Aresta: VALID AT em edge match usa o valid time herdado do assert.
+        let v = execute(
+            "MATCH (a)-[r:socio_de]->(b) WHERE b = \"Maria\" VALID AT 1500 RETURN *",
+            &be,
+        )
+        .unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1, "válida em 1500");
+        let v = execute(
+            "MATCH (a)-[r:socio_de]->(b) WHERE b = \"Maria\" VALID AT 2500 RETURN *",
+            &be,
+        )
+        .unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 0, "expirada em 2500");
+
+        // COMMUNITY clássico funde tudo; com LEIDEN as cliques separam-se.
+        let cc = execute("COMMUNITY (\"A2\")", &be).unwrap();
+        assert!(cc["members"].as_array().unwrap().len() >= 6, "componente única");
+        let leiden = execute("COMMUNITY (\"A2\", LEIDEN)", &be).unwrap();
+        let members: Vec<&str> = leiden["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m.as_str().unwrap())
+            .collect();
+        assert!(members.iter().all(|m| m.starts_with('A')), "só a clique A: {members:?}");
+        assert!(explain("COMMUNITY (\"A2\", LEIDEN)").unwrap().contains("Leiden"));
+    }
+
+    #[test]
+    fn valid_time_bitemporal_filter() {
+        // C2.2 (SQL:2011/XTDB): VALID AT filtra pelo tempo de VALIDADE do
+        // facto no mundo real (attrs valid_from/valid_to, [from, to)),
+        // ortogonal ao AS OF (transaction time = quando foi GRAVADO).
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        let fact = |name: &str, from: Option<&str>, to: Option<&str>| {
+            let mut e = Episode::new("ag", EventKind::Observation, name.as_bytes().to_vec());
+            if let Some(f) = from {
+                e.attrs.insert("valid_from".into(), f.into());
+            }
+            if let Some(t) = to {
+                e.attrs.insert("valid_to".into(), t.into());
+            }
+            e
+        };
+        // Sócio de 1000 a 2000; sócio desde 1500 (aberto); facto atemporal.
+        log.append(fact("socio_antigo", Some("1000"), Some("2000"))).unwrap(); // lsn 0
+        log.append(fact("socio_atual", Some("1500"), None)).unwrap(); // lsn 1
+        log.append(fact("atemporal", None, None)).unwrap(); // lsn 2
+        let be = LogBackend::new(log);
+
+        let names = |v: &serde_json::Value| -> Vec<String> {
+            v.as_array().unwrap().iter().map(|r| r["content"].as_str().unwrap().to_string()).collect()
+        };
+
+        // Em t=1200 só o sócio antigo é válido (o atual ainda não começou).
+        let v = execute("MATCH (n) VALID AT 1200 RETURN n", &be).unwrap();
+        assert_eq!(names(&v), vec!["socio_antigo", "atemporal"]);
+
+        // Em t=1700 ambos os sócios são válidos.
+        let v = execute("MATCH (n) VALID AT 1700 RETURN n", &be).unwrap();
+        assert_eq!(names(&v), vec!["socio_antigo", "socio_atual", "atemporal"]);
+
+        // Em t=2000 o intervalo [1000, 2000) já fechou — o antigo sai.
+        let v = execute("MATCH (n) VALID AT 2000 RETURN n", &be).unwrap();
+        assert_eq!(names(&v), vec!["socio_atual", "atemporal"]);
+
+        // Bi-temporal de verdade: VALID AT + AS OF compõem — em transaction
+        // time LSN 1 só o sócio antigo tinha sido GRAVADO.
+        let v = execute("MATCH (n) VALID AT 1700 AS OF LSN 1 RETURN n", &be).unwrap();
+        assert_eq!(names(&v), vec!["socio_antigo"]);
+
+        // EXPLAIN mostra a fase de valid time.
+        let s = explain("MATCH (n) VALID AT 1700 RETURN n").unwrap();
+        assert!(s.contains("ValidAt(1700)"), "{s}");
+    }
+
+    #[test]
+    fn numeric_range_filter_on_attrs() {
+        // C1.6: WHERE n.<campo> >/< número — resolvido pelo índice (hint de
+        // range) e revalidado pelo pós-filtro com coerção numérica (attrs são
+        // strings no Episode; antes disto a comparação devolvia sempre false).
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        for v in ["5", "50", "150", "3000"] {
+            let mut e = Episode::new("etl", EventKind::Observation, v.as_bytes().to_vec());
+            e.attrs.insert("valor".into(), v.into());
+            log.append(e).unwrap();
+        }
+        let be = LogBackend::new(log);
+
+        let v = execute("MATCH (n) WHERE n.valor > 10 AND n.valor < 200 RETURN n", &be).unwrap();
+        let got: Vec<&str> = v.as_array().unwrap().iter().map(|r| r["content"].as_str().unwrap()).collect();
+        assert_eq!(got, vec!["50", "150"]);
+
+        // Bounds inclusivos e um só lado.
+        let v = execute("MATCH (n) WHERE n.valor >= 150 RETURN n", &be).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 2);
+
+        // AS OF corta o range temporalmente (lsn < 2 ⇒ só "5" e "50").
+        let v = execute("MATCH (n) WHERE n.valor > 1 AS OF LSN 2 RETURN n", &be).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 2);
+
+        // Igualdade em string continua lexicográfica (zeros à esquerda intactos).
+        let v = execute("MATCH (n) WHERE n.valor = \"50\" RETURN n", &be).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dist_operators_filter_and_order() {
+        // C1.4 (padrão pgvector): DIST_* como operando do WHERE e chave do
+        // ORDER BY, avaliado sobre o embedding do episódio.
+        use heraclitus_core::ProductPoint;
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        for (name, hyp) in [("perto", 0.10f32), ("meio", 0.50), ("longe", 0.90)] {
+            let mut e = Episode::new("ag", EventKind::Observation, name.as_bytes().to_vec());
+            e.embedding = Some(ProductPoint { hyp: vec![hyp], sph: vec![], euc: vec![] });
+            log.append(e).unwrap();
+        }
+        // Sem embedding: nunca casa um filtro DIST_* e vai para o fim no ORDER BY.
+        log.append(Episode::new("ag", EventKind::Observation, b"sem embedding".to_vec()))
+            .unwrap();
+        let be = LogBackend::new(log);
+
+        // WHERE: só o vizinho hiperbólico próximo de 0.1 passa o corte.
+        let v = execute("MATCH (n) WHERE DIST_HYP([0.12]) < 0.1 RETURN n", &be).unwrap();
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["content"].as_str().unwrap(), "perto");
+
+        // ORDER BY: mais próximo primeiro; o episódio sem embedding vai para o fim.
+        let v = execute("MATCH (n) RETURN n ORDER BY DIST_HYP([0.12]) ASC", &be).unwrap();
+        let contents: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(contents, vec!["perto", "meio", "longe", "sem embedding"]);
+
+        // DESC inverte (o sem-embedding continua tratado como infinito → primeiro).
+        let v = execute("MATCH (n) RETURN n ORDER BY DIST_HYP([0.12]) DESC LIMIT 1", &be).unwrap();
+        assert_eq!(v.as_array().unwrap()[0]["content"].as_str().unwrap(), "sem embedding");
+
+        // EXPLAIN mostra a chave de ordenação por distância.
+        let s = explain("MATCH (n) RETURN n ORDER BY DIST_PRODUCT([0.1, 0.2])").unwrap();
+        assert!(s.contains("DIST_"), "{s}");
+    }
+
+    #[test]
     fn recall_and_provenance() {
         let (_d, be) = seeded_backend();
         let v = execute("RECALL (\"river\", 3)", &be).unwrap();

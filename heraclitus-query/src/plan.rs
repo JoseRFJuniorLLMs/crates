@@ -4,7 +4,7 @@
 //! planner has statistics to feed on (§3.12).
 
 use crate::ast::*;
-use crate::backend::{EdgeRow, QueryBackend};
+use crate::backend::{materialize_virtual, EdgeRow, QueryBackend, VirtualBackend};
 use crate::fusion::FusionWeights;
 use heraclitus_core::{Episode, EventKind, HeraclitusError, Lsn};
 use heraclitus_index_graph::decision::DecisionPolicy;
@@ -15,8 +15,9 @@ pub enum Plan {
     ScanFilter {
         label: Option<String>,
         conditions: Vec<(BoolOp, Condition)>,
+        valid_at: Option<u64>,
         as_of: Option<AsOf>,
-        order_by: Option<(String, bool)>,
+        order_by: Option<(OrderKey, bool)>,
         limit: Option<u32>,
     },
     Recall {
@@ -38,6 +39,7 @@ pub enum Plan {
         rel_var: String,
         rel_type: Option<String>,
         conditions: Vec<(BoolOp, Condition)>,
+        valid_at: Option<u64>,
         as_of: Option<AsOf>,
         returns: Vec<RetItem>,
         limit: Option<u32>,
@@ -80,6 +82,7 @@ pub enum Plan {
     },
     Community {
         node: String,
+        leiden: bool,
         as_of: Option<AsOf>,
     },
     Metrics {
@@ -126,6 +129,7 @@ pub fn plan(stmt: &Stmt) -> Plan {
                 rel_var: e.rel_var.clone(),
                 rel_type: e.rel_type.clone(),
                 conditions: m.conditions.clone(),
+                valid_at: m.valid_at,
                 as_of: m.as_of,
                 returns: m.returns.clone(),
                 limit: m.limit,
@@ -134,6 +138,7 @@ pub fn plan(stmt: &Stmt) -> Plan {
         Stmt::Match(m) => Plan::ScanFilter {
             label: m.label.clone(),
             conditions: m.conditions.clone(),
+            valid_at: m.valid_at,
             as_of: m.as_of,
             order_by: m.order_by.clone(),
             limit: m.limit,
@@ -204,8 +209,9 @@ pub fn plan(stmt: &Stmt) -> Plan {
             max_depth: *max_depth,
             as_of: *as_of,
         },
-        Stmt::Community { node, as_of } => Plan::Community {
+        Stmt::Community { node, leiden, as_of } => Plan::Community {
             node: node.clone(),
+            leiden: *leiden,
             as_of: *as_of,
         },
         Stmt::Metrics { node, as_of } => Plan::Metrics {
@@ -240,6 +246,7 @@ pub fn render(plan: &Plan) -> String {
         Plan::ScanFilter {
             label,
             conditions,
+            valid_at,
             as_of,
             order_by,
             limit,
@@ -251,11 +258,19 @@ pub fn render(plan: &Plan) -> String {
             for (op, c) in conditions {
                 s += &format!("  cond[{op:?}] {:?} {:?} {:?}\n", c.lhs, c.cmp, c.rhs);
             }
+            if let Some(t) = valid_at {
+                s += &format!("  ValidAt({t})\n");
+            }
             if let Some(a) = as_of {
                 s += &format!("  AsOf({a:?})\n");
             }
-            if let Some((f, asc)) = order_by {
-                s += &format!("  OrderBy({f}, asc={asc})\n");
+            if let Some((key, asc)) = order_by {
+                match key {
+                    OrderKey::Field(f) => s += &format!("  OrderBy({f}, asc={asc})\n"),
+                    OrderKey::Dist(kind, v) => {
+                        s += &format!("  OrderBy(DIST_{kind:?}[{} dims], asc={asc})\n", v.len())
+                    }
+                }
             }
             if let Some(l) = limit {
                 s += &format!("  Limit({l})\n");
@@ -276,6 +291,7 @@ pub fn render(plan: &Plan) -> String {
             rel_var,
             rel_type,
             conditions,
+            valid_at,
             as_of,
             limit,
             ..
@@ -289,6 +305,9 @@ pub fn render(plan: &Plan) -> String {
             );
             for (op, c) in conditions {
                 s += &format!("  cond[{op:?}] {:?} {:?} {:?}\n", c.lhs, c.cmp, c.rhs);
+            }
+            if let Some(t) = valid_at {
+                s += &format!("  ValidAt({t})\n");
             }
             if let Some(a) = as_of {
                 s += &format!("  AsOf({a:?})\n");
@@ -320,8 +339,9 @@ pub fn render(plan: &Plan) -> String {
         Plan::Why { target, max_depth, as_of } => format!(
             "CausalTrace(WHY)\n  target = {target}\n  max_depth = {max_depth:?}\n  as_of = {as_of:?}\n"
         ),
-        Plan::Community { node, as_of } => {
-            format!("GraphCommunity\n  node = {node}\n  as_of = {as_of:?}\n")
+        Plan::Community { node, leiden, as_of } => {
+            let algo = if *leiden { "Leiden" } else { "ConnectedComponents" };
+            format!("GraphCommunity({algo})\n  node = {node}\n  as_of = {as_of:?}\n")
         }
         Plan::Metrics { node, as_of } => {
             format!("GraphMetrics\n  node = {node}\n  as_of = {as_of:?}\n")
@@ -396,12 +416,51 @@ fn eval_operand(op: &Operand, lsn: Lsn, e: &Episode) -> Option<Json> {
         Operand::Ident(field) => field_of(lsn, e, field),
         Operand::Num(n) => Some(json!(n)),
         Operand::Str(s) => Some(json!(s)),
+        Operand::Dist(kind, v) => eval_dist(*kind, v, e).map(|d| json!(d)),
     }
 }
 
+/// Distância do embedding do episódio ao vetor literal da query, na Variedade
+/// Produto (curvaturas da assinatura default do manifold). `None` quando o
+/// episódio não tem embedding — a condição simplesmente não casa.
+fn eval_dist(kind: DistKind, q: &[f32], e: &Episode) -> Option<f64> {
+    let emb = e.embedding.as_ref()?;
+    let sig = &heraclitus_manifold::ProductMetric::default().sig;
+    Some(match kind {
+        DistKind::Hyp => heraclitus_manifold::dist_hyp(q, &emb.hyp, -sig.k1),
+        DistKind::Sph => heraclitus_manifold::dist_sph(q, &emb.sph, sig.k2),
+        DistKind::Euc => heraclitus_manifold::dist_euc(q, &emb.euc),
+        DistKind::Product => {
+            // O vetor plano da query é fatiado pelas dimensões do PRÓPRIO
+            // episódio (a mesma convenção do canal vetorial do FUSE).
+            let (a, b) = (emb.hyp.len(), emb.sph.len());
+            if q.len() != a + b + emb.euc.len() {
+                return None;
+            }
+            let qp = heraclitus_core::ProductPoint {
+                hyp: q[..a].to_vec(),
+                sph: q[a..a + b].to_vec(),
+                euc: q[a + b..].to_vec(),
+            };
+            heraclitus_manifold::ProductMetric::default().dist(&qp, emb)
+        }
+    })
+}
+
 fn cmp_json(a: &Json, b: &Json, cmp: Cmp) -> bool {
+    // Coerção numérica: attrs vivem como STRINGS no Episode; se um dos lados é
+    // um número genuíno e o outro é uma string numérica, compara-se como
+    // números — sem isto, `WHERE n.valor > 10` nunca casava (string vs número
+    // caía no caminho de strings e devolvia None). Strings puras dos dois
+    // lados continuam a comparar lexicograficamente (CPFs com zeros à esquerda
+    // não mudam de semântica).
+    let coerce = |j: &Json| j.as_f64().or_else(|| j.as_str().and_then(|s| s.trim().parse::<f64>().ok()));
     let ord = match (a.as_f64(), b.as_f64()) {
         (Some(x), Some(y)) => x.partial_cmp(&y),
+        (Some(_), None) | (None, Some(_)) => match (coerce(a), coerce(b)) {
+            (Some(x), Some(y)) => x.partial_cmp(&y),
+            _ => None,
+        },
         _ => a.as_str().and_then(|x| b.as_str().map(|y| x.cmp(y))),
     };
     match (ord, cmp) {
@@ -414,6 +473,21 @@ fn cmp_json(a: &Json, b: &Json, cmp: Cmp) -> bool {
         (None, Cmp::Ne) => true,
         (None, _) => false,
     }
+}
+
+/// Bi-temporalidade (VALID AT t): o facto é válido em `t` se
+/// `valid_from <= t` (ausente = desde sempre) E `t < valid_to` (ausente =
+/// ainda válido). Intervalo meio-aberto `[from, to)` — a mesma convenção dos
+/// intervalos de LSN. Um facto sem valid time é atemporal e passa sempre.
+/// Lê primeiro os campos NATIVOS do Episode (FORMAT v4); attrs são o
+/// fallback de compatibilidade (a convenção pré-v4).
+fn valid_at_matches(e: &Episode, t: u64) -> bool {
+    let num = |k: &str| e.attrs.get(k).and_then(|v| v.trim().parse::<f64>().ok());
+    let from = e.valid_from.map(|v| v as f64).or_else(|| num("valid_from"));
+    let to = e.valid_to.map(|v| v as f64).or_else(|| num("valid_to"));
+    let from_ok = from.map_or(true, |from| from <= t as f64);
+    let to_ok = to.map_or(true, |to| (t as f64) < to);
+    from_ok && to_ok
 }
 
 fn matches(conditions: &[(BoolOp, Condition)], lsn: Lsn, e: &Episode) -> bool {
@@ -475,6 +549,59 @@ fn flip_cmp(c: Cmp) -> Cmp {
 /// não passam pelo índice de atributos.
 fn is_builtin_field(f: &str) -> bool {
     matches!(f, "lsn" | "id" | "agent_id" | "session_id" | "kind" | "tipo" | "content")
+}
+
+/// Se o `WHERE` for conjuntivo e limitar `n.<campo>` por comparações NUMÉRICAS
+/// (`>`, `>=`, `<`, `<=`, campo não-builtin), devolve `(campo, min, max)` com
+/// bounds `(valor, inclusivo?)` para o índice ordenado resolver (C1.6, padrão
+/// Qdrant). `None` ⇒ scan por janela. O pós-filtro `matches` revalida tudo —
+/// a correção nunca depende do hint.
+fn attr_range_hint(
+    conditions: &[(BoolOp, Condition)],
+) -> Option<(String, Option<(f64, bool)>, Option<(f64, bool)>)> {
+    if conditions.iter().any(|(op, _)| matches!(op, BoolOp::Or)) {
+        return None;
+    }
+    let mut field: Option<String> = None;
+    let mut min: Option<(f64, bool)> = None;
+    let mut max: Option<(f64, bool)> = None;
+    for (_, c) in conditions {
+        // Normaliza para a forma `n.<campo> <cmp> <número>`.
+        let (f, cmp, n) = match (&c.lhs, &c.rhs) {
+            (Operand::Prop(_, f), Operand::Num(n)) => (f, c.cmp, *n),
+            (Operand::Num(n), Operand::Prop(_, f)) => (f, flip_cmp(c.cmp), *n),
+            _ => continue,
+        };
+        if is_builtin_field(f) {
+            continue;
+        }
+        // Um único campo por hint: o primeiro com bounds numéricos ganha.
+        match &field {
+            Some(existing) if existing != f => continue,
+            None => field = Some(f.clone()),
+            _ => {}
+        }
+        let tighter_min = |cur: Option<(f64, bool)>, cand: (f64, bool)| match cur {
+            Some((v, _)) if v >= cand.0 => cur,
+            _ => Some(cand),
+        };
+        let tighter_max = |cur: Option<(f64, bool)>, cand: (f64, bool)| match cur {
+            Some((v, _)) if v <= cand.0 => cur,
+            _ => Some(cand),
+        };
+        match cmp {
+            Cmp::Gt => min = tighter_min(min, (n, false)),
+            Cmp::Ge => min = tighter_min(min, (n, true)),
+            Cmp::Lt => max = tighter_max(max, (n, false)),
+            Cmp::Le => max = tighter_max(max, (n, true)),
+            _ => {}
+        }
+    }
+    let field = field?;
+    if min.is_none() && max.is_none() {
+        return None;
+    }
+    Some((field, min, max))
 }
 
 /// Se o `WHERE` for conjuntivo e fixar `n.<campo> = "valor"` (igualdade, valor
@@ -606,6 +733,7 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
         Plan::ScanFilter {
             label,
             conditions,
+            valid_at,
             as_of,
             order_by,
             limit,
@@ -615,14 +743,17 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
             // campo não-builtin, resolve pelo índice de atributos (global,
             // O(postings)) em vez de varrer a janela capada. O pós-filtro
             // `matches` revalida tudo, por isso a correção nunca depende disto.
-            let candidates: Vec<(Lsn, Episode)> = match attr_eq_hint(conditions) {
-                Some((field, value)) => match be.attr_lookup(&field, &value, bound)? {
-                    Some(hit) => hit,
-                    None => {
-                        let (lo, hi) = lsn_window(conditions, bound);
-                        be.scan_range(lo, hi)?
-                    }
+            let indexed: Option<Vec<(Lsn, Episode)>> = match attr_eq_hint(conditions) {
+                Some((field, value)) => be.attr_lookup(&field, &value, bound)?,
+                None => match attr_range_hint(conditions) {
+                    // ÍNDICE ORDENADO (C1.6): WHERE n.<campo> >/< número resolve
+                    // pelo range do índice de atributos em vez do scan.
+                    Some((field, min, max)) => be.attr_range_lookup(&field, min, max, bound)?,
+                    None => None,
                 },
+            };
+            let candidates: Vec<(Lsn, Episode)> = match indexed {
+                Some(hit) => hit,
                 None => {
                     // Push any `n.lsn` bounds down to a pruned, capped scan window.
                     let (lo, hi) = lsn_window(conditions, bound);
@@ -637,18 +768,31 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                         .map(|l| kind_label(&e.kind).eq_ignore_ascii_case(l))
                         .unwrap_or(true)
                 })
+                .filter(|(_, e)| valid_at.map_or(true, |t| valid_at_matches(e, t)))
                 .filter(|(l, e)| matches(conditions, *l, e))
                 .collect();
-            if let Some((field, asc)) = order_by {
-                rows.sort_by(|(la, ea), (lb, eb)| {
-                    let a = field_of(*la, ea, field).unwrap_or(Json::Null).to_string();
-                    let b = field_of(*lb, eb, field).unwrap_or(Json::Null).to_string();
-                    if *asc {
-                        a.cmp(&b)
-                    } else {
-                        b.cmp(&a)
-                    }
-                });
+            if let Some((key, asc)) = order_by {
+                match key {
+                    OrderKey::Field(field) => rows.sort_by(|(la, ea), (lb, eb)| {
+                        let a = field_of(*la, ea, field).unwrap_or(Json::Null).to_string();
+                        let b = field_of(*lb, eb, field).unwrap_or(Json::Null).to_string();
+                        if *asc {
+                            a.cmp(&b)
+                        } else {
+                            b.cmp(&a)
+                        }
+                    }),
+                    // Ordenação numérica por distância; sem embedding vai para o fim.
+                    OrderKey::Dist(kind, v) => rows.sort_by(|(_, ea), (_, eb)| {
+                        let a = eval_dist(*kind, v, ea).unwrap_or(f64::INFINITY);
+                        let b = eval_dist(*kind, v, eb).unwrap_or(f64::INFINITY);
+                        if *asc {
+                            a.total_cmp(&b)
+                        } else {
+                            b.total_cmp(&a)
+                        }
+                    }),
+                }
             }
             if let Some(l) = limit {
                 rows.truncate(*l as usize);
@@ -691,6 +835,7 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
             rel_var,
             rel_type,
             conditions,
+            valid_at,
             as_of,
             returns,
             limit,
@@ -707,6 +852,14 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
             let rows = be.match_edges(src.as_deref(), etype.as_deref(), dst.as_deref(), bound)?;
             let mut out: Vec<Json> = rows
                 .iter()
+                // Bi-temporal em ARESTAS (V2.4): VALID AT filtra pelo valid
+                // time do mundo herdado do episódio que assertou a aresta.
+                .filter(|r| {
+                    valid_at.map_or(true, |t| {
+                        r.world_valid_from.is_none_or(|from| from <= t)
+                            && r.world_valid_to.is_none_or(|to| t < to)
+                    })
+                })
                 .map(|r| project_edge(r, returns, from_var, to_var, rel_var))
                 .collect();
             if let Some(l) = limit {
@@ -786,9 +939,14 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
             let keys = be.entity_cluster(entity, bound)?;
             Ok(Json::Array(keys.into_iter().map(|k| json!(k)).collect()))
         }
-        Plan::Community { node, as_of } => {
+        Plan::Community { node, leiden, as_of } => {
             let bound = resolve_as_of(as_of, be)?;
-            match be.community(node, bound)? {
+            let result = if *leiden {
+                be.community_leiden(node, bound)?
+            } else {
+                be.community(node, bound)?
+            };
+            match result {
                 None => Ok(Json::Null),
                 Some(c) => Ok(json!({
                     "node": c.node,
@@ -810,15 +968,15 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                 })),
             }
         }
-        Plan::Simulate { .. } => {
-            // SIMULATE EDGE (motor contrafactual) foi removido no refactor M30 do
-            // backend; o overlay virtual (graph_snapshot/materialize_virtual/
-            // VirtualBackend) ainda não foi reintroduzido. Recuperável do git
-            // (commits 41480b6 "M16 counterfactual engine" / 519567c). Até lá,
-            // falha de forma explícita em vez de dar resultado errado.
-            Err(HeraclitusError::Query(
-                "SIMULATE EDGE indisponível neste build (motor contrafactual pendente de reintrodução no backend)".into(),
-            ))
+        Plan::Simulate { op, from, to, etype, then } => {
+            // Sobrepõe o contrafactual numa cópia do grafo; o grafo base e o
+            // log nunca são tocados (divergência isolada). `be.graph()` — e não
+            // um replay do log — para que um SIMULATE aninhado veja a mutação
+            // do SIMULATE exterior (o VirtualBackend devolve o overlay).
+            let base = be.graph()?;
+            let virt = materialize_virtual(&base, *op, from, to, etype);
+            let vb = VirtualBackend::new(be, virt);
+            execute(then, &vb)
         }
         Plan::Adapt { as_of } => {
             let bound = resolve_as_of(as_of, be)?;

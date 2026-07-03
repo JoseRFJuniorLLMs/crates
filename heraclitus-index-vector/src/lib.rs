@@ -5,18 +5,21 @@
 //! push-down. The index is derived state: losing it means replay, not data
 //! loss.
 
-use heraclitus_core::{Episode, EventId, Lsn, ProductPoint};
-use heraclitus_manifold::ProductMetric;
+use heraclitus_core::{Episode, EventId, HeraclitusError, Lsn, ProductPoint};
+use heraclitus_manifold::{ProductMetric, Signature};
 use heraclitus_views::View;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use roaring::RoaringBitmap;
+use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 const DEFAULT_M: usize = 16;
 const DEFAULT_EF_CONSTRUCTION: usize = 200;
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Node {
     point: ProductPoint,
     level: usize,
@@ -53,14 +56,11 @@ pub struct VectorIndex {
     lsns: Vec<Lsn>,
     watermark: Lsn,
     rng: StdRng,
-    // #8 — arena contígua de coordenadas para o hot-path de distância. Em vez de
-    // ler os 3 `Vec<f32>` dispersos de cada `ProductPoint` (pointer chasing na
-    // travessia HNSW), as coordenadas de todos os nós vivem num único buffer
-    // linear. `coords_off[i]` marca o início do nó i; `coords_len[i] = [a,b,c]`
-    // as dimensões (variáveis) das 3 componentes. Espelha `Node.point`.
-    coords: Vec<f32>,
-    coords_off: Vec<u32>,
-    coords_len: Vec<[u32; 3]>,
+    /// Tombstones semânticos (padrão Qdrant): ids internos "retirados" ficam
+    /// FORA dos resultados sem reconstruir o grafo — o nó continua traversável
+    /// para preservar a conectividade do HNSW. Nada é apagado do log: um
+    /// tombstone é ele próprio um evento (`attrs.tombstone_of = <event_id>`).
+    tombstones: RoaringBitmap,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +69,24 @@ pub struct VectorHit {
     pub lsn: Lsn,
     pub dist: f32,
 }
+
+/// Estado serializável do índice (#12 — checkpoint/restore para boot rápido).
+/// `by_event` reconstrói-se de `ids`; `rng` fica no seed determinístico (só
+/// afeta os níveis de inserções FUTURAS, não o estado restaurado).
+#[derive(Serialize, Deserialize)]
+struct VectorSnapshot {
+    m: usize,
+    ef_construction: usize,
+    nodes: Vec<Node>,
+    entry: Option<u32>,
+    ids: Vec<EventId>,
+    lsns: Vec<Lsn>,
+    watermark: Lsn,
+    sig: Signature,
+    tombstones: Vec<u32>,
+}
+
+const VECTOR_CKPT_FILE: &str = "vector.ckpt";
 
 impl VectorIndex {
     pub fn new(metric: ProductMetric) -> Self {
@@ -85,10 +103,29 @@ impl VectorIndex {
             // Determinism requirement (§3.5): RNG seeded from a constant; the
             // level sequence is then a pure function of insertion order.
             rng: StdRng::seed_from_u64(0x48524B4C),
-            coords: Vec::new(),
-            coords_off: Vec::new(),
-            coords_len: Vec::new(),
+            tombstones: RoaringBitmap::new(),
         }
+    }
+
+    /// Marca o vetor de `event` como retirado (tombstone semântico). Devolve
+    /// `true` se o evento estava indexado. Idempotente.
+    pub fn tombstone_event(&mut self, event: &EventId) -> bool {
+        match self.by_event.get(event) {
+            Some(&id) => {
+                self.tombstones.insert(id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn is_tombstoned(&self, internal: u32) -> bool {
+        self.tombstones.contains(internal)
+    }
+
+    /// Nº de vetores retirados — alimenta o trigger de compaction (delta ratio).
+    pub fn tombstone_count(&self) -> u64 {
+        self.tombstones.len()
     }
 
     fn dist(&self, a: u32, b: &ProductPoint) -> f64 {
@@ -117,19 +154,26 @@ impl VectorIndex {
         ef: usize,
         filter: Option<&RoaringBitmap>,
     ) -> Vec<Candidate> {
-        let passes = |id: u32| filter.map(|f| f.contains(id)).unwrap_or(true);
+        // Tombstones nunca entram nos RESULTADOS mas continuam a ser
+        // atravessados (visited/candidates) — remover nós do grafo partiria a
+        // conectividade; excluí-los só da seleção preserva o recall.
+        let passes =
+            |id: u32| !self.tombstones.contains(id) && filter.map(|f| f.contains(id)).unwrap_or(true);
         let mut visited: HashSet<u32> = HashSet::from([entry]);
         let d0 = self.dist(entry, query);
         // `candidates` drives traversal over every reachable node; `results`
         // keeps only filter-passing nodes (the ones we may return).
         let mut candidates = BinaryHeap::from([Candidate { dist: d0, id: entry }]);
-        let mut results: Vec<Candidate> = Vec::new();
+        // `results` como MAX-heap (via Reverse): o pior (maior dist) é o topo, então
+        // consultar/descartar o pior é O(1)/O(log ef) em vez do fold O(ef) por
+        // vizinho visitado. Semântica de seleção idêntica à versão em Vec.
+        let mut results: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
         if passes(entry) {
-            results.push(Candidate { dist: d0, id: entry });
+            results.push(Reverse(Candidate { dist: d0, id: entry }));
         }
 
         while let Some(c) = candidates.pop() {
-            let worst = results.iter().map(|r| r.dist).fold(f64::MIN, f64::max);
+            let worst = results.peek().map(|r| r.0.dist).unwrap_or(f64::MIN);
             // Stop only once we have ef filtered hits AND cannot improve them.
             if results.len() >= ef && c.dist > worst {
                 break;
@@ -139,29 +183,24 @@ impl VectorIndex {
             {
                 if visited.insert(n) {
                     let d = self.dist(n, query);
-                    let worst = results.iter().map(|r| r.dist).fold(f64::MIN, f64::max);
+                    let worst = results.peek().map(|r| r.0.dist).unwrap_or(f64::MIN);
                     // Keep exploring while we still need filtered hits, or while
                     // n could improve the current frontier.
                     if results.len() < ef || d < worst {
                         candidates.push(Candidate { dist: d, id: n });
                         if passes(n) {
-                            results.push(Candidate { dist: d, id: n });
+                            results.push(Reverse(Candidate { dist: d, id: n }));
                             if results.len() > ef {
-                                // drop the worst filtered result
-                                let (idx, _) = results
-                                    .iter()
-                                    .enumerate()
-                                    .max_by(|a, b| a.1.dist.total_cmp(&b.1.dist))
-                                    .unwrap();
-                                results.swap_remove(idx);
+                                results.pop(); // drop the worst (largest dist) filtered result
                             }
                         }
                     }
                 }
             }
         }
-        results.sort_by(|a, b| a.dist.total_cmp(&b.dist));
-        results
+        let mut out: Vec<Candidate> = results.into_iter().map(|r| r.0).collect();
+        out.sort_by(|a, b| a.dist.total_cmp(&b.dist));
+        out
     }
 
     pub fn insert(&mut self, event_id: EventId, lsn: Lsn, point: ProductPoint) {
@@ -177,14 +216,6 @@ impl VectorIndex {
             level,
             neighbors: vec![Vec::new(); level + 1],
         });
-        // #8 — espelha as coordenadas do ponto na arena contígua (mesma ordem
-        // hyp|sph|euc que o hot-path `dist` espera).
-        self.coords_off.push(self.coords.len() as u32);
-        self.coords_len
-            .push([point.hyp.len() as u32, point.sph.len() as u32, point.euc.len() as u32]);
-        self.coords.extend_from_slice(&point.hyp);
-        self.coords.extend_from_slice(&point.sph);
-        self.coords.extend_from_slice(&point.euc);
         self.by_event.insert(event_id, id);
         self.ids.push(event_id);
         self.lsns.push(lsn);
@@ -196,7 +227,11 @@ impl VectorIndex {
             for l in ((level + 1)..=top).rev() {
                 let best =
                     self.search_layer(&point, ep, l.min(self.nodes[ep as usize].level), 1, None);
-                ep = best[0].id;
+                // Com tombstones, a camada pode não devolver candidatos
+                // elegíveis: mantém o entry-point atual em vez de indexar [0].
+                if let Some(b) = best.first() {
+                    ep = b.id;
+                }
             }
             // connect at each level from min(level, top) down to 0
             for l in (0..=level.min(top)).rev() {
@@ -222,7 +257,9 @@ impl VectorIndex {
                     }
                 }
                 self.nodes[id as usize].neighbors[l] = selected;
-                ep = neighbors[0].id;
+                if let Some(n0) = neighbors.first() {
+                    ep = n0.id;
+                }
             }
             if level > top {
                 self.entry = Some(id);
@@ -250,7 +287,9 @@ impl VectorIndex {
         // level 0 regardless); the filter is pushed down only at level 0.
         for l in (1..=top).rev() {
             let best = self.search_layer(query, ep, l, 1, None);
-            ep = best[0].id;
+            if let Some(b) = best.first() {
+                ep = b.id;
+            }
         }
         let ef = ef.max(k);
         let candidates =
@@ -317,8 +356,10 @@ impl VectorIndex {
     }
 
     /// Rescore candidate internal ids with the exact f64 metric, take Top-k.
+    /// Tombstones ficam fora do rescore (mesma semântica do search HNSW).
     fn rescore(&self, query: &ProductPoint, cand: impl Iterator<Item = usize>, k: usize) -> Vec<VectorHit> {
         let mut scored: Vec<(f64, usize)> = cand
+            .filter(|i| !self.tombstones.contains(*i as u32))
             .map(|i| (self.metric.dist(query, &self.nodes[i].point), i))
             .collect();
         scored.sort_by(|x, y| x.0.total_cmp(&y.0));
@@ -341,6 +382,62 @@ impl VectorIndex {
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
+
+    /// #12 — Persiste o estado completo do HNSW (`<dir>/vector.ckpt`) com escrita
+    /// atómica (tmp + rename). Correção nunca depende disto: sem checkpoint, a
+    /// view reconstrói-se do LSN 0 (ver `heraclitus_views`).
+    pub fn save_checkpoint(&self, dir: &Path) -> Result<(), HeraclitusError> {
+        let snap = VectorSnapshot {
+            m: self.m,
+            ef_construction: self.ef_construction,
+            nodes: self.nodes.clone(),
+            entry: self.entry,
+            ids: self.ids.clone(),
+            lsns: self.lsns.clone(),
+            watermark: self.watermark,
+            sig: self.metric.sig.clone(),
+            tombstones: self.tombstones.iter().collect(),
+        };
+        let bytes = bincode::serde::encode_to_vec(&snap, bincode::config::standard())
+            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+        let tmp = dir.join("vector.ckpt.tmp");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, dir.join(VECTOR_CKPT_FILE))?;
+        Ok(())
+    }
+
+    /// #12 — Restaura o HNSW do checkpoint. Devolve `false` se não houver
+    /// ficheiro OU se ele não descodificar (formato antigo/corrompido) — a
+    /// view fica vazia e o registry força replay desde 0. Um checkpoint
+    /// ilegível NUNCA pode impedir o boot: o estado é derivado, o log é a verdade.
+    pub fn load_checkpoint(&mut self, dir: &Path) -> Result<bool, HeraclitusError> {
+        let bytes = match std::fs::read(dir.join(VECTOR_CKPT_FILE)) {
+            Ok(b) => b,
+            Err(_) => return Ok(false),
+        };
+        let Ok((snap, _)) = bincode::serde::decode_from_slice::<VectorSnapshot, _>(
+            &bytes,
+            bincode::config::standard(),
+        ) else {
+            return Ok(false);
+        };
+        self.by_event = snap
+            .ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, i as u32))
+            .collect();
+        self.m = snap.m;
+        self.ef_construction = snap.ef_construction;
+        self.nodes = snap.nodes;
+        self.entry = snap.entry;
+        self.ids = snap.ids;
+        self.lsns = snap.lsns;
+        self.watermark = snap.watermark;
+        self.metric = ProductMetric { sig: snap.sig };
+        self.tombstones = snap.tombstones.into_iter().collect();
+        Ok(true)
+    }
 }
 
 impl View for VectorIndex {
@@ -352,11 +449,27 @@ impl View for VectorIndex {
         if let Some(emb) = &event.embedding {
             self.insert(event.id, lsn, emb.clone());
         }
+        // Tombstone semântico como EVENTO (nada se apaga do log): um episódio
+        // com `attrs.tombstone_of = <event_id>` retira o vetor alvo dos
+        // resultados. Replay-determinístico como qualquer outra derivação.
+        if let Some(target) = event.attrs.get("tombstone_of") {
+            if let Ok(id) = target.parse::<EventId>() {
+                self.tombstone_event(&id);
+            }
+        }
         self.watermark = lsn;
     }
 
     fn watermark(&self) -> Lsn {
         self.watermark
+    }
+
+    fn checkpoint(&self, dir: &Path) -> Result<(), HeraclitusError> {
+        self.save_checkpoint(dir)
+    }
+
+    fn restore(&mut self, dir: &Path) -> Result<bool, HeraclitusError> {
+        self.load_checkpoint(dir)
     }
 
     fn reset(&mut self) {
@@ -483,5 +596,92 @@ mod tests {
 
         let got: Vec<EventId> = idx.search_exact_gpu(&query, k).iter().map(|h| h.id).collect();
         assert_eq!(got, gt_ids, "GPU-accelerated exact search must equal f64 brute-force");
+    }
+
+    #[test]
+    fn tombstones_hide_from_results_but_preserve_graph() {
+        // C2.1 (padrão Qdrant): o vetor retirado sai dos RESULTADOS sem
+        // remontar o índice; a travessia continua a passar por ele.
+        let mut idx = VectorIndex::new(ProductMetric::default());
+        let mut ids = Vec::new();
+        for i in 0..50 {
+            let e = EventId::new();
+            ids.push(e);
+            idx.insert(e, i as u64, pt(vec![i as f32 / 50.0]));
+        }
+        let q = pt(vec![0.5]);
+
+        // Antes: o mais próximo de 0.5 é o vetor 25.
+        let hits = idx.search(&q, 3, 32, None);
+        assert_eq!(hits[0].id, ids[25]);
+
+        // Tombstone no 25: sai dos resultados; o 24/26 assumem o topo.
+        assert!(idx.tombstone_event(&ids[25]));
+        assert_eq!(idx.tombstone_count(), 1);
+        let hits = idx.search(&q, 3, 32, None);
+        assert!(hits.iter().all(|h| h.id != ids[25]), "retirado não aparece");
+        assert!(hits[0].id == ids[24] || hits[0].id == ids[26]);
+
+        // O rescore exato (GPU/brute-force) respeita o tombstone.
+        let exact = idx.search_exact_gpu(&q, 3);
+        assert!(exact.iter().all(|h| h.id != ids[25]));
+
+        // Inserções novas continuam a funcionar com tombstones presentes.
+        let novo = EventId::new();
+        idx.insert(novo, 50, pt(vec![0.501]));
+        let hits = idx.search(&q, 1, 32, None);
+        assert_eq!(hits[0].id, novo);
+
+        // Round-trip de checkpoint preserva os tombstones.
+        let dir = tempfile::tempdir().unwrap();
+        idx.save_checkpoint(dir.path()).unwrap();
+        let mut re = VectorIndex::new(ProductMetric::default());
+        assert!(re.load_checkpoint(dir.path()).unwrap());
+        assert_eq!(re.tombstone_count(), 1);
+        let hits = re.search(&q, 3, 32, None);
+        assert!(hits.iter().all(|h| h.id != ids[25]));
+    }
+
+    #[test]
+    fn unreadable_checkpoint_degrades_to_rebuild() {
+        // Um snapshot de formato antigo/corrompido NUNCA impede o boot: o
+        // restore devolve false e o registry replaya desde 0.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("vector.ckpt"), b"formato antigo qualquer").unwrap();
+        let mut idx = VectorIndex::new(ProductMetric::default());
+        assert!(!idx.load_checkpoint(dir.path()).unwrap());
+        assert!(idx.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_restore_preserves_search() {
+        // #12 — o HNSW restaurado do checkpoint deve dar buscas idênticas ao
+        // original (boot rápido sem reconstruir do LSN 0).
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = VectorIndex::new(ProductMetric::default());
+        let mut ids = Vec::new();
+        for i in 0..200u64 {
+            let id = EventId(ulid::Ulid::from_parts(i, i as u128));
+            ids.push(id);
+            idx.insert(id, i, pt(vec![(i as f32) / 250.0, 0.1]));
+        }
+        let query = pt(vec![0.4, 0.1]);
+        let before: Vec<EventId> = idx.search(&query, 5, 64, None).iter().map(|h| h.id).collect();
+
+        idx.save_checkpoint(dir.path()).unwrap();
+
+        // Nova instância vazia restaura do disco (simula restart).
+        let mut restored = VectorIndex::new(ProductMetric::default());
+        assert!(restored.load_checkpoint(dir.path()).unwrap(), "checkpoint deve existir");
+        assert_eq!(restored.len(), 200);
+        assert_eq!(restored.internal_id(&ids[100]), idx.internal_id(&ids[100]));
+        let after: Vec<EventId> = restored.search(&query, 5, 64, None).iter().map(|h| h.id).collect();
+
+        assert_eq!(before, after, "busca no índice restaurado deve ser idêntica");
+
+        // Sem ficheiro → restore devolve false (view fica vazia → replay desde 0).
+        let empty_dir = tempfile::tempdir().unwrap();
+        let mut fresh = VectorIndex::new(ProductMetric::default());
+        assert!(!fresh.load_checkpoint(empty_dir.path()).unwrap());
     }
 }

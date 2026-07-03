@@ -10,3 +10,7 @@ description = "Derived BM25 inverted index"
 heraclitus-core = { workspace = true }
 heraclitus-views = { workspace = true }
 heraclitus-memtable = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

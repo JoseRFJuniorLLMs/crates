@@ -67,6 +67,8 @@ pub enum Stmt {
     },
     Community {
         node: String,
+        /// V2.4: partição LEIDEN (modularidade) em vez de componentes conexas.
+        leiden: bool,
         as_of: Option<AsOf>,
     },
     Metrics {
@@ -101,9 +103,14 @@ pub struct MatchStmt {
     /// M9: when present, this is a relationship match `(var)-[rel]->(to)`.
     pub edge: Option<EdgePattern>,
     pub conditions: Vec<(BoolOp, Condition)>,
+    /// Bi-temporalidade: `VALID AT t` filtra pelo tempo de VALIDADE do facto
+    /// (attrs `valid_from`/`valid_to`, numéricos; ausente = aberto) — ortogonal
+    /// ao `AS OF` (transaction time). Eventos sem valid time são atemporais e
+    /// passam sempre.
+    pub valid_at: Option<u64>,
     pub as_of: Option<AsOf>,
     pub returns: Vec<RetItem>,
-    pub order_by: Option<(String, bool)>, // (field, ascending)
+    pub order_by: Option<(OrderKey, bool)>, // (chave, ascending)
     pub limit: Option<u32>,
 }
 
@@ -143,6 +150,24 @@ pub enum Operand {
     Ident(String),
     Num(f64),
     Str(String),
+    /// Distância do embedding do nó ao vetor literal (Variedade Produto).
+    Dist(DistKind, Vec<f32>),
+}
+
+/// Componente da Variedade Produto H×S×E usado por um operador `DIST_*`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DistKind {
+    Hyp,
+    Sph,
+    Euc,
+    Product,
+}
+
+/// Chave do ORDER BY: um campo do episódio ou uma distância `DIST_*`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderKey {
+    Field(String),
+    Dist(DistKind, Vec<f32>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -414,10 +439,12 @@ fn build_stmt(pair: Pair<Rule>) -> Result<Stmt, HeraclitusError> {
         }
         Rule::community_stmt => {
             let mut node = String::new();
+            let mut leiden = false;
             let mut as_of = None;
             for p in inner.into_inner() {
                 match p.as_rule() {
                     Rule::string => node = unquote(p.as_str()),
+                    Rule::leiden_kw => leiden = true,
                     Rule::as_of => as_of = Some(build_as_of(p)?),
                     _ => {}
                 }
@@ -425,7 +452,7 @@ fn build_stmt(pair: Pair<Rule>) -> Result<Stmt, HeraclitusError> {
             if node.is_empty() {
                 return Err(perr("COMMUNITY needs a node id"));
             }
-            Ok(Stmt::Community { node, as_of })
+            Ok(Stmt::Community { node, leiden, as_of })
         }
         Rule::metrics_stmt => {
             let mut node = String::new();
@@ -496,6 +523,7 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt, HeraclitusError> {
         label: None,
         edge: None,
         conditions: Vec::new(),
+        valid_at: None,
         as_of: None,
         returns: Vec::new(),
         order_by: None,
@@ -545,6 +573,16 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt, HeraclitusError> {
                     }
                 }
             }
+            Rule::valid_at => {
+                let n = p
+                    .into_inner()
+                    .find(|x| x.as_rule() == Rule::int)
+                    .ok_or_else(|| perr("VALID AT needs a number"))?
+                    .as_str()
+                    .parse()
+                    .map_err(|_| perr("bad VALID AT number"))?;
+                m.valid_at = Some(n);
+            }
             Rule::as_of => m.as_of = Some(build_as_of(p)?),
             Rule::return_clause => {
                 for r in p.into_inner() {
@@ -562,17 +600,23 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt, HeraclitusError> {
                 }
             }
             Rule::order_by => {
-                let mut field = String::new();
+                let mut key = None;
                 let mut asc = true;
                 for o in p.into_inner() {
                     match o.as_rule() {
-                        Rule::prop => field = split_prop(o.as_str())?.1,
-                        Rule::ident => field = o.as_str().to_string(),
+                        Rule::prop => key = Some(OrderKey::Field(split_prop(o.as_str())?.1)),
+                        Rule::ident => key = Some(OrderKey::Field(o.as_str().to_string())),
+                        Rule::dist_fn => {
+                            let (kind, vector) = build_dist_fn(o)?;
+                            key = Some(OrderKey::Dist(kind, vector));
+                        }
                         Rule::direction => asc = !o.as_str().eq_ignore_ascii_case("desc"),
                         _ => {}
                     }
                 }
-                m.order_by = Some((field, asc));
+                if let Some(key) = key {
+                    m.order_by = Some((key, asc));
+                }
             }
             Rule::limit => {
                 let n = p.into_inner().next().ok_or_else(|| perr("empty limit"))?;
@@ -651,8 +695,39 @@ fn build_operand(pair: Pair<Rule>) -> Result<Operand, HeraclitusError> {
         }
         Rule::number => Operand::Num(inner.as_str().parse().map_err(|_| perr("bad number"))?),
         Rule::string => Operand::Str(unquote(inner.as_str())),
+        Rule::dist_fn => {
+            let (kind, vector) = build_dist_fn(inner)?;
+            Operand::Dist(kind, vector)
+        }
         _ => Operand::Ident(inner.as_str().to_string()),
     })
+}
+
+fn build_dist_fn(pair: Pair<Rule>) -> Result<(DistKind, Vec<f32>), HeraclitusError> {
+    let mut kind = DistKind::Product;
+    let mut vector = Vec::new();
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::dist_kind => {
+                kind = match p.as_str().to_ascii_uppercase().as_str() {
+                    "DIST_HYP" => DistKind::Hyp,
+                    "DIST_SPH" => DistKind::Sph,
+                    "DIST_EUC" => DistKind::Euc,
+                    _ => DistKind::Product,
+                };
+            }
+            Rule::vector => {
+                for n in p.into_inner() {
+                    vector.push(n.as_str().parse().map_err(|_| perr("bad number"))?);
+                }
+            }
+            _ => {}
+        }
+    }
+    if vector.is_empty() {
+        return Err(perr("DIST_* needs a non-empty vector"));
+    }
+    Ok((kind, vector))
 }
 
 fn build_as_of(pair: Pair<Rule>) -> Result<AsOf, HeraclitusError> {

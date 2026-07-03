@@ -42,6 +42,18 @@ pub struct HeraclitusConfig {
     /// Optional bearer token required on every gRPC call. `None` = no auth
     /// (default; the server is reachable by anyone who can reach the port).
     pub auth_token: Option<String>,
+    /// HTTP Basic credentials (`"user:pass"`) required on every admin REST
+    /// call (`/state`, `/verify`, ...). `None` = no auth (default — localhost
+    /// bind). Set via `HERACLITUS_REST_AUTH`.
+    pub rest_basic_auth: Option<String>,
+    /// Periodic view-checkpoint interval in seconds (fast boot): bounds the
+    /// tail a crash-boot has to replay. `0` = checkpoint only at boot and on
+    /// graceful shutdown. Default 300.
+    pub checkpoint_interval_secs: u64,
+    /// Append an `AuditQuery` event to the log for every executed GQL query
+    /// (immudb-style access meta-audit: who queried what is itself evidence).
+    /// Default `false` — it grows the log by one event per query.
+    pub audit_queries: bool,
     /// Encrypt episode `content` at rest with a per-`agent_id` key (§3.10),
     /// enabling crypto-shredding. `false` = plaintext at rest (default).
     /// Keys live under `<data_dir>/keys`.
@@ -77,6 +89,9 @@ impl Default for HeraclitusConfig {
             rest_addr: "127.0.0.1:7475".to_string(),
             cold_tier_path: PathBuf::from("./data/cold"),
             auth_token: None,
+            rest_basic_auth: None,
+            checkpoint_interval_secs: 300,
+            audit_queries: false,
             encryption_at_rest: false,
             compliance_enabled: false,
             compliance_interval_secs: 300,
@@ -125,6 +140,18 @@ impl HeraclitusConfig {
         }
         if let Ok(v) = std::env::var("HERACLITUS_AUTH_TOKEN") {
             self.auth_token = if v.is_empty() { None } else { Some(v) };
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_REST_AUTH") {
+            self.rest_basic_auth = if v.is_empty() { None } else { Some(v) };
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_CHECKPOINT_INTERVAL") {
+            if let Ok(s) = v.parse() {
+                self.checkpoint_interval_secs = s;
+            }
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_AUDIT_QUERIES") {
+            self.audit_queries =
+                matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes");
         }
         if let Ok(v) = std::env::var("HERACLITUS_ENCRYPTION") {
             self.encryption_at_rest = matches!(

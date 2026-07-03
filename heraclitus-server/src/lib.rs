@@ -2,10 +2,12 @@
 //! The server composes; the storage knows nothing about HTTP or LLMs.
 
 pub mod boot;
+pub mod embedded;
 pub mod engine;
 pub mod grpc;
 pub mod rest;
 
+pub use embedded::Embedded;
 pub use engine::Engine;
 
 use crate::boot::{group, Boot};
@@ -82,13 +84,41 @@ pub async fn serve_with(
         }
     };
     let svc = HeraclitusServer::with_interceptor(grpc::Service::new(engine.clone()), auth);
-    let rest = rest::router(engine.clone());
+    if config.rest_basic_auth.is_some() {
+        boot.warn_line("Auth REST", "HTTP Basic EXIGIDO em cada chamada");
+    }
+    let rest = rest::router(engine.clone(), config.rest_basic_auth.clone());
 
     let rest_listener = tokio::net::TcpListener::bind(rest_addr).await?;
     boot.ok_line("Servidor REST (axum)", &format!("http://{rest_addr}"));
     let rest_task = tokio::spawn(async move {
         let _ = axum::serve(rest_listener, rest).await;
     });
+
+    // Checkpoint PERIÓDICO das views (fast boot): limita a cauda que um boot
+    // pós-crash tem de replayar — sem isto só havia checkpoint no arranque e
+    // no shutdown gracioso. Nunca no caminho de escrita (spawn_blocking).
+    let checkpoint_task = if config.checkpoint_interval_secs > 0 {
+        let engine_ck = engine.clone();
+        let every = std::time::Duration::from_secs(config.checkpoint_interval_secs);
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // o primeiro tick dispara já; salta-o (o boot acabou de checkpointar)
+            loop {
+                tick.tick().await;
+                let e = engine_ck.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(err) = e.checkpoint_views() {
+                        tracing::warn!(error = %err, "checkpoint periódico falhou (próximo boot replaya mais cauda)");
+                    }
+                })
+                .await;
+            }
+        }))
+    } else {
+        None
+    };
 
     // Compliance daemon (RFC 3161 watermark timestamping). Off by default; never
     // on the append path. Receipts under `<data_dir>/receipts`.
@@ -134,6 +164,15 @@ pub async fn serve_with(
     rest_task.abort();
     if let Some(t) = compliance_task {
         t.abort();
+    }
+    if let Some(t) = checkpoint_task {
+        t.abort();
+    }
+    // Shutdown gracioso = checkpoint das views (fast boot): o próximo arranque
+    // restaura os snapshots e replaya só a cauda. Falhar aqui não pode impedir
+    // o encerramento — sem checkpoint, o boot cai no replay (mais lento, correto).
+    if let Err(e) = engine.checkpoint_views() {
+        tracing::warn!(error = %e, "checkpoint das views no shutdown falhou (boot seguinte replaya)");
     }
     Ok(())
 }
