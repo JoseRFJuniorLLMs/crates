@@ -13,7 +13,9 @@
 //! - Cursor de Varredura de Passada Única: Scanner sequencial reestruturado sob `BufReader` elimina o custo assintótico O(N²) de I/O de disco.
 //! - Padronização Concorrente Crossbeam: Eliminação de canais mistos mitigando riscos ocultos de starvation do Worker thread.
 
+pub mod cpm;
 pub mod format;
+pub mod mmap;
 pub mod vm_bridge;
 
 use arc_swap::ArcSwap;

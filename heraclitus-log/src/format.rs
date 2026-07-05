@@ -40,7 +40,14 @@ pub const FOOTER_MAGIC: [u8; 4] = *b"HFTR";
 /// episode's `valid_from`/`valid_to` (world time, SQL:2011-style), orthogonal
 /// to the LSN/HLC transaction time. v2 and v3 segments remain readable
 /// (per-version payload decode in `decode_episode_payload`).
-pub const FORMAT_VERSION: u16 = 4;
+/// Bumped 4 → 5: the per-record physical-corruption lane switches from
+/// CRC-32/ISO-HDLC (`crc32fast`) to **CRC-32C Castagnoli** (poly `0x1EDC6F41`),
+/// the CPM-200 §2 mandated checksum. The authenticated region, the payload
+/// layout (`StoragePayload`) and the BLAKE3 Merkle leaf are unchanged — only
+/// the CRC algorithm differs, dispatched by the segment's `format_version`, so
+/// v2–v4 segments (including the live memory log) stay readable under their
+/// original crc32fast lane. See `crate::cpm` for the canonical codec.
+pub const FORMAT_VERSION: u16 = 5;
 pub const HEADER_LEN: usize = 4 + 2 + 8 + 8;
 pub const RECORD_HEADER_LEN: usize = 4 + 4 + 8 + 8;
 pub const FOOTER_LEN: usize = 4 + 8 + 8 + 8 + 32;
@@ -132,15 +139,26 @@ pub fn encode_record(version: u16, lsn: Lsn, hlc: u64, payload: &[u8]) -> Vec<u8
     buf
 }
 
-/// CRC-32 over a record's authenticated region. The 4-byte CRC field at
-/// `[4..8]` is never part of the input (it would be self-referential). v1
-/// covers the payload only (back-compat); v2+ covers `len + lsn + hlc +
-/// payload`. `record` must be the full record bytes (`len >= RECORD_HEADER_LEN`).
+/// CRC over a record's authenticated region. The 4-byte CRC field at `[4..8]`
+/// is never part of the input (it would be self-referential). v1 covers the
+/// payload only (back-compat); v2–v4 cover `len + lsn + hlc + payload` under
+/// CRC-32/ISO-HDLC (`crc32fast`); v5+ covers the same region under **CRC-32C
+/// Castagnoli** (CPM-200 §2). The algorithm is chosen by the segment's
+/// `format_version`, so older segments keep validating under their original
+/// lane. `record` must be the full record bytes (`len >= RECORD_HEADER_LEN`).
 fn authenticated_crc(version: u16, record: &[u8]) -> u32 {
     if version < 2 {
         crc32fast::hash(&record[RECORD_HEADER_LEN..])
-    } else {
+    } else if version < 5 {
         let mut h = crc32fast::Hasher::new();
+        h.update(&record[..4]); // len
+        h.update(&record[8..]); // lsn + hlc + payload
+        h.finalize()
+    } else {
+        // v5+ (CPM-200 §2): CRC-32C Castagnoli over the authenticated region.
+        // The streaming hasher covers the discontiguous region (skipping the
+        // crc field at [4..8]) without allocating.
+        let mut h = crate::cpm::Crc32c::new();
         h.update(&record[..4]); // len
         h.update(&record[8..]); // lsn + hlc + payload
         h.finalize()
