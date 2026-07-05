@@ -125,9 +125,19 @@ pub fn learn_fusion_weights(examples: &[FusionExample], version: u32) -> FusionW
     let beta = channel_mrr(examples, |x| x.vector_score);
     let gamma = channel_mrr(examples, |x| x.text_score);
     if alpha + beta + gamma <= 0.0 {
-        return FusionWeights { alpha: 1.0, beta: 1.0, gamma: 1.0, version };
+        return FusionWeights {
+            alpha: 1.0,
+            beta: 1.0,
+            gamma: 1.0,
+            version,
+        };
     }
-    FusionWeights { alpha, beta, gamma, version }
+    FusionWeights {
+        alpha,
+        beta,
+        gamma,
+        version,
+    }
 }
 
 #[cfg(test)]
@@ -214,7 +224,11 @@ mod tests {
         FusionExample {
             candidates: cands
                 .iter()
-                .map(|&(g, v, t)| FusionInput { graph_score: g, vector_score: v, text_score: t })
+                .map(|&(g, v, t)| FusionInput {
+                    graph_score: g,
+                    vector_score: v,
+                    text_score: t,
+                })
                 .collect(),
             relevant: rel,
         }
@@ -233,8 +247,17 @@ mod tests {
     #[test]
     fn learns_to_downweight_the_weak_channel() {
         let w = learn_fusion_weights(&vector_strong_text_weak(), 2);
-        assert!(w.beta > w.gamma, "vector must outweigh text: beta={} gamma={}", w.beta, w.gamma);
-        assert!(w.beta > 0.9, "vector ranks gold first → high weight (got {})", w.beta);
+        assert!(
+            w.beta > w.gamma,
+            "vector must outweigh text: beta={} gamma={}",
+            w.beta,
+            w.gamma
+        );
+        assert!(
+            w.beta > 0.9,
+            "vector ranks gold first → high weight (got {})",
+            w.beta
+        );
         assert_eq!(w.version, 2, "version is carried for auditability");
         // Graph channel is constant (0) here → no signal → ~0 weight.
         assert!(w.alpha < w.beta);
@@ -244,16 +267,30 @@ mod tests {
     fn learned_weights_fix_fusion_that_equal_weights_break() {
         // A held-out query: the distractor D wins on the noisy text channel; the
         // relevant R wins on the reliable vector channel.
-        let r = FusionInput { graph_score: 0.0, vector_score: 0.8, text_score: 0.1 };
-        let d = FusionInput { graph_score: 0.0, vector_score: 0.3, text_score: 0.9 };
+        let r = FusionInput {
+            graph_score: 0.0,
+            vector_score: 0.8,
+            text_score: 0.1,
+        };
+        let d = FusionInput {
+            graph_score: 0.0,
+            vector_score: 0.3,
+            text_score: 0.9,
+        };
 
         // Equal weights: text noise makes the distractor win — fusion HURTS.
         let equal = FusionWeights::default();
-        assert!(equal.fuse(&d) > equal.fuse(&r), "equal-weight fusion picks the wrong candidate");
+        assert!(
+            equal.fuse(&d) > equal.fuse(&r),
+            "equal-weight fusion picks the wrong candidate"
+        );
 
         // Learned weights (from the vector-strong/text-weak history): R wins.
         let learned = learn_fusion_weights(&vector_strong_text_weak(), 2);
-        assert!(learned.fuse(&r) > learned.fuse(&d), "learned weights rank the relevant candidate first");
+        assert!(
+            learned.fuse(&r) > learned.fuse(&d),
+            "learned weights rank the relevant candidate first"
+        );
     }
 
     #[test]

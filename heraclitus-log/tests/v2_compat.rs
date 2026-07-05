@@ -69,8 +69,12 @@ fn v2_segment_remains_readable_and_appendable() {
     assert_eq!(String::from_utf8_lossy(&e.content), "registo 1");
 
     // Appends novos vão para o ativo v3; o scan atravessa as duas versões.
-    log.append(Episode::new("v3-writer", EventKind::Observation, b"novo".to_vec()))
-        .unwrap();
+    log.append(Episode::new(
+        "v3-writer",
+        EventKind::Observation,
+        b"novo".to_vec(),
+    ))
+    .unwrap();
     let all = log.scan(0, 10).unwrap();
     assert_eq!(all.len(), 4);
     assert_eq!(String::from_utf8_lossy(&all[3].1.content), "novo");
@@ -86,7 +90,11 @@ fn v3_segment_remains_readable_under_v4() {
 
     let mut eps = Vec::new();
     for i in 0..3u64 {
-        let mut e = Episode::new("v3-writer", EventKind::Observation, format!("v3-{i}").into_bytes());
+        let mut e = Episode::new(
+            "v3-writer",
+            EventKind::Observation,
+            format!("v3-{i}").into_bytes(),
+        );
         e.ts_hlc = 5_000 + i;
         e.attrs.insert("k".into(), format!("v{i}"));
         eps.push(e);
@@ -95,7 +103,11 @@ fn v3_segment_remains_readable_under_v4() {
     // Fabrica um segmento v3 byte-exato: header v3 + StoragePayloadV3.
     let path = dir.path().join(format!("{:020}.hrkl", 0));
     let mut f = File::create(&path).unwrap();
-    let hdr = format::SegmentHeader { version: 3, segment_id: 0, created_hlc: 1 };
+    let hdr = format::SegmentHeader {
+        version: 3,
+        segment_id: 0,
+        created_hlc: 1,
+    };
     f.write_all(&hdr.encode()).unwrap();
     for (i, e) in eps.iter().enumerate() {
         let sp = StoragePayloadV3 {
@@ -132,8 +144,39 @@ fn v3_segment_remains_readable_under_v4() {
     novo.valid_to = Some(2_000);
     log.append(novo).unwrap();
     let (_, back) = log.read(3).unwrap().unwrap();
-    assert_eq!(back.valid_from, Some(1_000), "valid time nativo persiste (v4)");
+    assert_eq!(
+        back.valid_from,
+        Some(1_000),
+        "valid time nativo persiste (v4)"
+    );
     assert_eq!(back.valid_to, Some(2_000));
+}
+
+#[test]
+fn replication_is_idempotent_and_rejects_divergence() {
+    // V2.3: re-aplicar a MESMA entrada é no-op OK; entrada DIFERENTE na mesma
+    // posição é divergência (falha); gap à frente do head falha (contiguidade).
+    let dir = tempfile::tempdir().unwrap();
+    let log = Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+
+    let e0 = Episode::new("leader", EventKind::Observation, b"a".to_vec());
+    let e1 = Episode::new("leader", EventKind::Observation, b"b".to_vec());
+
+    assert_eq!(log.append_replicated(0, e0.clone()).unwrap(), 0);
+    assert_eq!(log.append_replicated(1, e1.clone()).unwrap(), 1);
+
+    // Reconexão do follower: o líder reenvia o lote — idempotente.
+    assert_eq!(log.append_replicated(0, e0.clone()).unwrap(), 0);
+    assert_eq!(log.append_replicated(1, e1).unwrap(), 1);
+    assert_eq!(log.head(), 2, "re-aplicação não duplica");
+
+    // Evento DIFERENTE na posição 0 = divergência de histórico → falha.
+    let intruso = Episode::new("attacker", EventKind::Observation, b"x".to_vec());
+    assert!(log.append_replicated(0, intruso.clone()).is_err());
+
+    // Gap (posição 5 com head 2) → falha; o follower pede o backlog.
+    assert!(log.append_replicated(5, intruso).is_err());
+    assert_eq!(log.head(), 2);
 }
 
 #[test]
@@ -157,8 +200,12 @@ fn hlc_never_starts_behind_persisted_timestamps() {
     // Reabre (HLC nasceria frio) e appenda normalmente: o ts novo tem de ser
     // ESTRITAMENTE maior que o persistido — o open observou o máximo do disco.
     let log = Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
-    log.append(Episode::new("local", EventKind::Observation, b"agora".to_vec()))
-        .unwrap();
+    log.append(Episode::new(
+        "local",
+        EventKind::Observation,
+        b"agora".to_vec(),
+    ))
+    .unwrap();
     let (_, e1) = log.read(1).unwrap().unwrap();
     assert!(
         e1.ts_hlc > far_future,

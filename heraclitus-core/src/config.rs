@@ -154,10 +154,8 @@ impl HeraclitusConfig {
                 matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes");
         }
         if let Ok(v) = std::env::var("HERACLITUS_ENCRYPTION") {
-            self.encryption_at_rest = matches!(
-                v.to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "yes"
-            );
+            self.encryption_at_rest =
+                matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes");
         }
         if let Ok(v) = std::env::var("HERACLITUS_COMPLIANCE") {
             self.compliance_enabled =

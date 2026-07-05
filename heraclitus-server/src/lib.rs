@@ -45,7 +45,10 @@ pub async fn serve_with(
     };
     boot.info_line("Dados", &config.data_dir.display().to_string());
     boot.info_line("Durabilidade", &fsync);
-    boot.info_line("Memtable", &format!("{} eventos", group(config.memtable_cap as u64)));
+    boot.info_line(
+        "Memtable",
+        &format!("{} eventos", group(config.memtable_cap as u64)),
+    );
 
     let engine = Arc::new(Engine::open_with_boot(&config, &boot)?);
 
@@ -141,7 +144,10 @@ pub async fn serve_with(
         );
         boot.warn_line(
             "Compliance RFC 3161",
-            &format!("carimbo de tempo ATIVO · modo {}", config.compliance_tsa_mode),
+            &format!(
+                "carimbo de tempo ATIVO · modo {}",
+                config.compliance_tsa_mode
+            ),
         );
         let log = engine.log.clone();
         Some(tokio::spawn(run_worker(

@@ -28,7 +28,11 @@ mod tests {
     #[test]
     fn is_deterministic() {
         // Equality holds for any input — the point of the barrier.
-        for &(x, s) in &[(0.123_456_f32, 1e6_f32), (0.987_f32, 1e3_f32), (3.5_f32, 1.0_f32)] {
+        for &(x, s) in &[
+            (0.123_456_f32, 1e6_f32),
+            (0.987_f32, 1e3_f32),
+            (3.5_f32, 1.0_f32),
+        ] {
             assert_eq!(execute_op_quantize(x, s), execute_op_quantize(x, s));
         }
         // Exact, representable case: 0.5 * 1000 = 500.0 → 500.

@@ -16,15 +16,17 @@
 pub mod format;
 pub mod vm_bridge;
 
-use format::{Decoded, SegmentFooter, SegmentHeader, FOOTER_LEN, HEADER_LEN};
-use heraclitus_core::{Episode, EventId, EventKind, FsyncPolicy, HeraclitusError, Hlc, Lsn, ProductPoint, SegmentId};
-use heraclitus_crypto::KeyStore;
 use arc_swap::ArcSwap;
+use format::{Decoded, SegmentFooter, SegmentHeader, HEADER_LEN};
+use heraclitus_core::{
+    Episode, EventId, EventKind, FsyncPolicy, HeraclitusError, Hlc, Lsn, ProductPoint, SegmentId,
+};
+use heraclitus_crypto::KeyStore;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::broadcast;
 
@@ -80,9 +82,18 @@ pub struct RaftEntry {
 
 /// Interface formal de acoplamento com o Consenso Distribuído (Raft).
 pub trait RaftLogStorage: Send + Sync {
-    fn append_raft_entry(&self, term: u64, index: u64, episode: Episode) -> Result<Lsn, HeraclitusError>;
+    fn append_raft_entry(
+        &self,
+        term: u64,
+        index: u64,
+        episode: Episode,
+    ) -> Result<Lsn, HeraclitusError>;
     fn read_raft_entry(&self, lsn: Lsn) -> Result<Option<(Lsn, RaftEntry)>, HeraclitusError>;
-    fn truncate_from_lsn(&self, from_lsn: Lsn, current_raft_commit: u64) -> Result<(), HeraclitusError>;
+    fn truncate_from_lsn(
+        &self,
+        from_lsn: Lsn,
+        current_raft_commit: u64,
+    ) -> Result<(), HeraclitusError>;
 }
 
 struct Active {
@@ -116,7 +127,6 @@ struct StashedUpdate {
     lsn: Lsn,
     opaque_meta: [u8; 16],
     offset: u64,
-    hash: [u8; 32],
     episode: Arc<Episode>,
     resp_tx: crossbeam_channel::Sender<Result<Lsn, HeraclitusError>>,
 }
@@ -221,24 +231,29 @@ impl StoragePayloadV3 {
 /// Descodifica o payload bincode de um registo físico para o `Episode`
 /// completo, conforme a VERSÃO do segmento — o bincode não é autodescritivo,
 /// por isso cada geração tem a sua réplica de layout:
+///
 /// - v<=2 (pré-M30): `Episode` (sem valid time) serializado direto;
 /// - v3: `StoragePayloadV3` (opaque_meta + episódio completo, sem valid time);
 /// - v4+: `StoragePayload` (com `valid_from`/`valid_to` nativos).
+///
 /// Descodificar com o layout errado desaloca os campos (Utf8Error).
 /// Consumidores: read/scan internos e o tier (recall-on-demand). O `content`
 /// volta como foi persistido (cifrado se havia keystore).
 pub fn decode_episode_payload(version: u16, payload: &[u8]) -> Result<Episode, HeraclitusError> {
     if version >= 4 {
-        let (sp, _): (StoragePayload, usize) = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
-            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+        let (sp, _): (StoragePayload, usize) =
+            bincode::serde::decode_from_slice(payload, BINCODE_CFG)
+                .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
         Ok(sp.into_episode())
     } else if version == 3 {
-        let (sp, _): (StoragePayloadV3, usize) = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
-            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+        let (sp, _): (StoragePayloadV3, usize) =
+            bincode::serde::decode_from_slice(payload, BINCODE_CFG)
+                .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
         Ok(sp.into_episode())
     } else {
-        let (ep, _): (EpisodeV2, usize) = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
-            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+        let (ep, _): (EpisodeV2, usize) =
+            bincode::serde::decode_from_slice(payload, BINCODE_CFG)
+                .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
         Ok(ep.into_episode())
     }
 }
@@ -274,7 +289,7 @@ pub struct Log {
     keystore: Option<Arc<KeyStore>>,
 }
 
-fn sync_parent_dir(dir: &Path) -> Result<(), HeraclitusError> {
+fn sync_parent_dir(_dir: &Path) -> Result<(), HeraclitusError> {
     #[cfg(unix)]
     {
         OpenOptions::new().read(true).open(dir)?.sync_all()?;
@@ -325,7 +340,7 @@ impl Log {
         for id in &ids {
             let path = segment_path(&dir, *id);
             let is_last = Some(*id) == ids.last().copied();
-            
+
             let scan = scan_segment_file(&path, *id)?;
             // O relógio HLC nunca arranca ATRÁS do que já está persistido:
             // sem isto, um wall clock que recuasse entre execuções quebraria
@@ -337,12 +352,18 @@ impl Log {
 
             let mut entries = Vec::with_capacity(scan.locs.len());
             for &(l, off, meta) in &scan.locs {
-                entries.push(LsnEntry { lsn: l, offset: off, opaque_meta: meta });
+                entries.push(LsnEntry {
+                    lsn: l,
+                    offset: off,
+                    opaque_meta: meta,
+                });
                 max_recovered_lsn = Some(max_recovered_lsn.map_or(l, |m| m.max(l)));
             }
 
-            let base_l = scan.min_lsn.unwrap_or_else(|| max_recovered_lsn.map(|l| l + 1).unwrap_or(0));
-            
+            let base_l = scan
+                .min_lsn
+                .unwrap_or_else(|| max_recovered_lsn.map(|l| l + 1).unwrap_or(0));
+
             if scan.sealed {
                 initial_sealed.push(Arc::new(SegmentContainer {
                     meta: SegmentMeta {
@@ -354,7 +375,9 @@ impl Log {
                         blake3_root: scan.blake3_root,
                         version: scan.version,
                     },
-                    index: Arc::new(SegmentIndex { entries: Arc::new(entries) }),
+                    index: Arc::new(SegmentIndex {
+                        entries: Arc::new(entries),
+                    }),
                 }));
             } else if is_last && scan.version == format::FORMAT_VERSION {
                 tail_scan = Some((*id, scan));
@@ -370,21 +393,29 @@ impl Log {
                         blake3_root: Some(merkle_root(&scan.record_hashes)),
                         version: scan.version,
                     },
-                    index: Arc::new(SegmentIndex { entries: Arc::new(entries) }),
+                    index: Arc::new(SegmentIndex {
+                        entries: Arc::new(entries),
+                    }),
                 }));
             }
         }
 
         let initial_lsn = max_recovered_lsn.map(|l| l + 1).unwrap_or(0);
-        
+
         let (active_state, active_container) = match tail_scan {
             Some((id, scan)) => {
-                let file = OpenOptions::new().write(true).append(true).open(segment_path(&dir, id))?;
+                let file = OpenOptions::new()
+                    .append(true)
+                    .open(segment_path(&dir, id))?;
                 let mut entries = Vec::with_capacity(scan.locs.len());
                 for (l, off, meta) in scan.locs {
-                    entries.push(LsnEntry { lsn: l, offset: off, opaque_meta: meta });
+                    entries.push(LsnEntry {
+                        lsn: l,
+                        offset: off,
+                        opaque_meta: meta,
+                    });
                 }
-                
+
                 let container = Arc::new(SegmentContainer {
                     meta: SegmentMeta {
                         id,
@@ -396,7 +427,9 @@ impl Log {
                         // tail_scan só é aceite quando scan.version == FORMAT_VERSION
                         version: format::FORMAT_VERSION,
                     },
-                    index: Arc::new(SegmentIndex { entries: Arc::new(entries) }),
+                    index: Arc::new(SegmentIndex {
+                        entries: Arc::new(entries),
+                    }),
                 });
 
                 let state = Active {
@@ -408,13 +441,18 @@ impl Log {
                     max_lsn: scan.max_lsn.unwrap_or(initial_lsn),
                     last_sync: Instant::now(),
                 };
-                
+
                 (state, container)
             }
             None => {
-                let id = initial_sealed.iter().map(|c| c.meta.id).max().map(|m| m + 1).unwrap_or(0);
+                let id = initial_sealed
+                    .iter()
+                    .map(|c| c.meta.id)
+                    .max()
+                    .map(|m| m + 1)
+                    .unwrap_or(0);
                 let state = new_active(&dir, id, initial_lsn, &hlc)?;
-                
+
                 let container = Arc::new(SegmentContainer {
                     meta: SegmentMeta {
                         id,
@@ -425,15 +463,17 @@ impl Log {
                         blake3_root: None,
                         version: format::FORMAT_VERSION,
                     },
-                    index: Arc::new(SegmentIndex { entries: Arc::new(Vec::new()) }),
+                    index: Arc::new(SegmentIndex {
+                        entries: Arc::new(Vec::new()),
+                    }),
                 });
-                
+
                 (state, container)
             }
         };
 
         initial_sealed.sort_by_key(|c| c.meta.base_lsn);
-        
+
         let catalog = Arc::new(ArcSwap::from_pointee(LogCatalog {
             sealed: Arc::new(initial_sealed),
             active: active_container,
@@ -454,16 +494,18 @@ impl Log {
         let worker_fsync_policy = fsync;
 
         std::thread::spawn(move || {
-            let _drop_guard = WorkerDropGuard { poisoned: worker_poisoned.clone() };
+            let _drop_guard = WorkerDropGuard {
+                poisoned: worker_poisoned.clone(),
+            };
             let fsync_policy = worker_fsync_policy;
-            
+
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                 let mut active = active_state;
                 let mut current_lsn = initial_lsn;
                 let mut batch = Vec::with_capacity(128);
                 let mut stashed_updates = Vec::with_capacity(128);
                 let mut stashed_flushes = Vec::with_capacity(32);
-                
+
                 let mut scratch_buffer = Vec::with_capacity(262144);
                 let mut crypto_scratch = Vec::with_capacity(262144);
 
@@ -474,12 +516,27 @@ impl Log {
 
                     let first_cmd = match cmd_rx.recv() {
                         Ok(cmd) => cmd,
-                        Err(_) => break, 
+                        Err(_) => break,
                     };
 
-                    if let LogCommand::Truncate { from_lsn, allowed_max_lsn, resp_tx } = first_cmd {
-                        match handle_truncation_protected(&worker_dir, &mut active, &worker_catalog, from_lsn, allowed_max_lsn, &mut current_lsn, &worker_committed_lsn) {
-                            Ok(_) => { let _ = resp_tx.send(Ok(())); }
+                    if let LogCommand::Truncate {
+                        from_lsn,
+                        allowed_max_lsn,
+                        resp_tx,
+                    } = first_cmd
+                    {
+                        match handle_truncation_protected(
+                            &worker_dir,
+                            &mut active,
+                            &worker_catalog,
+                            from_lsn,
+                            allowed_max_lsn,
+                            &mut current_lsn,
+                            &worker_committed_lsn,
+                        ) {
+                            Ok(_) => {
+                                let _ = resp_tx.send(Ok(()));
+                            }
                             Err(e) => {
                                 let _ = resp_tx.send(Err(e));
                                 worker_poisoned.store(true, Ordering::SeqCst);
@@ -492,8 +549,14 @@ impl Log {
                     batch.push(first_cmd);
                     while batch.len() < 128 {
                         match cmd_rx.try_recv() {
-                            Ok(LogCommand::Truncate { from_lsn, allowed_max_lsn, resp_tx }) => {
-                                let _ = resp_tx.send(Err(HeraclitusError::StorageEngine("Truncamento interceptou processamento do lote ativo".into())));
+                            Ok(LogCommand::Truncate {
+                                from_lsn: _,
+                                allowed_max_lsn: _,
+                                resp_tx,
+                            }) => {
+                                let _ = resp_tx.send(Err(HeraclitusError::StorageEngine(
+                                    "Truncamento interceptou processamento do lote ativo".into(),
+                                )));
                                 worker_poisoned.store(true, Ordering::SeqCst);
                             }
                             Ok(cmd) => batch.push(cmd),
@@ -511,7 +574,12 @@ impl Log {
                     // PIPELINE — FASE 2: PHYSICAL WRITES BOUNDARY (Zera os Gaps)
                     for cmd in &mut batch {
                         match cmd {
-                            LogCommand::Append { opaque_meta, episode, expected_lsn, resp_tx } => {
+                            LogCommand::Append {
+                                opaque_meta,
+                                episode,
+                                expected_lsn,
+                                resp_tx,
+                            } => {
                                 if let Some(expected) = expected_lsn {
                                     if tentative_lsn != *expected {
                                         let _ = resp_tx.send(Err(HeraclitusError::CasConflict {
@@ -523,19 +591,23 @@ impl Log {
                                 }
 
                                 let content_payload = match &worker_keystore {
-                                    Some(ks) => {
-                                        match ks.get_or_create(&episode.agent_id) {
-                                            Ok(key) => {
-                                                crypto_scratch.clear();
-                                                crypto_scratch = heraclitus_crypto::seal(&key, &episode.content, episode.agent_id.as_bytes());
-                                                &crypto_scratch
-                                            }
-                                            Err(e) => {
-                                                let _ = resp_tx.send(Err(HeraclitusError::Crypto(format!("Keystore Isolation Fault: {e:?}"))));
-                                                continue;
-                                            }
+                                    Some(ks) => match ks.get_or_create(&episode.agent_id) {
+                                        Ok(key) => {
+                                            crypto_scratch.clear();
+                                            crypto_scratch = heraclitus_crypto::seal(
+                                                &key,
+                                                &episode.content,
+                                                episode.agent_id.as_bytes(),
+                                            );
+                                            &crypto_scratch
                                         }
-                                    }
+                                        Err(e) => {
+                                            let _ = resp_tx.send(Err(HeraclitusError::Crypto(
+                                                format!("Keystore Isolation Fault: {e:?}"),
+                                            )));
+                                            continue;
+                                        }
+                                    },
                                     None => &episode.content,
                                 };
 
@@ -555,15 +627,31 @@ impl Log {
                                 };
 
                                 scratch_buffer.clear();
-                                if let Err(e) = bincode::serde::encode_into_std_write(&storage_payload, &mut scratch_buffer, BINCODE_CFG) {
-                                    let _ = resp_tx.send(Err(HeraclitusError::Serialization(e.to_string())));
+                                if let Err(e) = bincode::serde::encode_into_std_write(
+                                    &storage_payload,
+                                    &mut scratch_buffer,
+                                    BINCODE_CFG,
+                                ) {
+                                    let _ = resp_tx
+                                        .send(Err(HeraclitusError::Serialization(e.to_string())));
                                     continue;
                                 }
 
-                                let record = format::encode_record(format::FORMAT_VERSION, tentative_lsn, episode.ts_hlc, &scratch_buffer);
+                                let record = format::encode_record(
+                                    format::FORMAT_VERSION,
+                                    tentative_lsn,
+                                    episode.ts_hlc,
+                                    &scratch_buffer,
+                                );
 
                                 if active.bytes_written + record.len() as u64 > segment_max_bytes {
-                                    if let Err(e) = roll_segment(&worker_dir, &mut active, &worker_catalog, tentative_lsn, &worker_hlc) {
+                                    if let Err(e) = roll_segment(
+                                        &worker_dir,
+                                        &mut active,
+                                        &worker_catalog,
+                                        tentative_lsn,
+                                        &worker_hlc,
+                                    ) {
                                         let _ = resp_tx.send(Err(e));
                                         physical_io_error = true;
                                         break;
@@ -583,22 +671,25 @@ impl Log {
                                     lsn: tentative_lsn,
                                     opaque_meta: *opaque_meta,
                                     offset: record_offset,
-                                    hash: format::record_leaf(format::FORMAT_VERSION, &record),
                                     episode: episode.clone(),
                                     resp_tx: resp_tx.clone(),
                                 });
 
                                 active.bytes_written += record.len() as u64;
-                                active.record_hashes.push(format::record_leaf(format::FORMAT_VERSION, &record));
+                                active
+                                    .record_hashes
+                                    .push(format::record_leaf(format::FORMAT_VERSION, &record));
                                 active.max_lsn = active.max_lsn.max(tentative_lsn);
-                                
+
                                 // Incremento adiado: Ocorre estritamente pós sucesso da escrita
                                 tentative_lsn += 1;
 
                                 match &fsync_policy {
                                     FsyncPolicy::Always => sync_required = true,
                                     FsyncPolicy::GroupCommit { interval_ms } => {
-                                        if active.last_sync.elapsed().as_millis() as u64 >= *interval_ms {
+                                        if active.last_sync.elapsed().as_millis() as u64
+                                            >= *interval_ms
+                                        {
                                             sync_required = true;
                                         }
                                     }
@@ -612,7 +703,8 @@ impl Log {
                                 // Truncate é tratado fora do lote (fase de batching); se
                                 // aqui chegar, recusa defensivamente sem corromper o pipeline.
                                 let _ = resp_tx.send(Err(HeraclitusError::StorageEngine(
-                                    "Truncate não é processado dentro do lote de escrita".into())));
+                                    "Truncate não é processado dentro do lote de escrita".into(),
+                                )));
                             }
                         }
                     }
@@ -646,13 +738,19 @@ impl Log {
                     if !stashed_updates.is_empty() {
                         let current_catalog = worker_catalog.load();
                         let old_active_container = &current_catalog.active;
-                        
+
                         // Alocação incremental restrita estritamente ao tamanho do novo lote
-                        let mut updated_entries = Vec::with_capacity(old_active_container.index.entries.len() + stashed_updates.len());
+                        let mut updated_entries = Vec::with_capacity(
+                            old_active_container.index.entries.len() + stashed_updates.len(),
+                        );
                         updated_entries.extend_from_slice(&old_active_container.index.entries);
 
                         for update in &stashed_updates {
-                            updated_entries.push(LsnEntry { lsn: update.lsn, offset: update.offset, opaque_meta: update.opaque_meta });
+                            updated_entries.push(LsnEntry {
+                                lsn: update.lsn,
+                                offset: update.offset,
+                                opaque_meta: update.opaque_meta,
+                            });
                             highest_committed_lsn_in_batch = Some(update.lsn);
                         }
 
@@ -663,7 +761,9 @@ impl Log {
                             sealed: current_catalog.sealed.clone(),
                             active: Arc::new(SegmentContainer {
                                 meta: updated_meta,
-                                index: Arc::new(SegmentIndex { entries: Arc::new(updated_entries) }),
+                                index: Arc::new(SegmentIndex {
+                                    entries: Arc::new(updated_entries),
+                                }),
                             }),
                         }));
                     }
@@ -709,14 +809,16 @@ impl Log {
 
     fn check_poison(&self) -> Result<(), HeraclitusError> {
         if self.poisoned.load(Ordering::Acquire) {
-            return Err(HeraclitusError::StorageEngine("Fail-Fast: Motor desativado devido a falhas fisicas ou corrupcao de dados".into()));
+            return Err(HeraclitusError::StorageEngine(
+                "Fail-Fast: Motor desativado devido a falhas fisicas ou corrupcao de dados".into(),
+            ));
         }
         Ok(())
     }
 
     pub fn resolve_lsn_from_consensus_index(&self, target_raft_index: u64) -> Lsn {
         let catalog = self.catalog.load();
-        
+
         if let Some(entry) = catalog.active.index.entries.iter().rev().find(|e| {
             let r_idx = u64::from_le_bytes(e.opaque_meta[8..16].try_into().unwrap_or([0u8; 8]));
             r_idx <= target_raft_index
@@ -735,7 +837,11 @@ impl Log {
         0
     }
 
-    pub fn read_committed(&self, lsn: Lsn, allowed_max_lsn: Lsn) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
+    pub fn read_committed(
+        &self,
+        lsn: Lsn,
+        allowed_max_lsn: Lsn,
+    ) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
         if lsn >= allowed_max_lsn {
             return Ok(None);
         }
@@ -756,20 +862,32 @@ impl Log {
         }
 
         let catalog = self.catalog.load();
-        
+
         // INDEXAÇÃO DIRETA O(1): Aproveita a invariante gapless eliminando buscas binárias no hot path
         if lsn >= catalog.active.meta.base_lsn {
             let active_container = &catalog.active;
             let offset_idx = (lsn - active_container.meta.base_lsn) as usize;
             if let Some(entry) = active_container.index.entries.get(offset_idx) {
                 // INVARIANTE FRACA PROTEGIDA: Auditoria rigorosa de linearidade de índice contíguo
-                debug_assert_eq!(entry.lsn, active_container.meta.base_lsn + (offset_idx as u64));
+                debug_assert_eq!(
+                    entry.lsn,
+                    active_container.meta.base_lsn + (offset_idx as u64)
+                );
                 return self.read_at(active_container.meta.id, entry.offset);
             }
         } else {
-            let idx = match catalog.sealed.binary_search_by_key(&lsn, |c| c.meta.base_lsn) {
+            let idx = match catalog
+                .sealed
+                .binary_search_by_key(&lsn, |c| c.meta.base_lsn)
+            {
                 Ok(i) => Some(i),
-                Err(i) => if i > 0 { Some(i - 1) } else { None },
+                Err(i) => {
+                    if i > 0 {
+                        Some(i - 1)
+                    } else {
+                        None
+                    }
+                }
             };
 
             if let Some(i) = idx {
@@ -784,13 +902,17 @@ impl Log {
         Ok(self.scan(lsn, lsn + 1)?.into_iter().next())
     }
 
-    pub fn read_at(&self, seg: SegmentId, off: u64) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
+    pub fn read_at(
+        &self,
+        seg: SegmentId,
+        off: u64,
+    ) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
         let path = segment_path(&self.dir, seg);
         let mut f = match File::open(&path) {
             Ok(f) => f,
             Err(_) => return Ok(None),
         };
-        
+
         f.seek(SeekFrom::Start(off))?;
         if format::RECORD_HEADER_LEN < 4 {
             return Err(HeraclitusError::Corruption {
@@ -803,7 +925,7 @@ impl Log {
         if f.read_exact(&mut rh).is_err() {
             return Ok(None);
         }
-        
+
         let len = u32::from_le_bytes(rh[..4].try_into().unwrap_or([0u8; 4])) as usize;
         if len > 512 * 1024 * 1024 {
             return Err(HeraclitusError::Corruption {
@@ -811,13 +933,13 @@ impl Log {
                 detail: "Defesa de Estouro de Memória: Carga abusiva rejeitada".into(),
             });
         }
-        
+
         let mut buf = vec![0u8; format::RECORD_HEADER_LEN + len];
         buf[..format::RECORD_HEADER_LEN].copy_from_slice(&rh);
         if f.read_exact(&mut buf[format::RECORD_HEADER_LEN..]).is_err() {
             return Ok(None);
         }
-        
+
         // Versão do SEGMENTO (não a corrente): decide a regra de CRC e o
         // layout do payload. read_at recebe só (seg, off), por isso lê o
         // header do próprio ficheiro — barato: já está aberto.
@@ -844,7 +966,12 @@ impl Log {
         self.scan_capped(from, to, usize::MAX)
     }
 
-    pub fn scan_capped(&self, from: Lsn, to: Lsn, max: usize) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
+    pub fn scan_capped(
+        &self,
+        from: Lsn,
+        to: Lsn,
+        max: usize,
+    ) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
         let stable_limit = self.committed_lsn.load(Ordering::Acquire);
         let effective_to = to.min(stable_limit);
         if from >= effective_to || max == 0 {
@@ -853,10 +980,10 @@ impl Log {
 
         let mut out = Vec::with_capacity(max.min(2048));
         let mut scan_lsn = from;
-        
+
         let mut active_file_handle: Option<(SegmentId, File)> = None;
         let mut record_header_buffer = [0u8; format::RECORD_HEADER_LEN];
-        let mut record_buf = Vec::with_capacity(65536); 
+        let mut record_buf = Vec::with_capacity(65536);
 
         let catalog = self.catalog.load();
 
@@ -864,16 +991,25 @@ impl Log {
             let container = if scan_lsn >= catalog.active.meta.base_lsn {
                 Some(&catalog.active)
             } else {
-                let idx = match catalog.sealed.binary_search_by_key(&scan_lsn, |c| c.meta.base_lsn) {
+                let idx = match catalog
+                    .sealed
+                    .binary_search_by_key(&scan_lsn, |c| c.meta.base_lsn)
+                {
                     Ok(i) => Some(i),
-                    Err(i) => if i > 0 { Some(i - 1) } else { None },
+                    Err(i) => {
+                        if i > 0 {
+                            Some(i - 1)
+                        } else {
+                            None
+                        }
+                    }
                 };
                 idx.map(|i| &catalog.sealed[i])
             };
 
             if let Some(container) = container {
                 let offset_idx = (scan_lsn - container.meta.base_lsn) as usize;
-                
+
                 // FRONTEIRA VALIDADA: Impede leituras trans-segmento inconsistentes ou transições inválidas
                 if offset_idx >= container.index.entries.len() {
                     scan_lsn = container.meta.max_lsn + 1;
@@ -882,7 +1018,9 @@ impl Log {
 
                 if let Some(entry) = container.index.entries.get(offset_idx) {
                     let file_ref = match &mut active_file_handle {
-                        Some((cached_seg, ref mut file)) if *cached_seg == container.meta.id => file,
+                        Some((cached_seg, ref mut file)) if *cached_seg == container.meta.id => {
+                            file
+                        }
                         _ => {
                             let path = segment_path(&self.dir, container.meta.id);
                             let file = File::open(&path)?;
@@ -912,7 +1050,9 @@ impl Log {
                             break;
                         }
 
-                        let len = u32::from_le_bytes(record_header_buffer[..4].try_into().unwrap_or([0u8; 4])) as usize;
+                        let len = u32::from_le_bytes(
+                            record_header_buffer[..4].try_into().unwrap_or([0u8; 4]),
+                        ) as usize;
                         if len > 512 * 1024 * 1024 {
                             return Err(HeraclitusError::Corruption {
                                 context: format!("Segmento: {}", container.meta.id),
@@ -921,15 +1061,20 @@ impl Log {
                         }
 
                         record_buf.resize(format::RECORD_HEADER_LEN + len, 0);
-                        record_buf[..format::RECORD_HEADER_LEN].copy_from_slice(&record_header_buffer);
-                        if file_ref.read_exact(&mut record_buf[format::RECORD_HEADER_LEN..]).is_err() {
-                            break; 
+                        record_buf[..format::RECORD_HEADER_LEN]
+                            .copy_from_slice(&record_header_buffer);
+                        if file_ref
+                            .read_exact(&mut record_buf[format::RECORD_HEADER_LEN..])
+                            .is_err()
+                        {
+                            break;
                         }
 
                         match format::decode_record(container.meta.version, &record_buf) {
                             Decoded::Record(rlsn, _hlc, payload, _) => {
                                 if rlsn == scan_lsn {
-                                    let mut ep = decode_episode_payload(container.meta.version, payload)?;
+                                    let mut ep =
+                                        decode_episode_payload(container.meta.version, payload)?;
 
                                     self.decrypt_in_place(&mut ep)?;
                                     out.push((rlsn, ep));
@@ -957,7 +1102,10 @@ impl Log {
     /// immudb `verify_row`): re-varre o ficheiro, recomputa a raiz Merkle com
     /// a regra de leaf da versão do segmento e compara com o rodapé/catálogo.
     /// `None` se o id não existir no catálogo.
-    pub fn verify_segment(&self, id: SegmentId) -> Result<Option<SegmentVerifyReport>, HeraclitusError> {
+    pub fn verify_segment(
+        &self,
+        id: SegmentId,
+    ) -> Result<Option<SegmentVerifyReport>, HeraclitusError> {
         let catalog = self.catalog.load();
         let meta = catalog
             .sealed
@@ -973,8 +1121,8 @@ impl Log {
         // Um segmento selado é válido se a raiz recomputada bate com a do
         // rodapé; o ativo (sem rodapé ainda) é válido se a varredura não
         // detectou corrupção física.
-        let valid = !scan.corruption_detected
-            && stored_root.map_or(!meta.sealed, |s| s == computed_root);
+        let valid =
+            !scan.corruption_detected && stored_root.map_or(!meta.sealed, |s| s == computed_root);
         Ok(Some(SegmentVerifyReport {
             id,
             version: scan.version,
@@ -992,7 +1140,7 @@ impl Log {
         self.flush()?;
         let catalog = self.catalog.load();
         let mut report = VerifyReport::default();
-        
+
         let mut paths: Vec<PathBuf> = catalog.sealed.iter().map(|c| c.meta.path.clone()).collect();
         paths.push(catalog.active.meta.path.clone());
 
@@ -1005,12 +1153,12 @@ impl Log {
                 let root = merkle_root(&scan.record_hashes);
                 match scan.blake3_root {
                     Some(stored) if stored == root => report.merkle_ok += 1,
-                    Some(_) => {
-                        return Err(HeraclitusError::Corruption {
-                            context: format!("{}", path.display()),
-                            detail: "Mismatch catastrófico detectado na raiz Merkle permanente do rodapé".into(),
-                        })
-                    }
+                    Some(_) => return Err(HeraclitusError::Corruption {
+                        context: format!("{}", path.display()),
+                        detail:
+                            "Mismatch catastrófico detectado na raiz Merkle permanente do rodapé"
+                                .into(),
+                    }),
                     None => {}
                 }
             }
@@ -1021,9 +1169,16 @@ impl Log {
     pub fn flush(&self) -> Result<(), HeraclitusError> {
         self.check_poison()?;
         let (tx, rx) = crossbeam_channel::bounded(1);
-        self.cmd_tx.send(LogCommand::Flush { resp_tx: tx })
-            .map_err(|_| HeraclitusError::StorageEngine("Pipeline abortado na injeção de Flush".into()))?;
-        rx.recv().map_err(|_| HeraclitusError::StorageEngine("A thread principal do worker falhou em processar o Flush".into()))?
+        self.cmd_tx
+            .send(LogCommand::Flush { resp_tx: tx })
+            .map_err(|_| {
+                HeraclitusError::StorageEngine("Pipeline abortado na injeção de Flush".into())
+            })?;
+        rx.recv().map_err(|_| {
+            HeraclitusError::StorageEngine(
+                "A thread principal do worker falhou em processar o Flush".into(),
+            )
+        })?
     }
 
     /// Caminho de escrita público: envia um `LogCommand::Append` e devolve o LSN
@@ -1046,27 +1201,57 @@ impl Log {
     }
 
     /// Aplicação replicada (follower): grava a entrada do líder na posição exata
-    /// `lsn` (CAS com `expected = lsn` — falha se o head divergir, garantindo
-    /// ordem estrita). PRESERVA o carimbo HLC do líder — replicar não re-carimba
-    /// — e fá-lo observar pelo HLC local para manter o relógio monotónico.
-    /// NOTA: rever semântica de replicação (gaps/idempotência).
+    /// `lsn`. PRESERVA o carimbo HLC do líder — replicar não re-carimba — e
+    /// fá-lo observar pelo HLC local para manter o relógio monotónico.
+    ///
+    /// Semântica (V2.3):
+    /// - `lsn == head`: append normal (CAS garante contiguidade — sem gaps);
+    /// - `lsn > head`: gap → `CasConflict` (o follower pede o backlog);
+    /// - `lsn < head`: RE-APLICAÇÃO. Idempotente se for o MESMO evento (mesmo
+    ///   `EventId`) — um follower que repete um lote após reconexão não pode
+    ///   falhar. Um evento DIFERENTE na mesma posição é divergência real de
+    ///   histórico e continua a falhar (o log imutável nunca se reescreve).
     pub fn append_replicated(&self, lsn: Lsn, episode: Episode) -> Result<Lsn, HeraclitusError> {
         self.hlc.observe(episode.ts_hlc);
+        let head = self.head();
+        if lsn < head {
+            return match self.read(lsn)? {
+                Some((_, existing)) if existing.id == episode.id => Ok(lsn),
+                _ => Err(HeraclitusError::CasConflict {
+                    expected: lsn,
+                    head,
+                }),
+            };
+        }
         self.enqueue_append(episode, Some(lsn), "append_replicated")
     }
 
-    fn enqueue_append(&self, episode: Episode, expected_lsn: Option<Lsn>, ctx: &str) -> Result<Lsn, HeraclitusError> {
+    fn enqueue_append(
+        &self,
+        episode: Episode,
+        expected_lsn: Option<Lsn>,
+        ctx: &str,
+    ) -> Result<Lsn, HeraclitusError> {
         self.check_poison()?;
         let (tx, rx) = crossbeam_channel::bounded(1);
         let opaque_meta = episode.id.0.to_bytes();
-        self.cmd_tx.send_timeout(LogCommand::Append {
-            opaque_meta,
-            episode: Arc::new(episode),
-            expected_lsn,
-            resp_tx: tx,
-        }, std::time::Duration::from_secs(10))
-        .map_err(|_| HeraclitusError::StorageEngine(format!("Timeout de canal: pipeline saturado ({ctx})")))?;
-        rx.recv().map_err(|_| HeraclitusError::StorageEngine(format!("Worker interrompido no {ctx}")))?
+        self.cmd_tx
+            .send_timeout(
+                LogCommand::Append {
+                    opaque_meta,
+                    episode: Arc::new(episode),
+                    expected_lsn,
+                    resp_tx: tx,
+                },
+                std::time::Duration::from_secs(10),
+            )
+            .map_err(|_| {
+                HeraclitusError::StorageEngine(format!(
+                    "Timeout de canal: pipeline saturado ({ctx})"
+                ))
+            })?;
+        rx.recv()
+            .map_err(|_| HeraclitusError::StorageEngine(format!("Worker interrompido no {ctx}")))?
     }
 
     pub fn sealed_segments(&self) -> Vec<SegmentMeta> {
@@ -1079,24 +1264,40 @@ impl Log {
     }
 
     fn decrypt_in_place(&self, ep: &mut Episode) -> Result<(), HeraclitusError> {
-        let Some(ks) = &self.keystore else { return Ok(()); };
-        if !heraclitus_crypto::is_encrypted(&ep.content) { return Ok(()); }
-        
+        let Some(ks) = &self.keystore else {
+            return Ok(());
+        };
+        if !heraclitus_crypto::is_encrypted(&ep.content) {
+            return Ok(());
+        }
+
         let key = ks.get(&ep.agent_id).ok_or_else(|| {
-            HeraclitusError::Crypto(format!("Chave criptográfica ausente para o agente: {}", ep.agent_id))
+            HeraclitusError::Crypto(format!(
+                "Chave criptográfica ausente para o agente: {}",
+                ep.agent_id
+            ))
         })?;
 
-        let opened = heraclitus_crypto::open(&key, &ep.content, ep.agent_id.as_bytes()).ok_or_else(|| {
-            HeraclitusError::Crypto(format!("Assinatura inválida detectada na cifra do agente: {}", ep.agent_id))
-        })?;
-        
+        let opened = heraclitus_crypto::open(&key, &ep.content, ep.agent_id.as_bytes())
+            .ok_or_else(|| {
+                HeraclitusError::Crypto(format!(
+                    "Assinatura inválida detectada na cifra do agente: {}",
+                    ep.agent_id
+                ))
+            })?;
+
         ep.content = opened;
         Ok(())
     }
 }
 
 impl RaftLogStorage for Log {
-    fn append_raft_entry(&self, term: u64, index: u64, episode: Episode) -> Result<Lsn, HeraclitusError> {
+    fn append_raft_entry(
+        &self,
+        term: u64,
+        index: u64,
+        episode: Episode,
+    ) -> Result<Lsn, HeraclitusError> {
         self.check_poison()?;
         // Entrada expedida pelo líder: preserva o carimbo dele, observa-o localmente.
         self.hlc.observe(episode.ts_hlc);
@@ -1106,15 +1307,25 @@ impl RaftLogStorage for Log {
         opaque_meta[..8].copy_from_slice(&term.to_le_bytes());
         opaque_meta[8..16].copy_from_slice(&index.to_le_bytes());
 
-        self.cmd_tx.send_timeout(LogCommand::Append {
-            opaque_meta,
-            episode: Arc::new(episode),
-            expected_lsn: None,
-            resp_tx: tx,
-        }, std::time::Duration::from_secs(10))
-        .map_err(|_| HeraclitusError::StorageEngine("Timeout de canal concorrente: Pipeline saturado".into()))?;
+        self.cmd_tx
+            .send_timeout(
+                LogCommand::Append {
+                    opaque_meta,
+                    episode: Arc::new(episode),
+                    expected_lsn: None,
+                    resp_tx: tx,
+                },
+                std::time::Duration::from_secs(10),
+            )
+            .map_err(|_| {
+                HeraclitusError::StorageEngine(
+                    "Timeout de canal concorrente: Pipeline saturado".into(),
+                )
+            })?;
 
-        rx.recv().map_err(|_| HeraclitusError::StorageEngine("Worker interrompido no processamento Raft".into()))?
+        rx.recv().map_err(|_| {
+            HeraclitusError::StorageEngine("Worker interrompido no processamento Raft".into())
+        })?
     }
 
     fn read_raft_entry(&self, lsn: Lsn) -> Result<Option<(Lsn, RaftEntry)>, HeraclitusError> {
@@ -1122,13 +1333,22 @@ impl RaftLogStorage for Log {
             return Ok(None);
         }
         let catalog = self.catalog.load();
-        
+
         let container = if lsn >= catalog.active.meta.base_lsn {
             Some(&catalog.active)
         } else {
-            let idx = match catalog.sealed.binary_search_by_key(&lsn, |c| c.meta.base_lsn) {
+            let idx = match catalog
+                .sealed
+                .binary_search_by_key(&lsn, |c| c.meta.base_lsn)
+            {
                 Ok(i) => Some(i),
-                Err(i) => if i > 0 { Some(i - 1) } else { None },
+                Err(i) => {
+                    if i > 0 {
+                        Some(i - 1)
+                    } else {
+                        None
+                    }
+                }
             };
             idx.map(|i| &catalog.sealed[i])
         };
@@ -1146,40 +1366,65 @@ impl RaftLogStorage for Log {
                 f.seek(SeekFrom::Start(entry.offset))?;
                 f.read_exact(&mut buf)?;
 
-                if let Decoded::Record(_, _, payload, _) = format::decode_record(container.meta.version, &buf) {
+                if let Decoded::Record(_, _, payload, _) =
+                    format::decode_record(container.meta.version, &buf)
+                {
                     let ep = decode_episode_payload(container.meta.version, payload)?;
 
-                    let term = u64::from_le_bytes(entry.opaque_meta[..8].try_into().unwrap_or([0u8; 8]));
-                    let index = u64::from_le_bytes(entry.opaque_meta[8..16].try_into().unwrap_or([0u8; 8]));
+                    let term =
+                        u64::from_le_bytes(entry.opaque_meta[..8].try_into().unwrap_or([0u8; 8]));
+                    let index =
+                        u64::from_le_bytes(entry.opaque_meta[8..16].try_into().unwrap_or([0u8; 8]));
 
-                    return Ok(Some((lsn, RaftEntry {
-                        term,
-                        index,
-                        payload: Arc::new(ep),
-                    })));
+                    return Ok(Some((
+                        lsn,
+                        RaftEntry {
+                            term,
+                            index,
+                            payload: Arc::new(ep),
+                        },
+                    )));
                 }
             }
         }
         Ok(None)
     }
 
-    fn truncate_from_lsn(&self, from_lsn: Lsn, current_raft_commit: u64) -> Result<(), HeraclitusError> {
+    fn truncate_from_lsn(
+        &self,
+        from_lsn: Lsn,
+        current_raft_commit: u64,
+    ) -> Result<(), HeraclitusError> {
         self.check_poison()?;
         let allowed_max_lsn = self.resolve_lsn_from_consensus_index(current_raft_commit);
         let (tx, rx) = crossbeam_channel::bounded(1);
-        
-        self.cmd_tx.send(LogCommand::Truncate { from_lsn, allowed_max_lsn, resp_tx: tx })
-            .map_err(|_| HeraclitusError::StorageEngine("Falha de injeção na barreira de Truncate do Raft".into()))?;
-        rx.recv().map_err(|_| HeraclitusError::StorageEngine("Truncamento de log abortado".into()))?
+
+        self.cmd_tx
+            .send(LogCommand::Truncate {
+                from_lsn,
+                allowed_max_lsn,
+                resp_tx: tx,
+            })
+            .map_err(|_| {
+                HeraclitusError::StorageEngine(
+                    "Falha de injeção na barreira de Truncate do Raft".into(),
+                )
+            })?;
+        rx.recv()
+            .map_err(|_| HeraclitusError::StorageEngine("Truncamento de log abortado".into()))?
     }
 }
 
-fn new_active(dir: &Path, id: SegmentId, base_lsn: Lsn, hlc: &Hlc) -> Result<Active, HeraclitusError> {
+fn new_active(
+    dir: &Path,
+    id: SegmentId,
+    base_lsn: Lsn,
+    hlc: &Hlc,
+) -> Result<Active, HeraclitusError> {
     let path = segment_path(dir, id);
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(false)
-        .write(true)
         .append(true)
         .open(&path)?;
     let header = SegmentHeader {
@@ -1190,7 +1435,7 @@ fn new_active(dir: &Path, id: SegmentId, base_lsn: Lsn, hlc: &Hlc) -> Result<Act
     file.write_all(&header.encode())?;
     file.sync_data()?;
     sync_parent_dir(dir)?;
-    
+
     Ok(Active {
         file,
         segment_id: id,
@@ -1207,7 +1452,8 @@ fn roll_segment(
     active: &mut Active,
     catalog_swap: &ArcSwap<LogCatalog>,
     next_base_lsn: Lsn,
-    hlc: &Hlc) -> Result<(), HeraclitusError> {
+    hlc: &Hlc,
+) -> Result<(), HeraclitusError> {
     active.file.sync_data()?;
     let footer = SegmentFooter {
         record_count: active.record_hashes.len() as u64,
@@ -1217,13 +1463,13 @@ fn roll_segment(
     };
     active.file.write_all(&footer.encode())?;
     active.file.sync_data()?;
-    
+
     let next_id = active.segment_id + 1;
     let old_base_lsn = active.base_lsn;
-    
+
     let current_catalog = catalog_swap.load();
     let mut new_sealed = (*current_catalog.sealed).clone();
-    
+
     new_sealed.push(Arc::new(SegmentContainer {
         meta: SegmentMeta {
             id: active.segment_id,
@@ -1250,7 +1496,9 @@ fn roll_segment(
             blake3_root: None,
             version: format::FORMAT_VERSION,
         },
-        index: Arc::new(SegmentIndex { entries: Arc::new(Vec::new()) }),
+        index: Arc::new(SegmentIndex {
+            entries: Arc::new(Vec::new()),
+        }),
     });
 
     catalog_swap.store(Arc::new(LogCatalog {
@@ -1282,7 +1530,9 @@ fn handle_truncation_protected(
     let (target_container, target_idx) = if is_in_active {
         (&catalog.active, None)
     } else {
-        let pos = catalog.sealed.binary_search_by_key(&from_lsn, |c| c.meta.base_lsn)
+        let pos = catalog
+            .sealed
+            .binary_search_by_key(&from_lsn, |c| c.meta.base_lsn)
             .unwrap_or_else(|i| if i > 0 { i - 1 } else { 0 });
         new_sealed.truncate(pos + 1);
         (&catalog.sealed[pos], Some(pos))
@@ -1290,17 +1540,19 @@ fn handle_truncation_protected(
 
     let path = segment_path(dir, target_container.meta.id);
     let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
-    
+
     let mut new_entries = Vec::new();
     let mut valid_len = HEADER_LEN as u64;
     let mut max_lsn = target_container.meta.base_lsn;
     let mut hashes = Vec::new();
 
     for entry in target_container.index.entries.iter() {
-        if entry.lsn >= from_lsn { break; }
+        if entry.lsn >= from_lsn {
+            break;
+        }
         new_entries.push(*entry);
         max_lsn = max_lsn.max(entry.lsn);
-        
+
         file.seek(SeekFrom::Start(entry.offset))?;
         let mut rh = [0u8; format::RECORD_HEADER_LEN];
         file.read_exact(&mut rh)?;
@@ -1309,7 +1561,7 @@ fn handle_truncation_protected(
         file.seek(SeekFrom::Start(entry.offset))?;
         file.read_exact(&mut buf)?;
         hashes.push(format::record_leaf(target_container.meta.version, &buf));
-        
+
         valid_len = entry.offset + format::RECORD_HEADER_LEN as u64 + len as u64;
     }
 
@@ -1324,7 +1576,7 @@ fn handle_truncation_protected(
     file.sync_all()?;
 
     if let Some(pos) = target_idx {
-        for seg in &catalog.sealed[pos+1..] {
+        for seg in &catalog.sealed[pos + 1..] {
             let _ = std::fs::remove_file(&seg.meta.path);
         }
     }
@@ -1352,11 +1604,13 @@ fn handle_truncation_protected(
             blake3_root: None,
             version: target_container.meta.version,
         },
-        index: Arc::new(SegmentIndex { entries: Arc::new(new_entries) }),
+        index: Arc::new(SegmentIndex {
+            entries: Arc::new(new_entries),
+        }),
     });
 
     if !is_in_active {
-        new_sealed.pop(); 
+        new_sealed.pop();
     }
 
     catalog_swap.store(Arc::new(LogCatalog {
@@ -1469,7 +1723,11 @@ fn scan_segment_file(path: &Path, _id: SegmentId) -> Result<SegmentScan, Heracli
                 sealed = true;
                 root = Some(f.blake3_root);
                 offset += format::FOOTER_LEN as u64;
-                if offset != file_len || hashes.len() as u64 != f.record_count || min_lsn != Some(f.min_lsn) || max_lsn != Some(f.max_lsn) {
+                if offset != file_len
+                    || hashes.len() as u64 != f.record_count
+                    || min_lsn != Some(f.min_lsn)
+                    || max_lsn != Some(f.max_lsn)
+                {
                     corruption = true;
                 }
                 break;
@@ -1478,8 +1736,10 @@ fn scan_segment_file(path: &Path, _id: SegmentId) -> Result<SegmentScan, Heracli
                 break;
             }
         } else {
-            let len = u32::from_le_bytes(magic_peek.try_into().unwrap_or([0u8; 4])) as usize;
-            if len > 512 * 1024 * 1024 || offset + format::RECORD_HEADER_LEN as u64 + len as u64 > file_len {
+            let len = u32::from_le_bytes(magic_peek) as usize;
+            if len > 512 * 1024 * 1024
+                || offset + format::RECORD_HEADER_LEN as u64 + len as u64 > file_len
+            {
                 corruption = true;
                 break;
             }
@@ -1510,16 +1770,19 @@ fn scan_segment_file(path: &Path, _id: SegmentId) -> Result<SegmentScan, Heracli
                     // Versão do segmento decide o layout: v3+ traz opaque_meta
                     // no payload; v<=2 deriva-o do EventId do Episode.
                     let opaque_meta = if version >= 4 {
-                        let (sp, _): (StoragePayload, usize) = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
-                            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+                        let (sp, _): (StoragePayload, usize) =
+                            bincode::serde::decode_from_slice(payload, BINCODE_CFG)
+                                .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
                         sp.opaque_meta
                     } else if version == 3 {
-                        let (sp, _): (StoragePayloadV3, usize) = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
-                            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+                        let (sp, _): (StoragePayloadV3, usize) =
+                            bincode::serde::decode_from_slice(payload, BINCODE_CFG)
+                                .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
                         sp.opaque_meta
                     } else {
-                        let (ep, _): (EpisodeV2, usize) = bincode::serde::decode_from_slice(payload, BINCODE_CFG)
-                            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+                        let (ep, _): (EpisodeV2, usize) =
+                            bincode::serde::decode_from_slice(payload, BINCODE_CFG)
+                                .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
                         ep.id.0.to_bytes()
                     };
 
@@ -1598,7 +1861,9 @@ fn segment_id_from_path(path: &Path) -> Result<SegmentId, HeraclitusError> {
 }
 
 pub fn merkle_root(hashes: &[[u8; 32]]) -> [u8; 32] {
-    if hashes.is_empty() { return [0u8; 32]; }
+    if hashes.is_empty() {
+        return [0u8; 32];
+    }
     let mut current = hashes.to_vec();
     let mut len = current.len();
     while len > 1 {
@@ -1640,4 +1905,3 @@ pub struct SegmentVerifyReport {
     pub stored_root: Option<[u8; 32]>,
     pub valid: bool,
 }
-

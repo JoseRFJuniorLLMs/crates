@@ -114,11 +114,7 @@ impl ConsistencyVirtualMachine {
 
     /// Fold an entire instruction stream from an initial state — convenience
     /// over `stream.into_iter().fold(state, |s, i| vm.reduce_step(s, i))`.
-    pub fn run(
-        &self,
-        state: VmState,
-        stream: impl IntoIterator<Item = VmInstruction>,
-    ) -> VmState {
+    pub fn run(&self, state: VmState, stream: impl IntoIterator<Item = VmInstruction>) -> VmState {
         stream
             .into_iter()
             .fold(state, |acc, inst| self.reduce_step(acc, inst))

@@ -2,12 +2,12 @@
 //! All intelligence lives in the agent; this is just the riverbed.
 
 use heraclitus_activation::ActivationStore;
-use heraclitus_core::{Episode, EventKind, HeraclitusConfig, HeraclitusError, Lsn, ProductPoint};
 use heraclitus_core::vm::{ConsistencyVirtualMachine, VmInstruction, VmState, VmVersion};
+use heraclitus_core::{Episode, EventKind, HeraclitusConfig, HeraclitusError, Lsn, ProductPoint};
 use heraclitus_crypto::KeyStore;
+use heraclitus_index_attr::AttrIndex;
 use heraclitus_index_graph::entity::EntityResolver;
 use heraclitus_index_graph::temporal::TemporalGraph;
-use heraclitus_index_attr::AttrIndex;
 use heraclitus_index_graph::GraphIndex;
 use heraclitus_index_text::TextIndex;
 use heraclitus_index_vector::VectorIndex;
@@ -267,7 +267,10 @@ impl Engine {
                 idx.keys()
             };
             if skip_replay {
-                p.ok(format!("PULADO — {} chaves do checkpoint", group(keys as u64)));
+                p.ok(format!(
+                    "PULADO — {} chaves do checkpoint",
+                    group(keys as u64)
+                ));
             } else {
                 p.ok(format!("{} chaves indexadas", group(keys as u64)));
             }
@@ -310,7 +313,8 @@ impl Engine {
             text.into_bytes(),
         );
         e.attrs.insert("audit".into(), "query".into());
-        e.attrs.insert("ok".into(), if ok { "true".into() } else { "false".into() });
+        e.attrs
+            .insert("ok".into(), if ok { "true".into() } else { "false".into() });
         let _ = self.append(e);
     }
 
@@ -340,14 +344,23 @@ impl Engine {
     /// Append an H-VM upsert to the durable log.
     pub fn hvm_upsert(&self, key: Vec<u8>, val: Vec<u8>) -> Result<Lsn, HeraclitusError> {
         let lsn = self.log.head();
-        let instr = VmInstruction::Upsert { key, val, lsn, ev_id: heraclitus_core::EventId::new() };
+        let instr = VmInstruction::Upsert {
+            key,
+            val,
+            lsn,
+            ev_id: heraclitus_core::EventId::new(),
+        };
         vm_bridge::append_instruction(&self.log, VmVersion(1), &instr)
     }
 
     /// Append an H-VM delete to the durable log.
     pub fn hvm_delete(&self, key: Vec<u8>) -> Result<Lsn, HeraclitusError> {
         let lsn = self.log.head();
-        let instr = VmInstruction::Delete { key, lsn, ev_id: heraclitus_core::EventId::new() };
+        let instr = VmInstruction::Delete {
+            key,
+            lsn,
+            ev_id: heraclitus_core::EventId::new(),
+        };
         vm_bridge::append_instruction(&self.log, VmVersion(1), &instr)
     }
 
@@ -455,7 +468,10 @@ impl Engine {
     }
 
     /// `heraclitus_verify_segment(id)` — prova de integridade pontual.
-    pub fn verify_segment(&self, id: heraclitus_core::SegmentId) -> Result<serde_json::Value, HeraclitusError> {
+    pub fn verify_segment(
+        &self,
+        id: heraclitus_core::SegmentId,
+    ) -> Result<serde_json::Value, HeraclitusError> {
         let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         match self.log.verify_segment(id)? {
             None => Ok(serde_json::json!({ "found": false, "id": id })),
@@ -759,14 +775,28 @@ impl QueryBackend for Engine {
         etype: &str,
         as_of: Option<Lsn>,
     ) -> Result<Option<EdgeHypotheses>, HeraclitusError> {
-        Ok(hypotheses_of(&self.tgraph.lock().unwrap(), from, to, etype, as_of))
+        Ok(hypotheses_of(
+            &self.tgraph.lock().unwrap(),
+            from,
+            to,
+            etype,
+            as_of,
+        ))
     }
 
-    fn community(&self, node: &str, as_of: Option<Lsn>) -> Result<Option<CommunityResult>, HeraclitusError> {
+    fn community(
+        &self,
+        node: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<CommunityResult>, HeraclitusError> {
         Ok(community_of(&self.tgraph.lock().unwrap(), node, as_of))
     }
 
-    fn community_leiden(&self, node: &str, as_of: Option<Lsn>) -> Result<Option<CommunityResult>, HeraclitusError> {
+    fn community_leiden(
+        &self,
+        node: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<CommunityResult>, HeraclitusError> {
         Ok(heraclitus_query::backend::community_leiden_of(
             &self.tgraph.lock().unwrap(),
             node,
@@ -774,18 +804,30 @@ impl QueryBackend for Engine {
         ))
     }
 
-    fn node_metrics(&self, node: &str, as_of: Option<Lsn>) -> Result<Option<MetricsResult>, HeraclitusError> {
+    fn node_metrics(
+        &self,
+        node: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<MetricsResult>, HeraclitusError> {
         Ok(node_metrics_of(&self.tgraph.lock().unwrap(), node, as_of))
     }
 
-    fn resolve_entity(&self, key: &str, as_of: Option<Lsn>) -> Result<Option<String>, HeraclitusError> {
+    fn resolve_entity(
+        &self,
+        key: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<String>, HeraclitusError> {
         let er = self.entity.lock().unwrap();
-        Ok(resolve_of(&*er, key, as_of))
+        Ok(resolve_of(&er, key, as_of))
     }
 
-    fn entity_cluster(&self, entity_id: &str, as_of: Option<Lsn>) -> Result<Vec<String>, HeraclitusError> {
+    fn entity_cluster(
+        &self,
+        entity_id: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Vec<String>, HeraclitusError> {
         let er = self.entity.lock().unwrap();
-        Ok(cluster_of(&*er, entity_id, as_of))
+        Ok(cluster_of(&er, entity_id, as_of))
     }
 
     fn append(
@@ -863,12 +905,19 @@ mod tests {
         let ckpt = dir.path().join("hvm.hbt");
         {
             let engine = engine_in(dir.path());
-            engine.hvm_upsert(b"user:1".to_vec(), b"alice".to_vec()).unwrap();
-            engine.hvm_upsert(b"user:2".to_vec(), b"bob".to_vec()).unwrap();
+            engine
+                .hvm_upsert(b"user:1".to_vec(), b"alice".to_vec())
+                .unwrap();
+            engine
+                .hvm_upsert(b"user:2".to_vec(), b"bob".to_vec())
+                .unwrap();
             engine.hvm_delete(b"user:1".to_vec()).unwrap();
 
             let state = engine.hvm_state().unwrap();
-            assert_eq!(state.memory_layers.get(b"user:2".as_slice()), Some(&b"bob".to_vec()));
+            assert_eq!(
+                state.memory_layers.get(b"user:2".as_slice()),
+                Some(&b"bob".to_vec())
+            );
             assert!(!state.memory_layers.contains_key(b"user:1".as_slice()));
 
             // Checkpoint to a Bᵋ-tree on disk and verify its contents.
@@ -881,7 +930,10 @@ mod tests {
         // Reopen over the same data dir: the ledger replays from the durable log.
         let engine2 = engine_in(dir.path());
         let state2 = engine2.hvm_state().unwrap();
-        assert_eq!(state2.memory_layers.get(b"user:2".as_slice()), Some(&b"bob".to_vec()));
+        assert_eq!(
+            state2.memory_layers.get(b"user:2".as_slice()),
+            Some(&b"bob".to_vec())
+        );
         assert!(!state2.memory_layers.contains_key(b"user:1".as_slice()));
     }
 
@@ -951,9 +1003,15 @@ mod tests {
             e.attrs.insert("edge_op".into(), op.into());
             e
         };
-        engine.append(mk("Alfa", "Maria", "socio_de", "assert")).unwrap();
-        engine.append(mk("Alfa", "Beto", "pagou", "assert")).unwrap();
-        engine.append(mk("Alfa", "Maria", "socio_de", "retract")).unwrap();
+        engine
+            .append(mk("Alfa", "Maria", "socio_de", "assert"))
+            .unwrap();
+        engine
+            .append(mk("Alfa", "Beto", "pagou", "assert"))
+            .unwrap();
+        engine
+            .append(mk("Alfa", "Maria", "socio_de", "retract"))
+            .unwrap();
     }
 
     #[test]
@@ -1005,7 +1063,11 @@ mod tests {
             let mut e = Episode::new("ag", EventKind::Observation, text.as_bytes().to_vec());
             e.parents.push(a_id);
             e.attrs.insert("confidence".into(), conf.into());
-            e.embedding = Some(ProductPoint { hyp: vec![hyp], sph: vec![], euc: vec![] });
+            e.embedding = Some(ProductPoint {
+                hyp: vec![hyp],
+                sph: vec![],
+                euc: vec![],
+            });
             engine.append(e).unwrap();
         };
         child("0.7", 0.65, "fraude");
@@ -1115,7 +1177,8 @@ mod tests {
                 "engine vs reference disagree on `{q}`"
             );
         }
-        let v = heraclitus_query::execute("HYPOTHESES (\"X\", \"Y\", \"fraud_partner\")", &engine).unwrap();
+        let v = heraclitus_query::execute("HYPOTHESES (\"X\", \"Y\", \"fraud_partner\")", &engine)
+            .unwrap();
         assert_eq!(v["hypotheses"].as_array().unwrap().len(), 2);
     }
 
@@ -1145,7 +1208,11 @@ mod tests {
         );
         let v = heraclitus_query::execute(&q, &engine).unwrap();
         assert_eq!(v["steps"].as_array().unwrap().len(), 4);
-        assert_eq!(v["roots"].as_array().unwrap().len(), 2, "two root observations");
+        assert_eq!(
+            v["roots"].as_array().unwrap().len(),
+            2,
+            "two root observations"
+        );
     }
 
     #[test]
@@ -1165,7 +1232,11 @@ mod tests {
             engine.append(edge(a, b)).unwrap();
         }
         let be = LogBackend::new(engine.log.clone());
-        for q in ["COMMUNITY (\"A1\")", "METRICS (\"A1\")", "COMMUNITY (\"B1\")"] {
+        for q in [
+            "COMMUNITY (\"A1\")",
+            "METRICS (\"A1\")",
+            "COMMUNITY (\"B1\")",
+        ] {
             assert_eq!(
                 heraclitus_query::execute(q, &engine).unwrap(),
                 heraclitus_query::execute(q, &be).unwrap(),
@@ -1194,7 +1265,9 @@ mod tests {
             for leaf in ["L1", "L2", "L3", "L4"] {
                 engine.append(edge("H", leaf, "socio_de", "1.0")).unwrap();
             }
-            engine.append(edge("X", "Y", "fraud_partner", "0.9")).unwrap();
+            engine
+                .append(edge("X", "Y", "fraud_partner", "0.9"))
+                .unwrap();
             let v = heraclitus_query::execute("DECIDE ()", &engine).unwrap();
             v["fired"].as_array().unwrap().len()
         };
@@ -1203,11 +1276,18 @@ mod tests {
         // Reopen: replay reconstructs the decisions (they are log events).
         let engine2 = engine_in(dir.path());
         let actions = heraclitus_query::execute("MATCH (n:Action) RETURN n", &engine2).unwrap();
-        assert_eq!(actions.as_array().unwrap().len(), fired, "replay reproduces decisions");
+        assert_eq!(
+            actions.as_array().unwrap().len(),
+            fired,
+            "replay reproduces decisions"
+        );
 
         // Deciding again on the reopened engine is idempotent.
         let v2 = heraclitus_query::execute("DECIDE ()", &engine2).unwrap();
-        assert!(v2["fired"].as_array().unwrap().is_empty(), "no duplicate actions after replay");
+        assert!(
+            v2["fired"].as_array().unwrap().is_empty(),
+            "no duplicate actions after replay"
+        );
         assert_eq!(v2["skipped"].as_array().unwrap().len(), fired);
     }
 
@@ -1224,12 +1304,22 @@ mod tests {
             e.attrs.insert("edge_type".into(), "socio_de".into());
             e
         };
-        for (a, b) in [("A1", "A2"), ("A2", "A3"), ("A3", "A1"), ("B1", "B2"), ("A1", "B1")] {
+        for (a, b) in [
+            ("A1", "A2"),
+            ("A2", "A3"),
+            ("A3", "A1"),
+            ("B1", "B2"),
+            ("A1", "B1"),
+        ] {
             engine.append(edge(a, b)).unwrap();
         }
         let head_before = engine.snapshot();
         let real = heraclitus_query::execute("COMMUNITY (\"A1\")", &engine).unwrap();
-        assert_eq!(real["members"].as_array().unwrap().len(), 5, "A1..A3 + B1,B2 joined");
+        assert_eq!(
+            real["members"].as_array().unwrap().len(),
+            5,
+            "A1..A3 + B1,B2 joined"
+        );
 
         // Counterfactual removal splits the community.
         let cf = heraclitus_query::execute(
@@ -1237,7 +1327,11 @@ mod tests {
             &engine,
         )
         .unwrap();
-        assert_eq!(cf["members"].as_array().unwrap().len(), 3, "bridge removed in the counterfactual");
+        assert_eq!(
+            cf["members"].as_array().unwrap().len(),
+            3,
+            "bridge removed in the counterfactual"
+        );
 
         // Base + log untouched.
         let real_again = heraclitus_query::execute("COMMUNITY (\"A1\")", &engine).unwrap();
@@ -1252,14 +1346,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let feedback = |score: &str, verdict: &str| {
             let mut e = Episode::new("analyst", EventKind::Observation, vec![]);
-            e.attrs.insert("feedback_rule".into(), "flag_anomaly".into());
+            e.attrs
+                .insert("feedback_rule".into(), "flag_anomaly".into());
             e.attrs.insert("score".into(), score.into());
             e.attrs.insert("verdict".into(), verdict.into());
             e
         };
         let learned = {
             let engine = engine_in(dir.path());
-            for (s, v) in [("3.0", "confirm"), ("2.0", "confirm"), ("1.6", "reject"), ("1.0", "reject")] {
+            for (s, v) in [
+                ("3.0", "confirm"),
+                ("2.0", "confirm"),
+                ("1.6", "reject"),
+                ("1.0", "reject"),
+            ] {
                 engine.append(feedback(s, v)).unwrap();
             }
             let r = heraclitus_query::execute("ADAPT ()", &engine).unwrap();
@@ -1270,7 +1370,11 @@ mod tests {
         // Reopen and re-learn: replay yields the identical rule.
         let engine2 = engine_in(dir.path());
         let r2 = heraclitus_query::execute("ADAPT ()", &engine2).unwrap();
-        assert_eq!(r2["learned_threshold"].as_f64().unwrap(), learned, "replay learns the same rule");
+        assert_eq!(
+            r2["learned_threshold"].as_f64().unwrap(),
+            learned,
+            "replay learns the same rule"
+        );
     }
 
     #[test]
@@ -1281,13 +1385,21 @@ mod tests {
         let engine = engine_in(dir.path());
         for i in 0..3 {
             engine
-                .append(Episode::new("ag", EventKind::Observation, format!("e{i}").into_bytes()))
+                .append(Episode::new(
+                    "ag",
+                    EventKind::Observation,
+                    format!("e{i}").into_bytes(),
+                ))
                 .unwrap();
         }
         let head = engine.snapshot();
         assert_eq!(head, 3);
 
-        let ok = heraclitus_query::execute(&format!("REQUIRE LSN >= {head} MATCH (n) RETURN n"), &engine).unwrap();
+        let ok = heraclitus_query::execute(
+            &format!("REQUIRE LSN >= {head} MATCH (n) RETURN n"),
+            &engine,
+        )
+        .unwrap();
         assert_eq!(ok.as_array().unwrap().len(), 3);
 
         let err = heraclitus_query::execute(
@@ -1305,8 +1417,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = engine_in(dir.path());
         for i in 0..500u64 {
-            let mut e = Episode::new("etl", EventKind::Observation, format!("emp {i}").into_bytes());
-            let cnpj = if i % 50 == 7 { "11222333000144".to_string() } else { format!("{i:014}") };
+            let mut e = Episode::new(
+                "etl",
+                EventKind::Observation,
+                format!("emp {i}").into_bytes(),
+            );
+            let cnpj = if i % 50 == 7 {
+                "11222333000144".to_string()
+            } else {
+                format!("{i:014}")
+            };
             e.attrs.insert("cnpj".into(), cnpj);
             e.attrs.insert("uf".into(), "MG".into());
             engine.append(e).unwrap();
@@ -1319,15 +1439,26 @@ mod tests {
         // índice == scan de referência (mesmas linhas, mesma ordem)
         let be = LogBackend::new(engine.log.clone());
         let via_ref = heraclitus_query::execute(q, &be).unwrap();
-        assert_eq!(via_engine, via_ref, "índice deve igualar o scan de referência");
+        assert_eq!(
+            via_engine, via_ref,
+            "índice deve igualar o scan de referência"
+        );
 
         // campo arbitrário também é indexado (uf), e valor inexistente => vazio
         assert_eq!(
             heraclitus_query::execute(r#"MATCH (n) WHERE n.uf = "MG" RETURN n"#, &engine)
-                .unwrap().as_array().unwrap().len(),
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
             500
         );
-        assert!(heraclitus_query::execute(r#"MATCH (n) WHERE n.cnpj = "0000" RETURN n"#, &engine)
-            .unwrap().as_array().unwrap().is_empty());
+        assert!(
+            heraclitus_query::execute(r#"MATCH (n) WHERE n.cnpj = "0000" RETURN n"#, &engine)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 }

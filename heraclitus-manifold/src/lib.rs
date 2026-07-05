@@ -76,7 +76,10 @@ fn add(a: &[f64], b: &[f64]) -> Vec<f64> {
 // the per-call heap traffic that dominated the ANN hot path.
 
 fn dot_f32(a: &[f32], b: &[f32]) -> f64 {
-    a.iter().zip(b).map(|(x, y)| (*x as f64) * (*y as f64)).sum()
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (*x as f64) * (*y as f64))
+        .sum()
 }
 
 fn norm_f32(a: &[f32]) -> f64 {
@@ -121,13 +124,21 @@ pub fn dist_hyp(u: &[f32], v: &[f32], c: f64) -> f64 {
         return 0.0;
     }
     let max_norm = (1.0 - BALL_EPS) / c.sqrt(); // boundary of the curvature-c ball
-    // Fold the boundary clamp into per-element scale factors instead of
-    // materializing clamped vectors: a point whose norm exceeds `max_norm` is
-    // scaled by `max_norm / n` (n > max_norm >= 0 implies n > 0), otherwise 1.
+                                                // Fold the boundary clamp into per-element scale factors instead of
+                                                // materializing clamped vectors: a point whose norm exceeds `max_norm` is
+                                                // scaled by `max_norm / n` (n > max_norm >= 0 implies n > 0), otherwise 1.
     let nu_raw = norm_f32(u);
     let nv_raw = norm_f32(v);
-    let su = if nu_raw > max_norm { max_norm / nu_raw } else { 1.0 };
-    let sv = if nv_raw > max_norm { max_norm / nv_raw } else { 1.0 };
+    let su = if nu_raw > max_norm {
+        max_norm / nu_raw
+    } else {
+        1.0
+    };
+    let sv = if nv_raw > max_norm {
+        max_norm / nv_raw
+    } else {
+        1.0
+    };
     let nu = su * nu_raw; // norm(scale(u, su)) == su * norm(u)
     let nv = sv * nv_raw;
     let mut diff2 = 0.0f64; // |su*u - sv*v|^2 in a single pass
@@ -314,7 +325,10 @@ mod tests {
         let v = vec![0.9f32, 0.0];
         let d2 = dist_hyp(&u, &v, 2.0);
         assert!(d2.is_finite(), "c=2 distance must be finite");
-        assert!(d2 < 12.0, "c=2 distance must not blow up (was ~24.19), got {d2}");
+        assert!(
+            d2 < 12.0,
+            "c=2 distance must not blow up (was ~24.19), got {d2}"
+        );
         // monotonic & symmetric still hold under c>1
         assert!((dist_hyp(&u, &v, 2.0) - dist_hyp(&v, &u, 2.0)).abs() < 1e-9);
         assert!(dist_hyp(&u, &u, 2.0) < 1e-9);

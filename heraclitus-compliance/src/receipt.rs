@@ -121,7 +121,11 @@ mod tests {
     #[test]
     fn persist_then_load_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
-        let c = Commitment { lsn: 42, root: [3u8; 32], segments: 2 };
+        let c = Commitment {
+            lsn: 42,
+            root: [3u8; 32],
+            segments: 2,
+        };
         let imprint = [4u8; 32];
         let r = persist(dir.path(), &c, &imprint, "ACT-dev", 1700, b"token-bytes").unwrap();
         assert_eq!(r.lsn, 42);

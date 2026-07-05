@@ -29,13 +29,18 @@ impl Embedded {
     /// Abre (ou cria) a base em `data_dir` com a configuração default —
     /// fsync, memtable e views idênticos aos do servidor.
     pub fn open(data_dir: impl Into<PathBuf>) -> Result<Self, HeraclitusError> {
-        let config = HeraclitusConfig { data_dir: data_dir.into(), ..HeraclitusConfig::default() };
+        let config = HeraclitusConfig {
+            data_dir: data_dir.into(),
+            ..HeraclitusConfig::default()
+        };
         Self::open_with(&config)
     }
 
     /// Abre com configuração explícita (cifra em repouso, fsync, caps...).
     pub fn open_with(config: &HeraclitusConfig) -> Result<Self, HeraclitusError> {
-        Ok(Self { engine: Arc::new(Engine::open(config)?) })
+        Ok(Self {
+            engine: Arc::new(Engine::open(config)?),
+        })
     }
 
     /// Grava um episódio no log (a fonte da verdade) e nas views.
@@ -69,6 +74,17 @@ impl Embedded {
     pub fn engine(&self) -> &Engine {
         &self.engine
     }
+
+    /// SQL analítico (DataFusion) sobre o log — feature `analytics`. Read-only
+    /// e derivado: materializa `events` do log (`as_of = Some(n)` ⇒ `lsn < n`)
+    /// e corre `SELECT ... GROUP BY ...` sem tocar no core.
+    #[cfg(feature = "analytics")]
+    pub fn analytics(
+        &self,
+        as_of: Option<Lsn>,
+    ) -> Result<heraclitus_analytics::LogAnalytics, heraclitus_analytics::AnalyticsError> {
+        heraclitus_analytics::LogAnalytics::from_log(&self.engine.log, as_of)
+    }
 }
 
 #[cfg(test)]
@@ -83,7 +99,11 @@ mod tests {
         let db = Embedded::open(dir.path()).unwrap();
 
         for i in 0..5 {
-            let mut e = Episode::new("agente", EventKind::Observation, format!("f{i}").into_bytes());
+            let mut e = Episode::new(
+                "agente",
+                EventKind::Observation,
+                format!("f{i}").into_bytes(),
+            );
             e.attrs.insert("valor".into(), format!("{}", i * 100));
             db.append(e).unwrap();
         }

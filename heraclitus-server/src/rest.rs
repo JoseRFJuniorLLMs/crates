@@ -17,12 +17,24 @@ fn b64(input: &[u8]) -> String {
     const AB: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         out.push(AB[(n >> 18) as usize & 63] as char);
         out.push(AB[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { AB[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { AB[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            AB[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            AB[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -82,7 +94,11 @@ async fn state(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
 
 /// Verificação Merkle do log inteiro.
 async fn verify(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
-    Json(engine.verify().unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() })))
+    Json(
+        engine
+            .verify()
+            .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() })),
+    )
 }
 
 /// Verificação Merkle pontual de um segmento.

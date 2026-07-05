@@ -56,7 +56,11 @@ pub struct WorkerConfig {
 
 impl WorkerConfig {
     pub fn new(interval: Duration, min_lsn_step: Lsn, receipts_dir: impl Into<PathBuf>) -> Self {
-        Self { interval, min_lsn_step, receipts_dir: receipts_dir.into() }
+        Self {
+            interval,
+            min_lsn_step,
+            receipts_dir: receipts_dir.into(),
+        }
     }
 }
 
@@ -113,7 +117,14 @@ pub fn anchor(
     let gen_ms = verify_dev_token(&token, &imprint)
         .map(|v| v.gen_unix_ms)
         .unwrap_or_else(|_| now_unix_ms());
-    receipt::persist(receipts_dir, &commitment, &imprint, tsa.policy_name(), gen_ms, &token)
+    receipt::persist(
+        receipts_dir,
+        &commitment,
+        &imprint,
+        tsa.policy_name(),
+        gen_ms,
+        &token,
+    )
 }
 
 /// Re-verify a previously issued receipt against the live log: recompute the

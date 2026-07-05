@@ -103,8 +103,16 @@ mod tests {
 
     #[test]
     fn imprint_is_32_bytes_and_binds_lsn() {
-        let c1 = Commitment { lsn: 100, root: [7u8; 32], segments: 3 };
-        let c2 = Commitment { lsn: 101, root: [7u8; 32], segments: 3 };
+        let c1 = Commitment {
+            lsn: 100,
+            root: [7u8; 32],
+            segments: 3,
+        };
+        let c2 = Commitment {
+            lsn: 101,
+            root: [7u8; 32],
+            segments: 3,
+        };
         let i1 = c1.message_imprint_sha256();
         assert_eq!(i1.len(), 32);
         // a different watermark over the same root yields a different imprint

@@ -452,7 +452,11 @@ fn build_stmt(pair: Pair<Rule>) -> Result<Stmt, HeraclitusError> {
             if node.is_empty() {
                 return Err(perr("COMMUNITY needs a node id"));
             }
-            Ok(Stmt::Community { node, leiden, as_of })
+            Ok(Stmt::Community {
+                node,
+                leiden,
+                as_of,
+            })
         }
         Rule::metrics_stmt => {
             let mut node = String::new();

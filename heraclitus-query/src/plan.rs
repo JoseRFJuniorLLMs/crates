@@ -209,7 +209,11 @@ pub fn plan(stmt: &Stmt) -> Plan {
             max_depth: *max_depth,
             as_of: *as_of,
         },
-        Stmt::Community { node, leiden, as_of } => Plan::Community {
+        Stmt::Community {
+            node,
+            leiden,
+            as_of,
+        } => Plan::Community {
             node: node.clone(),
             leiden: *leiden,
             as_of: *as_of,
@@ -454,7 +458,10 @@ fn cmp_json(a: &Json, b: &Json, cmp: Cmp) -> bool {
     // caía no caminho de strings e devolvia None). Strings puras dos dois
     // lados continuam a comparar lexicograficamente (CPFs com zeros à esquerda
     // não mudam de semântica).
-    let coerce = |j: &Json| j.as_f64().or_else(|| j.as_str().and_then(|s| s.trim().parse::<f64>().ok()));
+    let coerce = |j: &Json| {
+        j.as_f64()
+            .or_else(|| j.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+    };
     let ord = match (a.as_f64(), b.as_f64()) {
         (Some(x), Some(y)) => x.partial_cmp(&y),
         (Some(_), None) | (None, Some(_)) => match (coerce(a), coerce(b)) {
@@ -485,8 +492,8 @@ fn valid_at_matches(e: &Episode, t: u64) -> bool {
     let num = |k: &str| e.attrs.get(k).and_then(|v| v.trim().parse::<f64>().ok());
     let from = e.valid_from.map(|v| v as f64).or_else(|| num("valid_from"));
     let to = e.valid_to.map(|v| v as f64).or_else(|| num("valid_to"));
-    let from_ok = from.map_or(true, |from| from <= t as f64);
-    let to_ok = to.map_or(true, |to| (t as f64) < to);
+    let from_ok = from.is_none_or(|from| from <= t as f64);
+    let to_ok = to.is_none_or(|to| (t as f64) < to);
     from_ok && to_ok
 }
 
@@ -531,8 +538,7 @@ fn eq_filter(conditions: &[(BoolOp, Condition)], var: &str, field: &str) -> Opti
 }
 
 fn is_lsn_operand(op: &Operand) -> bool {
-    matches!(op, Operand::Ident(f) if f == "lsn")
-        || matches!(op, Operand::Prop(_, f) if f == "lsn")
+    matches!(op, Operand::Ident(f) if f == "lsn") || matches!(op, Operand::Prop(_, f) if f == "lsn")
 }
 
 fn flip_cmp(c: Cmp) -> Cmp {
@@ -548,7 +554,10 @@ fn flip_cmp(c: Cmp) -> Cmp {
 /// Campos servidos diretamente do envelope do evento (não são `attrs`), logo
 /// não passam pelo índice de atributos.
 fn is_builtin_field(f: &str) -> bool {
-    matches!(f, "lsn" | "id" | "agent_id" | "session_id" | "kind" | "tipo" | "content")
+    matches!(
+        f,
+        "lsn" | "id" | "agent_id" | "session_id" | "kind" | "tipo" | "content"
+    )
 }
 
 /// Se o `WHERE` for conjuntivo e limitar `n.<campo>` por comparações NUMÉRICAS
@@ -556,9 +565,10 @@ fn is_builtin_field(f: &str) -> bool {
 /// bounds `(valor, inclusivo?)` para o índice ordenado resolver (C1.6, padrão
 /// Qdrant). `None` ⇒ scan por janela. O pós-filtro `matches` revalida tudo —
 /// a correção nunca depende do hint.
-fn attr_range_hint(
-    conditions: &[(BoolOp, Condition)],
-) -> Option<(String, Option<(f64, bool)>, Option<(f64, bool)>)> {
+/// Um limite numérico: `(valor, inclusivo?)`.
+type NumBound = Option<(f64, bool)>;
+
+fn attr_range_hint(conditions: &[(BoolOp, Condition)]) -> Option<(String, NumBound, NumBound)> {
     if conditions.iter().any(|(op, _)| matches!(op, BoolOp::Or)) {
         return None;
     }
@@ -768,7 +778,7 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                         .map(|l| kind_label(&e.kind).eq_ignore_ascii_case(l))
                         .unwrap_or(true)
                 })
-                .filter(|(_, e)| valid_at.map_or(true, |t| valid_at_matches(e, t)))
+                .filter(|(_, e)| valid_at.is_none_or(|t| valid_at_matches(e, t)))
                 .filter(|(l, e)| matches(conditions, *l, e))
                 .collect();
             if let Some((key, asc)) = order_by {
@@ -855,7 +865,7 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                 // Bi-temporal em ARESTAS (V2.4): VALID AT filtra pelo valid
                 // time do mundo herdado do episódio que assertou a aresta.
                 .filter(|r| {
-                    valid_at.map_or(true, |t| {
+                    valid_at.is_none_or(|t| {
                         r.world_valid_from.is_none_or(|from| from <= t)
                             && r.world_valid_to.is_none_or(|to| t < to)
                     })
@@ -939,7 +949,11 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
             let keys = be.entity_cluster(entity, bound)?;
             Ok(Json::Array(keys.into_iter().map(|k| json!(k)).collect()))
         }
-        Plan::Community { node, leiden, as_of } => {
+        Plan::Community {
+            node,
+            leiden,
+            as_of,
+        } => {
             let bound = resolve_as_of(as_of, be)?;
             let result = if *leiden {
                 be.community_leiden(node, bound)?
@@ -968,7 +982,13 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                 })),
             }
         }
-        Plan::Simulate { op, from, to, etype, then } => {
+        Plan::Simulate {
+            op,
+            from,
+            to,
+            etype,
+            then,
+        } => {
             // Sobrepõe o contrafactual numa cópia do grafo; o grafo base e o
             // log nunca são tocados (divergência isolada). `be.graph()` — e não
             // um replay do log — para que um SIMULATE aninhado veja a mutação

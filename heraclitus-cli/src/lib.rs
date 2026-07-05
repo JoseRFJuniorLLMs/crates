@@ -47,9 +47,12 @@ pub fn anchor(
     policy: String,
 ) -> Result<String, String> {
     use heraclitus_compliance::{anchor, current_watermark, HttpTsa, LocalTsa, TsaClient};
-    let log = Log::open(log_dir, 256 * 1024 * 1024, FsyncPolicy::Always).map_err(|e| e.to_string())?;
+    let log =
+        Log::open(log_dir, 256 * 1024 * 1024, FsyncPolicy::Always).map_err(|e| e.to_string())?;
     if current_watermark(&log) == 0 {
-        return Ok("nada selado para ancorar (sem segmentos selados); apenda mais eventos primeiro".into());
+        return Ok(
+            "nada selado para ancorar (sem segmentos selados); apenda mais eventos primeiro".into(),
+        );
     }
     let tsa: Box<dyn TsaClient> = match tsa_url {
         Some(u) => Box::new(HttpTsa::new(u, policy)),
@@ -75,7 +78,8 @@ pub fn verify_receipts(
     receipts_dir: &std::path::Path,
 ) -> Result<String, String> {
     use heraclitus_compliance::{load_manifest, verify_receipt};
-    let log = Log::open(log_dir, 256 * 1024 * 1024, FsyncPolicy::Always).map_err(|e| e.to_string())?;
+    let log =
+        Log::open(log_dir, 256 * 1024 * 1024, FsyncPolicy::Always).map_err(|e| e.to_string())?;
     let receipts = load_manifest(receipts_dir).map_err(|e| e.to_string())?;
     if receipts.is_empty() {
         return Ok("nenhum recibo encontrado (manifest.jsonl vazio ou ausente)".into());

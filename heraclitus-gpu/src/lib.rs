@@ -66,7 +66,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 pub fn batch_sqdist_cpu(query: &[f32], vectors: &[f32], dim: usize) -> Vec<f32> {
     assert!(dim > 0, "dim must be > 0");
     assert_eq!(query.len(), dim, "query length must equal dim");
-    assert_eq!(vectors.len() % dim, 0, "vectors length must be a multiple of dim");
+    assert_eq!(
+        vectors.len() % dim,
+        0,
+        "vectors length must be a multiple of dim"
+    );
     vectors
         .chunks_exact(dim)
         .map(|row| row.iter().zip(query).map(|(a, b)| (a - b) * (a - b)).sum())
@@ -74,7 +78,13 @@ pub fn batch_sqdist_cpu(query: &[f32], vectors: &[f32], dim: usize) -> Vec<f32> 
 }
 
 /// Quantized Top-M nearest rows by squared distance.
-pub fn topm_cpu(query: &[f32], vectors: &[f32], dim: usize, m: usize, scale: f32) -> Vec<Candidate> {
+pub fn topm_cpu(
+    query: &[f32],
+    vectors: &[f32],
+    dim: usize,
+    m: usize,
+    scale: f32,
+) -> Vec<Candidate> {
     let dists = batch_sqdist_cpu(query, vectors, dim);
     rank(dists.into_iter(), m, scale)
 }
@@ -99,7 +109,15 @@ pub struct ProductSig {
 impl Default for ProductSig {
     fn default() -> Self {
         // Matches heraclitus_manifold::Signature::default + BALL_EPS.
-        Self { a: 32, b: 8, c: 8, c1: 1.0, k2: 1.0, weights: [1.0, 1.0, 1.0], ball_eps: 1e-5 }
+        Self {
+            a: 32,
+            b: 8,
+            c: 8,
+            c1: 1.0,
+            k2: 1.0,
+            weights: [1.0, 1.0, 1.0],
+            ball_eps: 1e-5,
+        }
     }
 }
 
@@ -153,7 +171,11 @@ fn dist_euc_cpu(u: &[f32], v: &[f32]) -> f64 {
     if u.is_empty() {
         return 0.0;
     }
-    u.iter().zip(v).map(|(a, b)| ((a - b) as f64) * ((a - b) as f64)).sum::<f64>().sqrt()
+    u.iter()
+        .zip(v)
+        .map(|(a, b)| ((a - b) as f64) * ((a - b) as f64))
+        .sum::<f64>()
+        .sqrt()
 }
 
 /// Batch product-manifold distance: the f64 reference the WGSL kernel must match.
@@ -162,16 +184,32 @@ pub fn product_dist_cpu(query: &[f32], vectors: &[f32], sig: &ProductSig) -> Vec
     let dim = sig.a + sig.b + sig.c;
     assert!(dim > 0, "dim must be > 0");
     assert_eq!(query.len(), dim, "query length must equal a+b+c");
-    assert_eq!(vectors.len() % dim, 0, "vectors length must be a multiple of a+b+c");
+    assert_eq!(
+        vectors.len() % dim,
+        0,
+        "vectors length must be a multiple of a+b+c"
+    );
     let c1 = sig.c1 as f64;
     let k2 = sig.k2 as f64;
     let ball_eps = sig.ball_eps as f64;
-    let (w1, w2, w3) = (sig.weights[0] as f64, sig.weights[1] as f64, sig.weights[2] as f64);
-    let (qh, qs, qe) = (&query[..sig.a], &query[sig.a..sig.a + sig.b], &query[sig.a + sig.b..]);
+    let (w1, w2, w3) = (
+        sig.weights[0] as f64,
+        sig.weights[1] as f64,
+        sig.weights[2] as f64,
+    );
+    let (qh, qs, qe) = (
+        &query[..sig.a],
+        &query[sig.a..sig.a + sig.b],
+        &query[sig.a + sig.b..],
+    );
     vectors
         .chunks_exact(dim)
         .map(|row| {
-            let (rh, rs, re) = (&row[..sig.a], &row[sig.a..sig.a + sig.b], &row[sig.a + sig.b..]);
+            let (rh, rs, re) = (
+                &row[..sig.a],
+                &row[sig.a..sig.a + sig.b],
+                &row[sig.a + sig.b..],
+            );
             let dh = dist_hyp_cpu(qh, rh, c1, ball_eps);
             let ds = dist_sph_cpu(qs, rs, k2);
             let de = dist_euc_cpu(qe, re);
@@ -181,7 +219,13 @@ pub fn product_dist_cpu(query: &[f32], vectors: &[f32], sig: &ProductSig) -> Vec
 }
 
 /// Quantized Top-M nearest rows by product-manifold distance (CPU reference).
-pub fn topm_product_cpu(query: &[f32], vectors: &[f32], sig: &ProductSig, m: usize, scale: f32) -> Vec<Candidate> {
+pub fn topm_product_cpu(
+    query: &[f32],
+    vectors: &[f32],
+    sig: &ProductSig,
+    m: usize,
+    scale: f32,
+) -> Vec<Candidate> {
     let dists = product_dist_cpu(query, vectors, sig);
     rank(dists.into_iter().map(|d| d as f32), m, scale)
 }
@@ -268,7 +312,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn rank(dists: impl Iterator<Item = f32>, m: usize, scale: f32) -> Vec<Candidate> {
     let mut cands: Vec<Candidate> = dists
         .enumerate()
-        .map(|(i, d)| Candidate { qdist: execute_op_quantize(d, scale), index: i as u32 })
+        .map(|(i, d)| Candidate {
+            qdist: execute_op_quantize(d, scale),
+            index: i as u32,
+        })
         .collect();
     cands.sort_unstable();
     cands.truncate(m);
@@ -301,7 +348,11 @@ mod gpu_rt {
         CTX.get_or_init(|| pollster::block_on(init())).as_ref()
     }
 
-    fn pipeline(device: &wgpu::Device, label: &str, src: &str) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+    fn pipeline(
+        device: &wgpu::Device,
+        label: &str,
+        src: &str,
+    ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(label),
             source: wgpu::ShaderSource::Wgsl(src.into()),
@@ -325,14 +376,25 @@ mod gpu_rt {
             .await?;
         let (device, queue) = adapter
             .request_device(
-                &wgpu::DeviceDescriptor { label: Some("heraclitus-gpu"), ..Default::default() },
+                &wgpu::DeviceDescriptor {
+                    label: Some("heraclitus-gpu"),
+                    ..Default::default()
+                },
                 None,
             )
             .await
             .ok()?;
         let (sqdist, sqdist_bgl) = pipeline(&device, "sqdist", super::PRODUCT_SQDIST_WGSL);
-        let (product, product_bgl) = pipeline(&device, "product", super::PRODUCT_MANIFOLD_DIST_WGSL);
-        Some(Ctx { device, queue, sqdist, sqdist_bgl, product, product_bgl })
+        let (product, product_bgl) =
+            pipeline(&device, "product", super::PRODUCT_MANIFOLD_DIST_WGSL);
+        Some(Ctx {
+            device,
+            queue,
+            sqdist,
+            sqdist_bgl,
+            product,
+            product_bgl,
+        })
     }
 }
 
@@ -384,10 +446,22 @@ fn run_dist(
         label: Some("dist-bg"),
         layout: bgl,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: query_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: vectors_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: dist_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: query_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: vectors_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: dist_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: params_buf.as_entire_binding(),
+            },
         ],
     });
 
@@ -417,21 +491,41 @@ fn run_dist(
 
 /// GPU Top-M by squared-Euclidean distance. `None` if no GPU → CPU fallback.
 #[cfg(feature = "gpu")]
-pub fn topm_gpu(query: &[f32], vectors: &[f32], dim: usize, m: usize, scale: f32) -> Option<Vec<Candidate>> {
+pub fn topm_gpu(
+    query: &[f32],
+    vectors: &[f32],
+    dim: usize,
+    m: usize,
+    scale: f32,
+) -> Option<Vec<Candidate>> {
     if dim == 0 || query.len() != dim || vectors.is_empty() || vectors.len() % dim != 0 {
         return None;
     }
     let n = vectors.len() / dim;
     let ctx = gpu_rt::ctx()?;
     let params: [u32; 4] = [dim as u32, n as u32, 0, 0];
-    let dists = run_dist(ctx, &ctx.sqdist, &ctx.sqdist_bgl, query, vectors, n, bytemuck::cast_slice(&params))?;
+    let dists = run_dist(
+        ctx,
+        &ctx.sqdist,
+        &ctx.sqdist_bgl,
+        query,
+        vectors,
+        n,
+        bytemuck::cast_slice(&params),
+    )?;
     Some(rank(dists.into_iter(), m, scale))
 }
 
 /// GPU Top-M by product-manifold distance. `None` if no GPU → CPU fallback.
 /// Validated against [`product_dist_cpu`] by `product_gpu_matches_cpu_on_hardware`.
 #[cfg(feature = "gpu")]
-pub fn topm_product_gpu(query: &[f32], vectors: &[f32], sig: &ProductSig, m: usize, scale: f32) -> Option<Vec<Candidate>> {
+pub fn topm_product_gpu(
+    query: &[f32],
+    vectors: &[f32],
+    sig: &ProductSig,
+    m: usize,
+    scale: f32,
+) -> Option<Vec<Candidate>> {
     let dim = sig.a + sig.b + sig.c;
     if dim == 0 || query.len() != dim || vectors.is_empty() || vectors.len() % dim != 0 {
         return None;
@@ -440,12 +534,28 @@ pub fn topm_product_gpu(query: &[f32], vectors: &[f32], sig: &ProductSig, m: usi
     let ctx = gpu_rt::ctx()?;
     // Params struct layout (std140): 4 u32 + 6 f32 + 2 pad = 48 bytes.
     let params: [u32; 12] = [
-        sig.a as u32, sig.b as u32, sig.c as u32, n as u32,
-        sig.c1.to_bits(), sig.k2.to_bits(), sig.weights[0].to_bits(),
-        sig.weights[1].to_bits(), sig.weights[2].to_bits(), sig.ball_eps.to_bits(),
-        0, 0,
+        sig.a as u32,
+        sig.b as u32,
+        sig.c as u32,
+        n as u32,
+        sig.c1.to_bits(),
+        sig.k2.to_bits(),
+        sig.weights[0].to_bits(),
+        sig.weights[1].to_bits(),
+        sig.weights[2].to_bits(),
+        sig.ball_eps.to_bits(),
+        0,
+        0,
     ];
-    let dists = run_dist(ctx, &ctx.product, &ctx.product_bgl, query, vectors, n, bytemuck::cast_slice(&params))?;
+    let dists = run_dist(
+        ctx,
+        &ctx.product,
+        &ctx.product_bgl,
+        query,
+        vectors,
+        n,
+        bytemuck::cast_slice(&params),
+    )?;
     Some(rank(dists.into_iter(), m, scale))
 }
 
@@ -462,7 +572,13 @@ pub fn topm(query: &[f32], vectors: &[f32], dim: usize, m: usize, scale: f32) ->
 /// Product-manifold Top-M: GPU (feature `gpu`) with CPU fallback. This is the
 /// drop-in the index RECALL path calls; the GPU does the brute-force scan and
 /// the CPU arbitrates the quantized order.
-pub fn topm_product(query: &[f32], vectors: &[f32], sig: &ProductSig, m: usize, scale: f32) -> Vec<Candidate> {
+pub fn topm_product(
+    query: &[f32],
+    vectors: &[f32],
+    sig: &ProductSig,
+    m: usize,
+    scale: f32,
+) -> Vec<Candidate> {
     #[cfg(feature = "gpu")]
     if let Some(r) = topm_product_gpu(query, vectors, sig, m, scale) {
         return r;
@@ -505,7 +621,11 @@ mod tests {
         let ia: Vec<u32> = a.iter().map(|c| c.index).collect();
         let ib: Vec<u32> = b.iter().map(|c| c.index).collect();
         assert_eq!(ia, ib, "sub-quantum jitter must not reorder the Top-M");
-        assert_eq!(ia, (0..10).collect::<Vec<u32>>(), "nearest are the smallest-norm rows");
+        assert_eq!(
+            ia,
+            (0..10).collect::<Vec<u32>>(),
+            "nearest are the smallest-norm rows"
+        );
     }
 
     #[test]
@@ -537,7 +657,11 @@ mod tests {
         }
         let top = topm_product_cpu(&query, &vectors, &sig, 5, 1e3);
         let idx: Vec<u32> = top.iter().map(|c| c.index).collect();
-        assert_eq!(idx, vec![0, 1, 2, 3, 4], "nearest are the smallest-i points");
+        assert_eq!(
+            idx,
+            vec![0, 1, 2, 3, 4],
+            "nearest are the smallest-i points"
+        );
     }
 
     pub(super) fn make_query(sig: &ProductSig) -> Vec<f32> {
@@ -552,16 +676,16 @@ mod tests {
         let dim = sig.a + sig.b + sig.c;
         let mut p = vec![0.0f32; dim];
         let fi = i as f32;
-        for j in 0..sig.a {
-            p[j] = fi * 0.004;
+        for slot in p.iter_mut().take(sig.a) {
+            *slot = fi * 0.004;
         }
         let ang = fi * 0.02;
         p[sig.a] = ang.cos();
         if sig.b > 1 {
             p[sig.a + 1] = ang.sin();
         }
-        for j in 0..sig.c {
-            p[sig.a + sig.b + j] = fi * 0.2;
+        for slot in p.iter_mut().skip(sig.a + sig.b).take(sig.c) {
+            *slot = fi * 0.2;
         }
         p
     }
@@ -586,8 +710,15 @@ mod gpu_tests {
         let scale = 1e3;
         match topm_gpu(&query, &vectors, dim, 10, scale) {
             Some(gpu) => {
-                assert_eq!(gpu, topm_cpu(&query, &vectors, dim, 10, scale), "Euclidean GPU == CPU");
-                eprintln!("[M20.3.1a] Euclidean GPU validated: {} candidates == CPU", gpu.len());
+                assert_eq!(
+                    gpu,
+                    topm_cpu(&query, &vectors, dim, 10, scale),
+                    "Euclidean GPU == CPU"
+                );
+                eprintln!(
+                    "[M20.3.1a] Euclidean GPU validated: {} candidates == CPU",
+                    gpu.len()
+                );
             }
             None => eprintln!("[M20.3.1a] no GPU adapter; CPU fallback (skipped)"),
         }
@@ -609,8 +740,14 @@ mod gpu_tests {
         match topm_product_gpu(&query, &vectors, &sig, 12, scale) {
             Some(gpu) => {
                 let cpu = topm_product_cpu(&query, &vectors, &sig, 12, scale);
-                assert_eq!(gpu, cpu, "product-metric GPU Top-M must equal CPU reference");
-                eprintln!("[M20.3.1b] product-metric GPU validated on hardware: {} == CPU", gpu.len());
+                assert_eq!(
+                    gpu, cpu,
+                    "product-metric GPU Top-M must equal CPU reference"
+                );
+                eprintln!(
+                    "[M20.3.1b] product-metric GPU validated on hardware: {} == CPU",
+                    gpu.len()
+                );
             }
             None => eprintln!("[M20.3.1b] no GPU adapter; CPU fallback (skipped)"),
         }

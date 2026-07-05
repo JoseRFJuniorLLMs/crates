@@ -196,7 +196,11 @@ impl View for ActivationStore {
         heraclitus_views::ckpt::save(
             dir,
             "activation",
-            &ActivationSnapshot { decay: self.decay, watermark: self.watermark, records },
+            &ActivationSnapshot {
+                decay: self.decay,
+                watermark: self.watermark,
+                records,
+            },
         )
     }
 
@@ -209,7 +213,11 @@ impl View for ActivationStore {
             .records
             .into_iter()
             .map(|(id, recent, n, first_access)| {
-                let mut rec = ActivationRecord { n, first_access, ..Default::default() };
+                let mut rec = ActivationRecord {
+                    n,
+                    first_access,
+                    ..Default::default()
+                };
                 for t in recent.into_iter().take(RECENT_K) {
                     rec.recent.push(t);
                 }

@@ -317,15 +317,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = Log::open(dir.path().join("log"), 1 << 20, FsyncPolicy::Always).unwrap();
         for i in 0..50 {
-            log.append(Episode::new("a", EventKind::Observation, format!("e{i}").into_bytes()))
-                .unwrap();
+            log.append(Episode::new(
+                "a",
+                EventKind::Observation,
+                format!("e{i}").into_bytes(),
+            ))
+            .unwrap();
         }
 
         // 1ª sessão: aplica tudo e persiste watermarks.json (= head).
         {
             let state = Arc::new(Mutex::new((0u64, 0u64)));
             let mut reg = ViewRegistry::open(dir.path()).unwrap();
-            reg.register(Box::new(CountView { state: state.clone(), wm: 0 }));
+            reg.register(Box::new(CountView {
+                state: state.clone(),
+                wm: 0,
+            }));
             reg.catch_up(&log).unwrap();
             assert_eq!(state.lock().unwrap().0, 50);
         }
@@ -333,7 +340,10 @@ mod tests {
         // Restart: NOVO registry lê watermarks.json (avançado), view NASCE VAZIA.
         let state2 = Arc::new(Mutex::new((0u64, 0u64)));
         let mut reg2 = ViewRegistry::open(dir.path()).unwrap();
-        reg2.register(Box::new(CountView { state: state2.clone(), wm: 0 }));
+        reg2.register(Box::new(CountView {
+            state: state2.clone(),
+            wm: 0,
+        }));
         reg2.catch_up(&log).unwrap();
 
         // Sem o fix isto seria 0 (view vazia, replay saltado). Com o fix: 50.

@@ -36,7 +36,14 @@ impl View for SnapView {
         self.wm
     }
     fn checkpoint(&self, dir: &Path) -> Result<(), HeraclitusError> {
-        ckpt::save(dir, "snap", &SnapState { count: self.count, wm: self.wm })
+        ckpt::save(
+            dir,
+            "snap",
+            &SnapState {
+                count: self.count,
+                wm: self.wm,
+            },
+        )
     }
     fn restore(&mut self, dir: &Path) -> Result<bool, HeraclitusError> {
         match ckpt::load::<SnapState>(dir, "snap")? {
@@ -56,8 +63,12 @@ impl View for SnapView {
 
 fn append_n(log: &Log, n: usize) {
     for i in 0..n {
-        log.append(Episode::new("a", EventKind::Observation, format!("e{i}").into_bytes()))
-            .unwrap();
+        log.append(Episode::new(
+            "a",
+            EventKind::Observation,
+            format!("e{i}").into_bytes(),
+        ))
+        .unwrap();
     }
 }
 
@@ -71,7 +82,11 @@ fn restore_replays_only_the_tail() {
     let applied1 = Arc::new(Mutex::new(0u64));
     {
         let mut reg = ViewRegistry::open(dir.path()).unwrap();
-        reg.register(Box::new(SnapView { count: 0, wm: 0, applied_this_session: applied1.clone() }));
+        reg.register(Box::new(SnapView {
+            count: 0,
+            wm: 0,
+            applied_this_session: applied1.clone(),
+        }));
         reg.catch_up(&log).unwrap();
         reg.checkpoint().unwrap();
     }
@@ -83,7 +98,11 @@ fn restore_replays_only_the_tail() {
     // 2ª sessão: restaura o snapshot e replaya SÓ os 10 da cauda.
     let applied2 = Arc::new(Mutex::new(0u64));
     let mut reg2 = ViewRegistry::open(dir.path()).unwrap();
-    reg2.register(Box::new(SnapView { count: 0, wm: 0, applied_this_session: applied2.clone() }));
+    reg2.register(Box::new(SnapView {
+        count: 0,
+        wm: 0,
+        applied_this_session: applied2.clone(),
+    }));
     reg2.catch_up(&log).unwrap();
 
     assert_eq!(

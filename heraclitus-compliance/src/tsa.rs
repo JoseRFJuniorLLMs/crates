@@ -130,7 +130,12 @@ impl TsaClient for HttpTsa {
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
         let req = TimeStampReq::new(imprint, u64::from_be_bytes(nonce))?;
         let body = req.to_der_bytes()?;
-        http_post_der(&self.url, "application/timestamp-query", &body, self.timeout)
+        http_post_der(
+            &self.url,
+            "application/timestamp-query",
+            &body,
+            self.timeout,
+        )
     }
 }
 
@@ -143,11 +148,11 @@ fn http_post_der(
     body: &[u8],
     timeout: Duration,
 ) -> Result<Vec<u8>, CompError> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| CompError::Unsupported(
+    let rest = url.strip_prefix("http://").ok_or_else(|| {
+        CompError::Unsupported(
             "HttpTsa só suporta http:// nesta versão (use proxy TLS para https)".into(),
-        ))?;
+        )
+    })?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),

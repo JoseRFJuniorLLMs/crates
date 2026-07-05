@@ -81,10 +81,12 @@ impl AttrIndex {
     pub fn open(dir: impl AsRef<Path>) -> Self {
         let path = dir.as_ref().join(SNAPSHOT_FILE);
         match std::fs::read(&path) {
-            Ok(bytes) => match bincode::serde::decode_from_slice::<Snapshot, _>(&bytes, BINCODE_CFG) {
-                Ok((snap, _)) => AttrIndex { inner: snap },
-                Err(_) => AttrIndex::new(), // checkpoint corrompido -> rebuild por replay
-            },
+            Ok(bytes) => {
+                match bincode::serde::decode_from_slice::<Snapshot, _>(&bytes, BINCODE_CFG) {
+                    Ok((snap, _)) => AttrIndex { inner: snap },
+                    Err(_) => AttrIndex::new(), // checkpoint corrompido -> rebuild por replay
+                }
+            }
             Err(_) => AttrIndex::new(),
         }
     }
@@ -161,7 +163,11 @@ impl View for AttrIndex {
             if v.len() > MAX_VALUE_LEN || SKIP_VALUES.contains(&v.to_ascii_lowercase().as_str()) {
                 continue;
             }
-            self.inner.exact.entry(ikey(field, v)).or_default().push(lsn);
+            self.inner
+                .exact
+                .entry(ikey(field, v))
+                .or_default()
+                .push(lsn);
             // Valor numérico entra também no índice ordenado (range filtering).
             // Os SKIP_VALUES continuam de fora — "0"/"-1" ubíquos gerariam
             // postings gigantes sem poder discriminante.
@@ -249,8 +255,15 @@ mod tests {
         e.attrs.insert("objeto".into(), desc.clone());
         e.attrs.insert("cnpj".into(), "11222333000144".into());
         idx.apply(0, &e);
-        assert!(idx.lookup("objeto", &desc).is_empty(), "texto livre não é indexado");
-        assert_eq!(idx.lookup("cnpj", "11222333000144"), &[0], "identificador curto é indexado");
+        assert!(
+            idx.lookup("objeto", &desc).is_empty(),
+            "texto livre não é indexado"
+        );
+        assert_eq!(
+            idx.lookup("cnpj", "11222333000144"),
+            &[0],
+            "identificador curto é indexado"
+        );
     }
 
     #[test]
@@ -262,16 +275,32 @@ mod tests {
             e.attrs.insert("valor".into(), v.into());
             e
         };
-        for (lsn, v) in [(0, "-50.5"), (1, "10"), (2, "99.9"), (3, "100"), (4, "3000"), (5, "abc")] {
+        for (lsn, v) in [
+            (0, "-50.5"),
+            (1, "10"),
+            (2, "99.9"),
+            (3, "100"),
+            (4, "3000"),
+            (5, "abc"),
+        ] {
             idx.apply(lsn, &val(v));
         }
 
         use std::ops::Bound::*;
-        assert_eq!(idx.lookup_range("valor", Included(10.0), Included(100.0)), &[1, 2, 3]);
-        assert_eq!(idx.lookup_range("valor", Excluded(10.0), Excluded(100.0)), &[2]);
+        assert_eq!(
+            idx.lookup_range("valor", Included(10.0), Included(100.0)),
+            &[1, 2, 3]
+        );
+        assert_eq!(
+            idx.lookup_range("valor", Excluded(10.0), Excluded(100.0)),
+            &[2]
+        );
         // Negativos ordenam corretamente (f64_ordered preserva a ordem total).
         assert_eq!(idx.lookup_range("valor", Unbounded, Excluded(0.0)), &[0]);
-        assert_eq!(idx.lookup_range("valor", Included(100.0), Unbounded), &[3, 4]);
+        assert_eq!(
+            idx.lookup_range("valor", Included(100.0), Unbounded),
+            &[3, 4]
+        );
         // Não-numéricos ("abc") ficam fora do índice ordenado; campo inexistente = vazio.
         assert!(idx.lookup_range("outro", Unbounded, Unbounded).is_empty());
 
@@ -279,7 +308,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         idx.save(dir.path()).unwrap();
         let re = AttrIndex::open(dir.path());
-        assert_eq!(re.lookup_range("valor", Included(10.0), Included(100.0)), &[1, 2, 3]);
+        assert_eq!(
+            re.lookup_range("valor", Included(10.0), Included(100.0)),
+            &[1, 2, 3]
+        );
     }
 
     #[test]
@@ -313,6 +345,9 @@ mod tests {
             b.apply(i, &ep(&format!("cnpj{}", i % 3), &format!("nome{i}")));
         }
         assert_eq!(a.lookup("cnpj", "cnpj0"), b.lookup("cnpj", "cnpj0"));
-        assert_eq!(a.lookup("cnpj", "cnpj0"), &[0, 3, 6, 9, 12, 15, 18, 21, 24, 27]);
+        assert_eq!(
+            a.lookup("cnpj", "cnpj0"),
+            &[0, 3, 6, 9, 12, 15, 18, 21, 24, 27]
+        );
     }
 }

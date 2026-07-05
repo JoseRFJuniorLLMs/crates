@@ -32,6 +32,7 @@ heraclitus-activation = { workspace = true }
 heraclitus-retrieval = { workspace = true }
 heraclitus-query = { workspace = true }
 heraclitus-proto = { workspace = true }
+heraclitus-analytics = { workspace = true, optional = true }
 tonic = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
@@ -46,6 +47,10 @@ tracing-subscriber = { workspace = true }
 # self-checks `gpu_matches_cpu_on_hardware` / `product_gpu_matches_cpu_on_hardware`
 # (the CPU f64 rescore always has the final say, so results stay exact).
 gpu = ["heraclitus-index-vector/gpu"]
+# SQL analytics over the log (DataFusion). Off by default — DataFusion is a
+# heavy dependency and the default server/service stays lean. Enables
+# `Embedded::analytics()` and the REST `POST /sql` route.
+analytics = ["dep:heraclitus-analytics"]
 
 # Only the service binary needs these, and only on Windows.
 [target.'cfg(windows)'.dependencies]

@@ -1,0 +1,357 @@
+{
+  "heraclitus-activation/src/lib.rs": {
+    "mtime": 1783191837.760651,
+    "ast_hash": "0e9c93754e2d3a7003c127f43ae3b152",
+    "semantic_hash": "0e9c93754e2d3a7003c127f43ae3b152"
+  },
+  "heraclitus-analytics/src/lib.rs": {
+    "mtime": 1783191837.7789385,
+    "ast_hash": "30a6cf6a0f95f557e3772376822019db",
+    "semantic_hash": "30a6cf6a0f95f557e3772376822019db"
+  },
+  "heraclitus-btree/src/lib.rs": {
+    "mtime": 1783191837.8121505,
+    "ast_hash": "6a858783ecbcb61ab879c5f2a56f95ac",
+    "semantic_hash": "6a858783ecbcb61ab879c5f2a56f95ac"
+  },
+  "heraclitus-cli/src/lib.rs": {
+    "mtime": 1783191837.8322608,
+    "ast_hash": "9f5748aacdece50b72e5b96bdb051e1a",
+    "semantic_hash": "9f5748aacdece50b72e5b96bdb051e1a"
+  },
+  "heraclitus-cli/src/main.rs": {
+    "mtime": 1783191837.841267,
+    "ast_hash": "8202b93fc901372db99f6f3e15214e3c",
+    "semantic_hash": "8202b93fc901372db99f6f3e15214e3c"
+  },
+  "heraclitus-client/src/lib.rs": {
+    "mtime": 1782123869.3191512,
+    "ast_hash": "ebbd05e60915ce78ac5ee832cbf3d910",
+    "semantic_hash": "ebbd05e60915ce78ac5ee832cbf3d910"
+  },
+  "heraclitus-client/tests/end_to_end.rs": {
+    "mtime": 1781088857.0594532,
+    "ast_hash": "8c13892277cb96ba5777e15083043202",
+    "semantic_hash": "8c13892277cb96ba5777e15083043202"
+  },
+  "heraclitus-compliance/examples/seed_log.rs": {
+    "mtime": 1782029338.6489897,
+    "ast_hash": "9c842496322678c00fdbb18d21f08d83",
+    "semantic_hash": "9c842496322678c00fdbb18d21f08d83"
+  },
+  "heraclitus-compliance/src/commit.rs": {
+    "mtime": 1783191837.8520808,
+    "ast_hash": "c3735d999203be07efeb171bda7c4d57",
+    "semantic_hash": "c3735d999203be07efeb171bda7c4d57"
+  },
+  "heraclitus-compliance/src/lib.rs": {
+    "mtime": 1783191837.8520808,
+    "ast_hash": "0122125825fc66a180751f842adeea26",
+    "semantic_hash": "0122125825fc66a180751f842adeea26"
+  },
+  "heraclitus-compliance/src/receipt.rs": {
+    "mtime": 1783191837.853305,
+    "ast_hash": "8a8f2f57ab4e0b9c4101242544527a3e",
+    "semantic_hash": "8a8f2f57ab4e0b9c4101242544527a3e"
+  },
+  "heraclitus-compliance/src/rfc3161.rs": {
+    "mtime": 1783191837.8543131,
+    "ast_hash": "e490b0d7eeeebb3bdc1405c3f84b2c0a",
+    "semantic_hash": "e490b0d7eeeebb3bdc1405c3f84b2c0a"
+  },
+  "heraclitus-compliance/src/signer.rs": {
+    "mtime": 1783191837.8557944,
+    "ast_hash": "844fdf4595d77b876b24193e2732ceeb",
+    "semantic_hash": "844fdf4595d77b876b24193e2732ceeb"
+  },
+  "heraclitus-compliance/src/tsa.rs": {
+    "mtime": 1783191837.8569412,
+    "ast_hash": "5ecec75dad07d008dfa575e3f875ed10",
+    "semantic_hash": "5ecec75dad07d008dfa575e3f875ed10"
+  },
+  "heraclitus-compliance/src/verify.rs": {
+    "mtime": 1783191837.857949,
+    "ast_hash": "f7c149825c38d6fb3110aa33f682b763",
+    "semantic_hash": "f7c149825c38d6fb3110aa33f682b763"
+  },
+  "heraclitus-compliance/src/worker.rs": {
+    "mtime": 1782029059.1080806,
+    "ast_hash": "ecaf7eac3d0bd1a509ba864d6f039f4f",
+    "semantic_hash": "ecaf7eac3d0bd1a509ba864d6f039f4f"
+  },
+  "heraclitus-core/src/config.rs": {
+    "mtime": 1783191837.8625915,
+    "ast_hash": "1af71d22100fd90f62552e370f876581",
+    "semantic_hash": "1af71d22100fd90f62552e370f876581"
+  },
+  "heraclitus-core/src/error.rs": {
+    "mtime": 1783028955.7307146,
+    "ast_hash": "300262b7270133e70d7c5323cb3018cd",
+    "semantic_hash": "300262b7270133e70d7c5323cb3018cd"
+  },
+  "heraclitus-core/src/event.rs": {
+    "mtime": 1783046882.713583,
+    "ast_hash": "70df2442373a6a81c34de1ca346b9f07",
+    "semantic_hash": "70df2442373a6a81c34de1ca346b9f07"
+  },
+  "heraclitus-core/src/hlc.rs": {
+    "mtime": 1781066076.776703,
+    "ast_hash": "d4930aa3e2a59b03bbdb6c0937837d8c",
+    "semantic_hash": "d4930aa3e2a59b03bbdb6c0937837d8c"
+  },
+  "heraclitus-core/src/id.rs": {
+    "mtime": 1781066069.3373585,
+    "ast_hash": "e9e79935ed9b67b82491a849a3fd3baa",
+    "semantic_hash": "e9e79935ed9b67b82491a849a3fd3baa"
+  },
+  "heraclitus-core/src/lib.rs": {
+    "mtime": 1782360587.523499,
+    "ast_hash": "1074f2eec07982cb15e3bfedfcdfa44d",
+    "semantic_hash": "1074f2eec07982cb15e3bfedfcdfa44d"
+  },
+  "heraclitus-core/src/vm/codec.rs": {
+    "mtime": 1783191837.8651161,
+    "ast_hash": "de6f273d7cdf37121aea139ee0eacfe9",
+    "semantic_hash": "de6f273d7cdf37121aea139ee0eacfe9"
+  },
+  "heraclitus-core/src/vm/interpreter.rs": {
+    "mtime": 1783191837.8661318,
+    "ast_hash": "32e6639db09da30ad4d4b1354e364bf1",
+    "semantic_hash": "32e6639db09da30ad4d4b1354e364bf1"
+  },
+  "heraclitus-core/src/vm/mod.rs": {
+    "mtime": 1782360587.523499,
+    "ast_hash": "0ea21f71df21e4b3a2cd551de2666735",
+    "semantic_hash": "0ea21f71df21e4b3a2cd551de2666735"
+  },
+  "heraclitus-core/src/vm/quantizer.rs": {
+    "mtime": 1783191837.8661318,
+    "ast_hash": "5b60c946f855f6393a76d3e788499358",
+    "semantic_hash": "5b60c946f855f6393a76d3e788499358"
+  },
+  "heraclitus-crypto/src/lib.rs": {
+    "mtime": 1783191837.8692787,
+    "ast_hash": "cf2d08cbde75a8ca0e9d07feda7b5e66",
+    "semantic_hash": "cf2d08cbde75a8ca0e9d07feda7b5e66"
+  },
+  "heraclitus-distill/src/lib.rs": {
+    "mtime": 1781088857.0671442,
+    "ast_hash": "2d41de2e9e0d28e24ff3ea570a14e981",
+    "semantic_hash": "2d41de2e9e0d28e24ff3ea570a14e981"
+  },
+  "heraclitus-gpu/src/lib.rs": {
+    "mtime": 1783191837.876837,
+    "ast_hash": "5c50665525c282f4d516274fc6ceeb39",
+    "semantic_hash": "5c50665525c282f4d516274fc6ceeb39"
+  },
+  "heraclitus-index-attr/src/lib.rs": {
+    "mtime": 1783191837.879218,
+    "ast_hash": "d0c9ccaf8d348f0ad37dbcf5b9611c22",
+    "semantic_hash": "d0c9ccaf8d348f0ad37dbcf5b9611c22"
+  },
+  "heraclitus-index-graph/src/adaptive.rs": {
+    "mtime": 1783191837.8860831,
+    "ast_hash": "5a681d7e7a5492edb8ccff70e8958d30",
+    "semantic_hash": "5a681d7e7a5492edb8ccff70e8958d30"
+  },
+  "heraclitus-index-graph/src/decision.rs": {
+    "mtime": 1781643390.3836024,
+    "ast_hash": "048f1c2b1b698f504e728061c5ffae09",
+    "semantic_hash": "048f1c2b1b698f504e728061c5ffae09"
+  },
+  "heraclitus-index-graph/src/entity.rs": {
+    "mtime": 1783191837.8880813,
+    "ast_hash": "55bfa15bef99918e936d3a5922f59ac7",
+    "semantic_hash": "55bfa15bef99918e936d3a5922f59ac7"
+  },
+  "heraclitus-index-graph/src/lib.rs": {
+    "mtime": 1783191837.8890834,
+    "ast_hash": "48c8c1a5f98fc7c150640303e957001c",
+    "semantic_hash": "48c8c1a5f98fc7c150640303e957001c"
+  },
+  "heraclitus-index-graph/src/temporal.rs": {
+    "mtime": 1783191837.8975995,
+    "ast_hash": "0a4307d79274e6b0a0278099d6fa779c",
+    "semantic_hash": "0a4307d79274e6b0a0278099d6fa779c"
+  },
+  "heraclitus-index-text/src/lib.rs": {
+    "mtime": 1783028955.7364182,
+    "ast_hash": "c1f1f3bc74893929ed730bc4283cf676",
+    "semantic_hash": "c1f1f3bc74893929ed730bc4283cf676"
+  },
+  "heraclitus-index-vector/benches/hnsw_search.rs": {
+    "mtime": 1783191837.9012065,
+    "ast_hash": "255a0d6a835074a1880e47254fb9d3e8",
+    "semantic_hash": "255a0d6a835074a1880e47254fb9d3e8"
+  },
+  "heraclitus-index-vector/src/lib.rs": {
+    "mtime": 1783191837.906248,
+    "ast_hash": "d9856a2da362353aa9f7d296b50ca1fd",
+    "semantic_hash": "d9856a2da362353aa9f7d296b50ca1fd"
+  },
+  "heraclitus-log/benches/append.rs": {
+    "mtime": 1781085824.9409575,
+    "ast_hash": "787990f301a27a1bef24a669bf25d571",
+    "semantic_hash": "787990f301a27a1bef24a669bf25d571"
+  },
+  "heraclitus-log/examples/crash_writer.rs": {
+    "mtime": 1781066228.4310973,
+    "ast_hash": "426332b488d0e8d968f4c5e229c270e1",
+    "semantic_hash": "426332b488d0e8d968f4c5e229c270e1"
+  },
+  "heraclitus-log/examples/extract_memory.rs": {
+    "mtime": 1783028955.7424622,
+    "ast_hash": "595fdda3b94562f6fee6d6a5365422c0",
+    "semantic_hash": "595fdda3b94562f6fee6d6a5365422c0"
+  },
+  "heraclitus-log/src/format.rs": {
+    "mtime": 1783046898.8191662,
+    "ast_hash": "06b97257b87cf934130f84808aa83048",
+    "semantic_hash": "06b97257b87cf934130f84808aa83048"
+  },
+  "heraclitus-log/src/lib.rs": {
+    "mtime": 1783191837.940251,
+    "ast_hash": "1a6bca97f0719070d13dcc1b302de096",
+    "semantic_hash": "1a6bca97f0719070d13dcc1b302de096"
+  },
+  "heraclitus-log/src/vm_bridge.rs": {
+    "mtime": 1783191837.9422572,
+    "ast_hash": "62f2d16327007a5080b2c8a826a9b8c2",
+    "semantic_hash": "62f2d16327007a5080b2c8a826a9b8c2"
+  },
+  "heraclitus-log/tests/crash_injection.rs": {
+    "mtime": 1781085825.2082713,
+    "ast_hash": "c8bba591ab16507aee1e10cc23357700",
+    "semantic_hash": "c8bba591ab16507aee1e10cc23357700"
+  },
+  "heraclitus-log/tests/v2_compat.rs": {
+    "mtime": 1783191837.9497025,
+    "ast_hash": "5f61ad5a6eac10f4df7d374f457dae98",
+    "semantic_hash": "5f61ad5a6eac10f4df7d374f457dae98"
+  },
+  "heraclitus-manifold/benches/distance.rs": {
+    "mtime": 1781085825.2783237,
+    "ast_hash": "f9941610faa4565ccfdddc64e626e1b2",
+    "semantic_hash": "f9941610faa4565ccfdddc64e626e1b2"
+  },
+  "heraclitus-manifold/src/estimate.rs": {
+    "mtime": 1781085825.3291917,
+    "ast_hash": "9bd54688c1ff063c169312a1c3faedfa",
+    "semantic_hash": "9bd54688c1ff063c169312a1c3faedfa"
+  },
+  "heraclitus-manifold/src/lib.rs": {
+    "mtime": 1783191837.9561882,
+    "ast_hash": "a3e2f82a8ea5a2a4fa22a19220601505",
+    "semantic_hash": "a3e2f82a8ea5a2a4fa22a19220601505"
+  },
+  "heraclitus-memtable/src/lib.rs": {
+    "mtime": 1781102564.8900285,
+    "ast_hash": "758be334d61cdfcaa6de04965c786951",
+    "semantic_hash": "758be334d61cdfcaa6de04965c786951"
+  },
+  "heraclitus-proto/build.rs": {
+    "mtime": 1781088089.1211593,
+    "ast_hash": "568bdea7767070abc1564b5b8986e878",
+    "semantic_hash": "568bdea7767070abc1564b5b8986e878"
+  },
+  "heraclitus-proto/src/lib.rs": {
+    "mtime": 1781088090.0916505,
+    "ast_hash": "619e26cf546e2742d33aef2e552bf39d",
+    "semantic_hash": "619e26cf546e2742d33aef2e552bf39d"
+  },
+  "heraclitus-query/src/ast.rs": {
+    "mtime": 1783191837.972325,
+    "ast_hash": "d0b714a6a5cfde9a70b4392ceeb46ca5",
+    "semantic_hash": "d0b714a6a5cfde9a70b4392ceeb46ca5"
+  },
+  "heraclitus-query/src/backend.rs": {
+    "mtime": 1783191837.981993,
+    "ast_hash": "76858d7d00db005fd1d2768427781753",
+    "semantic_hash": "76858d7d00db005fd1d2768427781753"
+  },
+  "heraclitus-query/src/fusion.rs": {
+    "mtime": 1783191837.9840243,
+    "ast_hash": "25eefbfbea5beab70e2c694839dc7eaf",
+    "semantic_hash": "25eefbfbea5beab70e2c694839dc7eaf"
+  },
+  "heraclitus-query/src/lib.rs": {
+    "mtime": 1783191837.992042,
+    "ast_hash": "acc7c88aabb31711ed6e2ef798a84fd5",
+    "semantic_hash": "acc7c88aabb31711ed6e2ef798a84fd5"
+  },
+  "heraclitus-query/src/plan.rs": {
+    "mtime": 1783191837.9995484,
+    "ast_hash": "e9e1e313c88e65e7a45468fdf313c03e",
+    "semantic_hash": "e9e1e313c88e65e7a45468fdf313c03e"
+  },
+  "heraclitus-raft/src/lib.rs": {
+    "mtime": 1781102227.1208332,
+    "ast_hash": "e09a2ad5a9450c7aae2e2797e865f050",
+    "semantic_hash": "e09a2ad5a9450c7aae2e2797e865f050"
+  },
+  "heraclitus-retrieval/src/lib.rs": {
+    "mtime": 1781085911.382908,
+    "ast_hash": "09050d132dec47438682c1bd862ba2d0",
+    "semantic_hash": "09050d132dec47438682c1bd862ba2d0"
+  },
+  "heraclitus-server/src/bin/service.rs": {
+    "mtime": 1783191838.0079958,
+    "ast_hash": "0ab2edb90958a78a0dfdda73499c39e6",
+    "semantic_hash": "0ab2edb90958a78a0dfdda73499c39e6"
+  },
+  "heraclitus-server/src/boot.rs": {
+    "mtime": 1783191838.0162847,
+    "ast_hash": "80db4f16dc28f1bcba4d7a5a5c527b10",
+    "semantic_hash": "80db4f16dc28f1bcba4d7a5a5c527b10"
+  },
+  "heraclitus-server/src/embedded.rs": {
+    "mtime": 1783191838.0162847,
+    "ast_hash": "560077e12b4af0b8b6d99d57238fa854",
+    "semantic_hash": "560077e12b4af0b8b6d99d57238fa854"
+  },
+  "heraclitus-server/src/engine.rs": {
+    "mtime": 1783191838.0283155,
+    "ast_hash": "3c26603778d74dd9c3273eeeec76ad90",
+    "semantic_hash": "3c26603778d74dd9c3273eeeec76ad90"
+  },
+  "heraclitus-server/src/grpc.rs": {
+    "mtime": 1783045536.9248104,
+    "ast_hash": "f59cf0cdab008ceebfcbd943a29cc1c8",
+    "semantic_hash": "f59cf0cdab008ceebfcbd943a29cc1c8"
+  },
+  "heraclitus-server/src/lib.rs": {
+    "mtime": 1783191838.03233,
+    "ast_hash": "53c4c73144c21af77336c3dde4ca167e",
+    "semantic_hash": "53c4c73144c21af77336c3dde4ca167e"
+  },
+  "heraclitus-server/src/main.rs": {
+    "mtime": 1782360587.537555,
+    "ast_hash": "89fc10264e72cf33f822abe806824ae0",
+    "semantic_hash": "89fc10264e72cf33f822abe806824ae0"
+  },
+  "heraclitus-server/src/rest.rs": {
+    "mtime": 1783191838.0343726,
+    "ast_hash": "9aeda7e083cb1a13701a97fb5bc084e4",
+    "semantic_hash": "9aeda7e083cb1a13701a97fb5bc084e4"
+  },
+  "heraclitus-tier/src/lib.rs": {
+    "mtime": 1783191838.041937,
+    "ast_hash": "326069d9a212aff3acc43bea4ba6aed0",
+    "semantic_hash": "326069d9a212aff3acc43bea4ba6aed0"
+  },
+  "heraclitus-txn/src/lib.rs": {
+    "mtime": 1781086341.8733327,
+    "ast_hash": "91282adc0cd5bda5b856169f3599f2af",
+    "semantic_hash": "91282adc0cd5bda5b856169f3599f2af"
+  },
+  "heraclitus-views/src/lib.rs": {
+    "mtime": 1783191838.0471442,
+    "ast_hash": "612b5d88610afbec96336ec4ef0230da",
+    "semantic_hash": "612b5d88610afbec96336ec4ef0230da"
+  },
+  "heraclitus-views/tests/fast_boot.rs": {
+    "mtime": 1783191838.0488153,
+    "ast_hash": "92fd63403aa7bfecb3926ce641b45c58",
+    "semantic_hash": "92fd63403aa7bfecb3926ce641b45c58"
+  }
+}

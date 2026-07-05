@@ -88,7 +88,11 @@ impl MlDsaSigner {
         use fips204::traits::SerDes as _;
         let (pk, sk) = fips204::ml_dsa_44::try_keygen()
             .map_err(|e| CompError::Unsupported(format!("ML-DSA keygen: {e}")))?;
-        Ok(Self { sk, pk_bytes: pk.into_bytes().to_vec(), subject: subject.into() })
+        Ok(Self {
+            sk,
+            pk_bytes: pk.into_bytes().to_vec(),
+            subject: subject.into(),
+        })
     }
 
     /// Verificação de referência (o par do `sign_snapshot`): o perito pode
@@ -251,9 +255,17 @@ mod tests {
         let data = b"commitment-snapshot";
         let sig = s.sign_snapshot(data).unwrap();
         assert_eq!(sig.subject, "AGU");
-        assert!(MlDsaSigner::verify(&sig.public_key_sec1, data, &sig.signature));
+        assert!(MlDsaSigner::verify(
+            &sig.public_key_sec1,
+            data,
+            &sig.signature
+        ));
         // Adulterar o dado OU a assinatura falha a verificação.
-        assert!(!MlDsaSigner::verify(&sig.public_key_sec1, b"outro", &sig.signature));
+        assert!(!MlDsaSigner::verify(
+            &sig.public_key_sec1,
+            b"outro",
+            &sig.signature
+        ));
         let mut bad = sig.signature.clone();
         bad[0] ^= 0xFF;
         assert!(!MlDsaSigner::verify(&sig.public_key_sec1, data, &bad));
@@ -265,8 +277,16 @@ mod tests {
         let s = HybridSigner::generate("AGU").unwrap();
         let data = b"commitment-snapshot";
         let sig = s.sign_snapshot(data).unwrap();
-        assert!(HybridSigner::verify(&sig.public_key_sec1, data, &sig.signature));
-        assert!(!HybridSigner::verify(&sig.public_key_sec1, b"outro", &sig.signature));
+        assert!(HybridSigner::verify(
+            &sig.public_key_sec1,
+            data,
+            &sig.signature
+        ));
+        assert!(!HybridSigner::verify(
+            &sig.public_key_sec1,
+            b"outro",
+            &sig.signature
+        ));
         // Corromper a componente ML-DSA (cauda) derruba o conjunto.
         let mut bad = sig.signature.clone();
         let last = bad.len() - 1;

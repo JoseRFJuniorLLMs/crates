@@ -11,8 +11,7 @@ use der::{Decode, Encode, Sequence};
 
 /// SHA-256 (`id-sha256`, 2.16.840.1.101.3.4.2.1) — the digest algorithm we
 /// send. blake3 is intentionally *not* used here: ACTs reject unregistered OIDs.
-pub const OID_SHA256: ObjectIdentifier =
-    ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
+pub const OID_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
 
 /// `AlgorithmIdentifier` with NULL parameters (the encoding ACTs expect for
 /// SHA-256).
@@ -25,7 +24,10 @@ pub struct AlgorithmIdentifier {
 
 impl AlgorithmIdentifier {
     pub fn sha256() -> Self {
-        Self { algorithm: OID_SHA256, parameters: Some(Null) }
+        Self {
+            algorithm: OID_SHA256,
+            parameters: Some(Null),
+        }
     }
 }
 
@@ -102,9 +104,6 @@ mod tests {
         assert_eq!(back.nonce, Some(0xDEAD_BEEF));
         assert!(back.cert_req);
         assert_eq!(back.message_imprint.digest_bytes(), &imprint[..]);
-        assert_eq!(
-            back.message_imprint.hash_algorithm.algorithm,
-            OID_SHA256
-        );
+        assert_eq!(back.message_imprint.hash_algorithm.algorithm, OID_SHA256);
     }
 }

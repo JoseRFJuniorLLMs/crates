@@ -65,7 +65,12 @@ fn main() {
         Cmd::Bench { n, dim, queries } => {
             heraclitus_cli::bench_recall(n, dim, queries).to_markdown()
         }
-        Cmd::Anchor { dir, receipts, tsa_url, policy } => {
+        Cmd::Anchor {
+            dir,
+            receipts,
+            tsa_url,
+            policy,
+        } => {
             let rdir = receipts_dir_for(&dir, receipts);
             heraclitus_cli::anchor(&dir, &rdir, tsa_url, policy).unwrap_or_else(|e| e)
         }

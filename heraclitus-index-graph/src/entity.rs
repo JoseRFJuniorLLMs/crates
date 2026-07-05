@@ -115,11 +115,14 @@ impl EntityResolver {
             .collect();
         for key in members {
             self.close_open(&key, lsn);
-            self.mappings.entry(key.clone()).or_default().push(EntityInterval {
-                entity_id: surv.clone(),
-                valid_from_lsn: lsn,
-                valid_to_lsn: None,
-            });
+            self.mappings
+                .entry(key.clone())
+                .or_default()
+                .push(EntityInterval {
+                    entity_id: surv.clone(),
+                    valid_from_lsn: lsn,
+                    valid_to_lsn: None,
+                });
             self.canonical.insert(key.clone(), surv.clone());
             self.groups.entry(surv.clone()).or_default().insert(key);
         }
@@ -138,16 +141,22 @@ impl EntityResolver {
         }
         let old = self.canonical[key].clone();
         self.close_open(key, lsn);
-        self.mappings.entry(key.to_string()).or_default().push(EntityInterval {
-            entity_id: new_id.clone(),
-            valid_from_lsn: lsn,
-            valid_to_lsn: None,
-        });
+        self.mappings
+            .entry(key.to_string())
+            .or_default()
+            .push(EntityInterval {
+                entity_id: new_id.clone(),
+                valid_from_lsn: lsn,
+                valid_to_lsn: None,
+            });
         self.canonical.insert(key.to_string(), new_id.clone());
         if let Some(g) = self.groups.get_mut(&old) {
             g.remove(key);
         }
-        self.groups.entry(new_id).or_default().insert(key.to_string());
+        self.groups
+            .entry(new_id)
+            .or_default()
+            .insert(key.to_string());
     }
 
     /// Derive resolution from one event. `er_op`: `merge` (er_a, er_b) | `split`

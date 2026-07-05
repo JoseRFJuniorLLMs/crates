@@ -37,7 +37,13 @@ pub fn seal(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
     let mut nonce = [0u8; NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce);
     let ct = cipher
-        .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad })
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .expect("chacha20poly1305 encrypt never fails for valid key/nonce");
     let mut out = Vec::with_capacity(ENC_MAGIC.len() + NONCE_LEN + ct.len());
     out.extend_from_slice(&ENC_MAGIC[..]);
@@ -192,7 +198,7 @@ mod tests {
         assert!(ks.shred("eva").unwrap());
         assert!(ks.get("eva").is_none());
         assert!(!ks.shred("eva").unwrap()); // idempotent
-        // a fresh key for the same agent cannot decrypt the old blob
+                                            // a fresh key for the same agent cannot decrypt the old blob
         let k2 = ks.get_or_create("eva").unwrap();
         assert!(open(&k2, &blob, b"eva").is_none());
     }

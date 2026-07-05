@@ -143,7 +143,10 @@ pub struct BeliefPolicy {
 
 impl Default for BeliefPolicy {
     fn default() -> Self {
-        Self { version: 1, eps: 1e-4 }
+        Self {
+            version: 1,
+            eps: 1e-4,
+        }
     }
 }
 
@@ -167,7 +170,10 @@ impl BeliefPolicy {
             return 0.0;
         }
         vs.sort_by(|a, b| a.hypothesis_id.cmp(&b.hypothesis_id));
-        let sum: f32 = vs.iter().map(|v| v.polarity * self.logit(v.confidence)).sum();
+        let sum: f32 = vs
+            .iter()
+            .map(|v| v.polarity * self.logit(v.confidence))
+            .sum();
         1.0 / (1.0 + (-sum).exp()) // sigmoid
     }
 
@@ -527,7 +533,11 @@ impl TemporalGraph {
             .iter()
             .map(|node| *degree.get(node).unwrap_or(&0) as f32)
             .collect();
-        let mean = if n > 0 { degs.iter().sum::<f32>() / n as f32 } else { 0.0 };
+        let mean = if n > 0 {
+            degs.iter().sum::<f32>() / n as f32
+        } else {
+            0.0
+        };
         let var = if n > 0 {
             degs.iter().map(|d| (d - mean) * (d - mean)).sum::<f32>() / n as f32
         } else {
@@ -543,7 +553,11 @@ impl TemporalGraph {
             } else {
                 0.0
             };
-            let anomaly_score = if std > 0.0 { (deg as f32 - mean) / std } else { 0.0 };
+            let anomaly_score = if std > 0.0 {
+                (deg as f32 - mean) / std
+            } else {
+                0.0
+            };
             metrics.insert(
                 node.clone(),
                 NodeMetrics {
@@ -568,7 +582,11 @@ impl TemporalGraph {
     /// crença agregada. Convenção de saída IGUAL ao `analyze`: nó → id da
     /// comunidade, com id = menor nó da comunidade. Em erro interno do Leiden,
     /// degrada para as componentes conexas — nunca pior que o baseline.
-    pub fn communities_leiden(&self, as_of: Lsn, min_confidence: f32) -> BTreeMap<EntityId, EntityId> {
+    pub fn communities_leiden(
+        &self,
+        as_of: Lsn,
+        min_confidence: f32,
+    ) -> BTreeMap<EntityId, EntityId> {
         // Arestas vivas com peso = crença; pares duplicados agregam pesos.
         let mut nodes: BTreeSet<EntityId> = BTreeSet::new();
         let mut weights: BTreeMap<(EntityId, EntityId), f64> = BTreeMap::new();
@@ -614,7 +632,9 @@ impl TemporalGraph {
                 for (_cid, members) in communities {
                     let mut names: Vec<&EntityId> = members.iter().map(|&i| by_index[i]).collect();
                     names.sort();
-                    let Some(&community_id) = names.first() else { continue };
+                    let Some(&community_id) = names.first() else {
+                        continue;
+                    };
                     for n in names {
                         result.insert(n.clone(), community_id.clone());
                     }
@@ -687,7 +707,11 @@ impl TemporalGraph {
             // hipóteses concorrentes).
             (Some(from), Some(to)) => {
                 let edge_id = Self::edge_id(from, to, &etype);
-                let op = e.attrs.get("edge_op").map(|s| s.as_str()).unwrap_or("assert");
+                let op = e
+                    .attrs
+                    .get("edge_op")
+                    .map(|s| s.as_str())
+                    .unwrap_or("assert");
                 if op.eq_ignore_ascii_case("retract") || op.eq_ignore_ascii_case("close") {
                     self.close_edge(&edge_id, lsn);
                 } else {
@@ -699,7 +723,11 @@ impl TemporalGraph {
                         .or_else(|| e.attrs.get("rule"))
                         .cloned()
                         .unwrap_or_else(|| edge_id.clone());
-                    let stance = e.attrs.get("stance").map(|s| s.as_str()).unwrap_or("support");
+                    let stance = e
+                        .attrs
+                        .get("stance")
+                        .map(|s| s.as_str())
+                        .unwrap_or("support");
                     let polarity = if stance.eq_ignore_ascii_case("refute")
                         || stance.eq_ignore_ascii_case("against")
                     {
@@ -870,16 +898,28 @@ mod tests {
             ver("h1", 0.8, &EdgeType::FraudPartner),
             ver("h2", 0.6, &EdgeType::NotRelated),
         ]);
-        assert!(with_neg < only_pos, "evidência negativa deve reduzir a crença");
+        assert!(
+            with_neg < only_pos,
+            "evidência negativa deve reduzir a crença"
+        );
         assert!((0.0..=1.0).contains(&with_neg));
     }
 
     #[test]
     fn belief_independente_de_ordem() {
         let p = BeliefPolicy::default();
-        let a = p.aggregate(&[ver("a", 0.7, &EdgeType::FraudPartner), ver("b", 0.6, &EdgeType::SimilarA)]);
-        let b = p.aggregate(&[ver("b", 0.6, &EdgeType::SimilarA), ver("a", 0.7, &EdgeType::FraudPartner)]);
-        assert!((a - b).abs() < 1e-6, "agregação deve ser determinística/independente de ordem");
+        let a = p.aggregate(&[
+            ver("a", 0.7, &EdgeType::FraudPartner),
+            ver("b", 0.6, &EdgeType::SimilarA),
+        ]);
+        let b = p.aggregate(&[
+            ver("b", 0.6, &EdgeType::SimilarA),
+            ver("a", 0.7, &EdgeType::FraudPartner),
+        ]);
+        assert!(
+            (a - b).abs() < 1e-6,
+            "agregação deve ser determinística/independente de ordem"
+        );
     }
 
     #[test]
@@ -912,14 +952,22 @@ mod tests {
 
         // Baseline: componentes conexas fundem tudo numa comunidade só.
         let cc = g.analyze(100, 0.0).community;
-        assert_eq!(cc.get("A2"), cc.get("B2"), "componentes conexas: 1 comunidade");
+        assert_eq!(
+            cc.get("A2"),
+            cc.get("B2"),
+            "componentes conexas: 1 comunidade"
+        );
 
         // Leiden separa as cliques apesar da ponte.
         let leiden = g.communities_leiden(100, 0.0);
         assert_eq!(leiden.len(), 8, "todos os nós classificados");
         assert_eq!(leiden.get("A1"), leiden.get("A4"), "clique A junta");
         assert_eq!(leiden.get("B1"), leiden.get("B4"), "clique B junta");
-        assert_ne!(leiden.get("A2"), leiden.get("B2"), "cliques separadas pela modularidade");
+        assert_ne!(
+            leiden.get("A2"),
+            leiden.get("B2"),
+            "cliques separadas pela modularidade"
+        );
 
         // Determinismo (§3.5): mesma entrada, mesma partição — sempre.
         let again = g.communities_leiden(100, 0.0);
@@ -930,7 +978,10 @@ mod tests {
         let mut g2 = TemporalGraph::new();
         g2.upsert_edge(
             edge("late", "X", "Y", EdgeType::SocioDe, 50),
-            vec![EdgeVersion { valid_from_lsn: 50, ..ver("late", 0.9, &EdgeType::SocioDe) }],
+            vec![EdgeVersion {
+                valid_from_lsn: 50,
+                ..ver("late", 0.9, &EdgeType::SocioDe)
+            }],
         );
         assert!(g2.communities_leiden(10, 0.0).is_empty());
         assert_eq!(g2.communities_leiden(50, 0.0).len(), 2);
@@ -939,8 +990,10 @@ mod tests {
     #[test]
     fn as_of_esconde_arestas_futuras() {
         let mut g = TemporalGraph::new();
-        g.upsert_edge(edge("e1", "Alfa", "Maria", EdgeType::SocioDe, 10),
-                      vec![ver("h", 0.9, &EdgeType::SocioDe)]);
+        g.upsert_edge(
+            edge("e1", "Alfa", "Maria", EdgeType::SocioDe, 10),
+            vec![ver("h", 0.9, &EdgeType::SocioDe)],
+        );
         // no LSN 5 a aresta (criada no 10) não existe; no 10 existe.
         assert_eq!(g.neighbors(&"Alfa".into(), None, 5, 0.0, 0.0).len(), 0);
         assert_eq!(g.neighbors(&"Alfa".into(), None, 10, 0.0, 0.0).len(), 1);
@@ -950,8 +1003,10 @@ mod tests {
     fn decay_reduz_peso_sem_apagar() {
         // RFC-006: aresta antiga pesa menos, mas continua viva (belief intacto).
         let mut g = TemporalGraph::new();
-        g.upsert_edge(edge("e1", "A", "B", EdgeType::Pagou, 0),
-                      vec![ver("h", 0.9, &EdgeType::Pagou)]);
+        g.upsert_edge(
+            edge("e1", "A", "B", EdgeType::Pagou, 0),
+            vec![ver("h", 0.9, &EdgeType::Pagou)],
+        );
         let nb = g.neighbors(&"A".into(), None, 1000, 0.0, 0.001);
         assert_eq!(nb.len(), 1);
         assert!(nb[0].weight < nb[0].belief, "decay deve reduzir o peso");
@@ -963,14 +1018,23 @@ mod tests {
         // Cadeia de fraude: INSIGHT -> troca -> Alfa ; laranja partilhado liga casos.
         let mut g = TemporalGraph::new();
         let v = |c: f32| vec![ver("h", c, &EdgeType::FraudPartner)];
-        g.upsert_edge(edge("e1", "INSIGHT", "troca", EdgeType::FraudPartner, 1), v(0.9));
-        g.upsert_edge(edge("e2", "troca", "Alfa", EdgeType::FraudPartner, 2), v(0.9));
-        g.upsert_edge(edge("e3", "troca", "Maria", EdgeType::FraudPartner, 3), v(0.9));
+        g.upsert_edge(
+            edge("e1", "INSIGHT", "troca", EdgeType::FraudPartner, 1),
+            v(0.9),
+        );
+        g.upsert_edge(
+            edge("e2", "troca", "Alfa", EdgeType::FraudPartner, 2),
+            v(0.9),
+        );
+        g.upsert_edge(
+            edge("e3", "troca", "Maria", EdgeType::FraudPartner, 3),
+            v(0.9),
+        );
         let reach = g.traverse(&"INSIGHT".into(), 3, 100, 0.5, 0.0);
         let names: BTreeSet<&str> = reach.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains("troca") && names.contains("Alfa") && names.contains("Maria"));
         assert_eq!(g.degree_at(&"troca".into(), 100), 3); // 1 in + 2 out
-        assert_eq!(g.degree_at(&"troca".into(), 2), 2);    // no LSN 2: e1(in)+e2(out); e3 ainda não
+        assert_eq!(g.degree_at(&"troca".into(), 2), 2); // no LSN 2: e1(in)+e2(out); e3 ainda não
     }
 
     use heraclitus_core::{Episode, EventKind};
@@ -1005,8 +1069,11 @@ mod tests {
         assert_eq!(g.edges.len(), 4);
         // 'a' tem como vizinhos de saída 'b' e 'f' (quem o referenciou).
         let a = events[0].1.id.to_string();
-        let outs: BTreeSet<EntityId> =
-            g.neighbors(&a, None, u64::MAX, 0.0, 0.0).into_iter().map(|n| n.to).collect();
+        let outs: BTreeSet<EntityId> = g
+            .neighbors(&a, None, u64::MAX, 0.0, 0.0)
+            .into_iter()
+            .map(|n| n.to)
+            .collect();
         assert_eq!(outs.len(), 2);
     }
 
@@ -1033,7 +1100,11 @@ mod tests {
         for (lsn, e) in &events {
             g2.apply(*lsn, e);
         }
-        assert_eq!(h1, g2.state_hash(), "grafo idêntico em instâncias separadas");
+        assert_eq!(
+            h1,
+            g2.state_hash(),
+            "grafo idêntico em instâncias separadas"
+        );
     }
 
     #[test]
@@ -1093,9 +1164,15 @@ mod tests {
         let socio = TemporalGraph::edge_id("Alfa", "Maria", &EdgeType::SocioDe);
 
         // No LSN 1..4 a aresta sócio existe; em 5 (retract) já não.
-        assert!(alive_ids(&g, 1).contains(&socio), "viva no nascimento (LSN 1)");
+        assert!(
+            alive_ids(&g, 1).contains(&socio),
+            "viva no nascimento (LSN 1)"
+        );
         assert!(alive_ids(&g, 4).contains(&socio), "viva antes do retract");
-        assert!(!alive_ids(&g, 5).contains(&socio), "morta a partir do retract");
+        assert!(
+            !alive_ids(&g, 5).contains(&socio),
+            "morta a partir do retract"
+        );
         // Nada destruído: a aresta permanece no grafo (com valid_to definido).
         assert!(g.edges.contains_key(&socio));
         assert_eq!(g.edges[&socio].valid_to_lsn, Some(5));
@@ -1172,10 +1249,16 @@ mod tests {
         let eid = TemporalGraph::edge_id("X", "Y", &EdgeType::FraudPartner);
         // Ambas as hipóteses estão presentes (uma única aresta, duas versions).
         assert_eq!(g.edges.len(), 1, "uma só aresta topológica");
-        assert_eq!(g.hypotheses_at(&eid, u64::MAX).len(), 2, "duas hipóteses coexistem");
+        assert_eq!(
+            g.hypotheses_at(&eid, u64::MAX).len(),
+            2,
+            "duas hipóteses coexistem"
+        );
 
         // A crença agregada fica abaixo da hipótese de suporte sozinha.
-        let only_support = g.policy.aggregate(&[ver("R1", 0.8, &EdgeType::FraudPartner)]);
+        let only_support = g
+            .policy
+            .aggregate(&[ver("R1", 0.8, &EdgeType::FraudPartner)]);
         assert!(g.belief(&eid) < only_support, "a refutação reduz a crença");
         assert!((0.0..=1.0).contains(&g.belief(&eid)));
     }
@@ -1191,7 +1274,10 @@ mod tests {
         // No LSN 4 só existe R1 (suporte); a partir de 5 entra a refutação.
         assert_eq!(g.hypotheses_at(&eid, 4).len(), 1);
         assert_eq!(g.hypotheses_at(&eid, 5).len(), 2);
-        assert!(g.belief_at(&eid, 4) > g.belief_at(&eid, 5), "AS OF antes da refutação crê mais");
+        assert!(
+            g.belief_at(&eid, 4) > g.belief_at(&eid, 5),
+            "AS OF antes da refutação crê mais"
+        );
     }
 
     #[test]
@@ -1299,7 +1385,7 @@ mod tests {
         g.apply_episode(1, &assert_ep("P", "Q"));
         g.apply_episode(2, &assert_ep("R", "S"));
         g.apply_episode(5, &assert_ep("Q", "R")); // ponte P-Q-R-S
-        // No LSN 4: {P,Q} e {R,S} separados.
+                                                  // No LSN 4: {P,Q} e {R,S} separados.
         let before = g.analyze(4, 0.0);
         assert_ne!(before.community["P"], before.community["R"]);
         // No LSN 5: tudo numa comunidade.

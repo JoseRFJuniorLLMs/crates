@@ -66,13 +66,19 @@ impl Boot {
         } else {
             Mode::Log
         };
-        Self { mode, start: Instant::now() }
+        Self {
+            mode,
+            start: Instant::now(),
+        }
     }
 
     /// A no-op narrator (tests, the CLI, embedded use): builds nothing, prints
     /// nothing. `Engine::open` uses this so non-server callers stay silent.
     pub fn silent() -> Self {
-        Self { mode: Mode::Silent, start: Instant::now() }
+        Self {
+            mode: Mode::Silent,
+            start: Instant::now(),
+        }
     }
 
     /// The flowing-river banner. In log mode this is a single structured line.
@@ -118,11 +124,23 @@ impl Boot {
                 Phase {
                     label: label.to_string(),
                     start: Instant::now(),
-                    kind: PhaseKind::Console { color, stop, handle },
+                    kind: PhaseKind::Console {
+                        color,
+                        stop,
+                        handle,
+                    },
                 }
             }
-            Mode::Log => Phase { label: label.to_string(), start: Instant::now(), kind: PhaseKind::Log },
-            Mode::Silent => Phase { label: label.to_string(), start: Instant::now(), kind: PhaseKind::Silent },
+            Mode::Log => Phase {
+                label: label.to_string(),
+                start: Instant::now(),
+                kind: PhaseKind::Log,
+            },
+            Mode::Silent => Phase {
+                label: label.to_string(),
+                start: Instant::now(),
+                kind: PhaseKind::Silent,
+            },
         }
     }
 
@@ -150,7 +168,8 @@ impl Boot {
                     if detail.is_empty() {
                         let _ = writeln!(o, "{tag_color}{tag}{RESET} {label}");
                     } else {
-                        let _ = writeln!(o, "{tag_color}{tag}{RESET} {label}  {DIM}{detail}{RESET}");
+                        let _ =
+                            writeln!(o, "{tag_color}{tag}{RESET} {label}  {DIM}{detail}{RESET}");
                     }
                 } else if detail.is_empty() {
                     let _ = writeln!(o, "{tag} {label}");
@@ -197,7 +216,11 @@ pub struct Phase {
 }
 
 enum PhaseKind {
-    Console { color: bool, stop: Arc<AtomicBool>, handle: Option<JoinHandle<()>> },
+    Console {
+        color: bool,
+        stop: Arc<AtomicBool>,
+        handle: Option<JoinHandle<()>>,
+    },
     Log,
     Silent,
 }
@@ -217,7 +240,11 @@ impl Phase {
         let el = fmt_dur(self.start.elapsed());
         let label = std::mem::take(&mut self.label);
         match &mut self.kind {
-            PhaseKind::Console { color: col, stop, handle } => {
+            PhaseKind::Console {
+                color: col,
+                stop,
+                handle,
+            } => {
                 stop.store(true, Ordering::Relaxed);
                 if let Some(h) = handle.take() {
                     let _ = h.join();
@@ -227,8 +254,10 @@ impl Phase {
                     if detail.is_empty() {
                         let _ = writeln!(o, "{CLR}{color}{tag}{RESET} {label}  {DIM}{el}{RESET}");
                     } else {
-                        let _ =
-                            writeln!(o, "{CLR}{color}{tag}{RESET} {label}  {DIM}{detail} · {el}{RESET}");
+                        let _ = writeln!(
+                            o,
+                            "{CLR}{color}{tag}{RESET} {label}  {DIM}{detail} · {el}{RESET}"
+                        );
                     }
                 } else if detail.is_empty() {
                     let _ = writeln!(o, "\r{tag} {label}  ({el})");
@@ -289,7 +318,16 @@ fn spin(label: String, color: bool, stop: Arc<AtomicBool>) {
 // ── small helpers (shared with the engine narration) ─────────────────────────
 
 /// Return the style codes, or empty strings when colour is off.
-fn styles(color: bool) -> (&'static str, &'static str, &'static str, &'static str, &'static str, &'static str) {
+fn styles(
+    color: bool,
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
     if color {
         (BOLD, DIM, CYAN, BLUE, WHITE, RESET)
     } else {
@@ -309,7 +347,7 @@ pub(crate) fn group(n: u64) -> String {
     let len = s.len();
     let mut out = String::with_capacity(len + len / 3);
     for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
+        if i > 0 && (len - i).is_multiple_of(3) {
             out.push('.');
         }
         out.push(ch);

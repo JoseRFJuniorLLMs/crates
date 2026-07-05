@@ -46,7 +46,9 @@ pub fn verify_dev_token(
             "imprint do carimbo não corresponde ao commitment recalculado".into(),
         ));
     }
-    Ok(VerifiedTime { gen_unix_ms: info.gen_unix_ms })
+    Ok(VerifiedTime {
+        gen_unix_ms: info.gen_unix_ms,
+    })
 }
 
 #[cfg(test)]

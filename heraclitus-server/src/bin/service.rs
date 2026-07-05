@@ -224,7 +224,11 @@ mod service_runner {
         } else {
             0
         };
-        set_state(ServiceState::Stopped, ServiceControlAccept::empty(), exit_code)?;
+        set_state(
+            ServiceState::Stopped,
+            ServiceControlAccept::empty(),
+            exit_code,
+        )?;
         tracing::info!("stopped");
         result.map_err(Into::into)
     }
@@ -292,8 +296,7 @@ mod service_ctl {
     }
 
     pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
-        let manager =
-            ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
         let service = manager.open_service(
             super::SERVICE_NAME,
             ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
@@ -309,8 +312,7 @@ mod service_ctl {
     }
 
     pub fn status() -> Result<(), Box<dyn std::error::Error>> {
-        let manager =
-            ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
         match manager.open_service(super::SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
             Ok(service) => {
                 let s = service.query_status()?;

@@ -95,7 +95,10 @@ pub fn replay_vm_to_btree(
 ) -> Result<heraclitus_btree::BEpsilonTree, HeraclitusError> {
     let state = replay_vm(log, vm)?;
     // O btree passou a ser file-backed: from_map(path, map) -> io::Result.
-    Ok(heraclitus_btree::BEpsilonTree::from_map(path, state.memory_layers)?)
+    Ok(heraclitus_btree::BEpsilonTree::from_map(
+        path,
+        state.memory_layers,
+    )?)
 }
 
 #[cfg(test)]
@@ -106,8 +109,13 @@ mod tests {
     use heraclitus_core::{Episode, EventId, EventKind, FsyncPolicy};
 
     fn open_log(dir: &std::path::Path) -> Log {
-        Log::open_with_keystore(dir.join("log"), 256 * 1024 * 1024, FsyncPolicy::Always, None)
-            .unwrap()
+        Log::open_with_keystore(
+            dir.join("log"),
+            256 * 1024 * 1024,
+            FsyncPolicy::Always,
+            None,
+        )
+        .unwrap()
     }
 
     /// THE M20.1 COMPLETION GATE: instructions persisted through the log and then
@@ -154,7 +162,10 @@ mod tests {
         assert_eq!(replayed, direct, "replay must equal the direct fold");
 
         // 'a' was deleted, only 'b' survives.
-        assert_eq!(replayed.memory_layers.get(b"b".as_slice()), Some(&b"2".to_vec()));
+        assert_eq!(
+            replayed.memory_layers.get(b"b".as_slice()),
+            Some(&b"2".to_vec())
+        );
         assert!(!replayed.memory_layers.contains_key(b"a".as_slice()));
     }
 
@@ -165,8 +176,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = open_log(dir.path());
 
-        log.append(Episode::new("ag", EventKind::Observation, b"hello".to_vec()))
-            .unwrap();
+        log.append(Episode::new(
+            "ag",
+            EventKind::Observation,
+            b"hello".to_vec(),
+        ))
+        .unwrap();
         append_instruction(
             &log,
             VmVersion(1),
@@ -209,7 +224,11 @@ mod tests {
         append_instruction(
             &log,
             ver,
-            &VmInstruction::Delete { key: b"b".to_vec(), lsn: 3, ev_id: EventId::new() },
+            &VmInstruction::Delete {
+                key: b"b".to_vec(),
+                lsn: 3,
+                ev_id: EventId::new(),
+            },
         )
         .unwrap();
 
@@ -220,7 +239,11 @@ mod tests {
         // chave-a-chave que a árvore == ledger reconstruído (get(k) == ledger[k]).
         // A construção via from_map garante que não há chaves a mais.
         for (k, v) in &state.memory_layers {
-            assert_eq!(tree.get(k).as_ref(), Some(v), "tree deve conter a chave do ledger");
+            assert_eq!(
+                tree.get(k).as_ref(),
+                Some(v),
+                "tree deve conter a chave do ledger"
+            );
         }
 
         // Persist + reload the checkpoint.
@@ -228,7 +251,11 @@ mod tests {
         tree.save(&path).unwrap();
         let loaded = heraclitus_btree::BEpsilonTree::load(&path).unwrap();
         for (k, v) in &state.memory_layers {
-            assert_eq!(loaded.get(k).as_ref(), Some(v), "checkpoint recarregado == ledger");
+            assert_eq!(
+                loaded.get(k).as_ref(),
+                Some(v),
+                "checkpoint recarregado == ledger"
+            );
         }
     }
 }

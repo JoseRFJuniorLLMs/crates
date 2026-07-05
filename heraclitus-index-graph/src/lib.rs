@@ -126,8 +126,16 @@ impl View for GraphIndex {
             dir,
             "graph",
             &GraphSnapshot {
-                out: self.out.iter().map(|e| (*e.key(), e.value().clone())).collect(),
-                inn: self.inn.iter().map(|e| (*e.key(), e.value().clone())).collect(),
+                out: self
+                    .out
+                    .iter()
+                    .map(|e| (*e.key(), e.value().clone()))
+                    .collect(),
+                inn: self
+                    .inn
+                    .iter()
+                    .map(|e| (*e.key(), e.value().clone()))
+                    .collect(),
                 attr,
                 by_internal: self.by_internal.clone(),
                 lsn_of: self.lsn_of.iter().map(|(k, v)| (*k, *v)).collect(),

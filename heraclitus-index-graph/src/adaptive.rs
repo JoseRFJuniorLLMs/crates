@@ -38,7 +38,11 @@ pub fn evaluate_threshold(samples: &[LabeledFlag], threshold: f32) -> PolicyEval
         }
     }
     let total_pos = samples.iter().filter(|s| s.confirmed).count() as f32;
-    let precision = if predicted_n > 0.0 { tp / predicted_n } else { 0.0 };
+    let precision = if predicted_n > 0.0 {
+        tp / predicted_n
+    } else {
+        0.0
+    };
     let recall = if total_pos > 0.0 { tp / total_pos } else { 0.0 };
     let f1 = if precision + recall > 0.0 {
         2.0 * precision * recall / (precision + recall)
@@ -101,8 +105,14 @@ mod tests {
         let learned = evaluate_threshold(&samples, learned_t);
 
         assert!(learned.f1 > default.f1, "learning must improve F1");
-        assert!((learned.precision - 1.0).abs() < 1e-6, "learned precision is perfect");
-        assert!(learned_t > 1.6 && learned_t <= 2.0, "threshold lands above the reject: {learned_t}");
+        assert!(
+            (learned.precision - 1.0).abs() < 1e-6,
+            "learned precision is perfect"
+        );
+        assert!(
+            learned_t > 1.6 && learned_t <= 2.0,
+            "threshold lands above the reject: {learned_t}"
+        );
         // The reject below default (1.0) was never flagged — default precision < 1.
         assert!(default.precision < 1.0);
     }
@@ -110,7 +120,10 @@ mod tests {
     #[test]
     fn deterministic_and_handles_empty() {
         let samples = [s(2.0, true), s(1.0, false)];
-        assert_eq!(learn_threshold(&samples, 1.5), learn_threshold(&samples, 1.5));
+        assert_eq!(
+            learn_threshold(&samples, 1.5),
+            learn_threshold(&samples, 1.5)
+        );
         assert_eq!(learn_threshold(&[], 1.5), 1.5, "no data ⇒ keep the default");
     }
 }

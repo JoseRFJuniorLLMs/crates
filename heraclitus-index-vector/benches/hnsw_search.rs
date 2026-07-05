@@ -3,8 +3,8 @@
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use heraclitus_core::{EventId, ProductPoint};
-use heraclitus_manifold::{project_to_ball, project_to_sphere, ProductMetric};
 use heraclitus_index_vector::VectorIndex;
+use heraclitus_manifold::{project_to_ball, project_to_sphere, ProductMetric};
 
 // Ponto pseudo-aleatório determinístico no product-manifold (a=32, b=8, c=8).
 fn mk_point(seed: u64) -> ProductPoint {

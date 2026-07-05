@@ -526,8 +526,17 @@ mod tests {
 
         // FUSE: B is graph-only (no embedding/text) yet gets lsn 1, not 0.
         let f = execute(&format!("FUSE (\"nothing\", [9.9], \"{a_id}\", 5)"), &be).unwrap();
-        let hit = f.as_array().unwrap().iter().find(|h| h["id"] == b_id).unwrap();
-        assert_eq!(hit["lsn"].as_u64().unwrap(), 1, "graph-only candidate keeps its real lsn");
+        let hit = f
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["id"] == b_id)
+            .unwrap();
+        assert_eq!(
+            hit["lsn"].as_u64().unwrap(),
+            1,
+            "graph-only candidate keeps its real lsn"
+        );
     }
 
     #[test]
@@ -548,19 +557,54 @@ mod tests {
         let be = LogBackend::new(log);
 
         // The baseline everyone agrees on: MATCH (n) AS OF LSN 0 is empty.
-        assert!(execute("MATCH (n) AS OF LSN 0 RETURN n", &be).unwrap().as_array().unwrap().is_empty());
+        assert!(execute("MATCH (n) AS OF LSN 0 RETURN n", &be)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty());
         // Graph + entity reads must agree.
-        assert!(execute("NEIGHBORS (\"A\") AS OF LSN 0", &be).unwrap().as_array().unwrap().is_empty());
-        assert!(execute("MATCH (a)-[r]->(b) AS OF LSN 0 RETURN *", &be).unwrap().as_array().unwrap().is_empty());
-        assert!(execute("TRAVERSE (\"A\", 3) AS OF LSN 0", &be).unwrap().as_array().unwrap().is_empty());
-        assert!(execute("COMMUNITY (\"A\") AS OF LSN 0", &be).unwrap().is_null());
-        assert!(execute("METRICS (\"A\") AS OF LSN 0", &be).unwrap().is_null());
-        assert!(execute("HYPOTHESES (\"A\", \"B\", \"socio_de\") AS OF LSN 0", &be).unwrap().is_null());
+        assert!(execute("NEIGHBORS (\"A\") AS OF LSN 0", &be)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(execute("MATCH (a)-[r]->(b) AS OF LSN 0 RETURN *", &be)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(execute("TRAVERSE (\"A\", 3) AS OF LSN 0", &be)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(execute("COMMUNITY (\"A\") AS OF LSN 0", &be)
+            .unwrap()
+            .is_null());
+        assert!(execute("METRICS (\"A\") AS OF LSN 0", &be)
+            .unwrap()
+            .is_null());
+        assert!(
+            execute("HYPOTHESES (\"A\", \"B\", \"socio_de\") AS OF LSN 0", &be)
+                .unwrap()
+                .is_null()
+        );
         assert!(execute("RESOLVE (\"CPF:1\") AS OF LSN 0", &be).unwrap()["entity_id"].is_null());
-        assert!(execute("CLUSTER (\"CPF:1\") AS OF LSN 0", &be).unwrap().as_array().unwrap().is_empty());
+        assert!(execute("CLUSTER (\"CPF:1\") AS OF LSN 0", &be)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty());
 
         // Sanity: AS OF LSN 1 already sees the edge (lsn 0 < 1).
-        assert_eq!(execute("NEIGHBORS (\"A\") AS OF LSN 1", &be).unwrap().as_array().unwrap().len(), 1);
+        assert_eq!(
+            execute("NEIGHBORS (\"A\") AS OF LSN 1", &be)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -585,7 +629,13 @@ mod tests {
         let be = LogBackend::new(log);
 
         // Reality: A1's community is just triangle A.
-        assert_eq!(execute("COMMUNITY (\"A1\")", &be).unwrap()["members"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            execute("COMMUNITY (\"A1\")", &be).unwrap()["members"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
 
         // Nested counterfactual: bridge A-B (outer) and B-C (inner) compose, so
         // all three triangles join.
@@ -593,10 +643,20 @@ mod tests {
                  THEN SIMULATE ADD EDGE (\"B1\", \"C1\", \"socio_de\") \
                  THEN COMMUNITY (\"A1\")";
         let v = execute(q, &be).unwrap();
-        assert_eq!(v["members"].as_array().unwrap().len(), 9, "nested mutations must compose");
+        assert_eq!(
+            v["members"].as_array().unwrap().len(),
+            9,
+            "nested mutations must compose"
+        );
 
         // Reality unchanged.
-        assert_eq!(execute("COMMUNITY (\"A1\")", &be).unwrap()["members"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            execute("COMMUNITY (\"A1\")", &be).unwrap()["members"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     #[test]
@@ -928,8 +988,14 @@ mod tests {
             e
         };
         for (f, t) in [
-            ("A1", "A2"), ("A2", "A3"), ("A3", "A1"), ("A1", "A3"),
-            ("B1", "B2"), ("B2", "B3"), ("B3", "B1"), ("B1", "B3"),
+            ("A1", "A2"),
+            ("A2", "A3"),
+            ("A3", "A1"),
+            ("A1", "A3"),
+            ("B1", "B2"),
+            ("B2", "B3"),
+            ("B3", "B1"),
+            ("B1", "B3"),
             ("A1", "B1"), // ponte
         ] {
             log.append(mk(f, t)).unwrap();
@@ -938,10 +1004,21 @@ mod tests {
 
         // Nó: campos nativos filtram sem attrs nenhum.
         let v = execute("MATCH (n) VALID AT 1500 RETURN n", &be).unwrap();
-        assert!(v.as_array().unwrap().iter().any(|r| r["content"] == "mandato"));
-        let v = execute("MATCH (n) WHERE n.agent_id = \"ag\" VALID AT 2500 RETURN n", &be).unwrap();
+        assert!(v
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["content"] == "mandato"));
+        let v = execute(
+            "MATCH (n) WHERE n.agent_id = \"ag\" VALID AT 2500 RETURN n",
+            &be,
+        )
+        .unwrap();
         assert!(
-            v.as_array().unwrap().iter().all(|r| r["content"] != "mandato"),
+            v.as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["content"] != "mandato"),
             "fora do intervalo [1000, 2000) o mandato não é válido"
         );
 
@@ -961,7 +1038,10 @@ mod tests {
 
         // COMMUNITY clássico funde tudo; com LEIDEN as cliques separam-se.
         let cc = execute("COMMUNITY (\"A2\")", &be).unwrap();
-        assert!(cc["members"].as_array().unwrap().len() >= 6, "componente única");
+        assert!(
+            cc["members"].as_array().unwrap().len() >= 6,
+            "componente única"
+        );
         let leiden = execute("COMMUNITY (\"A2\", LEIDEN)", &be).unwrap();
         let members: Vec<&str> = leiden["members"]
             .as_array()
@@ -969,8 +1049,13 @@ mod tests {
             .iter()
             .map(|m| m.as_str().unwrap())
             .collect();
-        assert!(members.iter().all(|m| m.starts_with('A')), "só a clique A: {members:?}");
-        assert!(explain("COMMUNITY (\"A2\", LEIDEN)").unwrap().contains("Leiden"));
+        assert!(
+            members.iter().all(|m| m.starts_with('A')),
+            "só a clique A: {members:?}"
+        );
+        assert!(explain("COMMUNITY (\"A2\", LEIDEN)")
+            .unwrap()
+            .contains("Leiden"));
     }
 
     #[test]
@@ -991,13 +1076,18 @@ mod tests {
             e
         };
         // Sócio de 1000 a 2000; sócio desde 1500 (aberto); facto atemporal.
-        log.append(fact("socio_antigo", Some("1000"), Some("2000"))).unwrap(); // lsn 0
+        log.append(fact("socio_antigo", Some("1000"), Some("2000")))
+            .unwrap(); // lsn 0
         log.append(fact("socio_atual", Some("1500"), None)).unwrap(); // lsn 1
         log.append(fact("atemporal", None, None)).unwrap(); // lsn 2
         let be = LogBackend::new(log);
 
         let names = |v: &serde_json::Value| -> Vec<String> {
-            v.as_array().unwrap().iter().map(|r| r["content"].as_str().unwrap().to_string()).collect()
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["content"].as_str().unwrap().to_string())
+                .collect()
         };
 
         // Em t=1200 só o sócio antigo é válido (o atual ainda não começou).
@@ -1036,8 +1126,17 @@ mod tests {
         }
         let be = LogBackend::new(log);
 
-        let v = execute("MATCH (n) WHERE n.valor > 10 AND n.valor < 200 RETURN n", &be).unwrap();
-        let got: Vec<&str> = v.as_array().unwrap().iter().map(|r| r["content"].as_str().unwrap()).collect();
+        let v = execute(
+            "MATCH (n) WHERE n.valor > 10 AND n.valor < 200 RETURN n",
+            &be,
+        )
+        .unwrap();
+        let got: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["content"].as_str().unwrap())
+            .collect();
         assert_eq!(got, vec!["50", "150"]);
 
         // Bounds inclusivos e um só lado.
@@ -1062,12 +1161,20 @@ mod tests {
         let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
         for (name, hyp) in [("perto", 0.10f32), ("meio", 0.50), ("longe", 0.90)] {
             let mut e = Episode::new("ag", EventKind::Observation, name.as_bytes().to_vec());
-            e.embedding = Some(ProductPoint { hyp: vec![hyp], sph: vec![], euc: vec![] });
+            e.embedding = Some(ProductPoint {
+                hyp: vec![hyp],
+                sph: vec![],
+                euc: vec![],
+            });
             log.append(e).unwrap();
         }
         // Sem embedding: nunca casa um filtro DIST_* e vai para o fim no ORDER BY.
-        log.append(Episode::new("ag", EventKind::Observation, b"sem embedding".to_vec()))
-            .unwrap();
+        log.append(Episode::new(
+            "ag",
+            EventKind::Observation,
+            b"sem embedding".to_vec(),
+        ))
+        .unwrap();
         let be = LogBackend::new(log);
 
         // WHERE: só o vizinho hiperbólico próximo de 0.1 passa o corte.
@@ -1087,8 +1194,15 @@ mod tests {
         assert_eq!(contents, vec!["perto", "meio", "longe", "sem embedding"]);
 
         // DESC inverte (o sem-embedding continua tratado como infinito → primeiro).
-        let v = execute("MATCH (n) RETURN n ORDER BY DIST_HYP([0.12]) DESC LIMIT 1", &be).unwrap();
-        assert_eq!(v.as_array().unwrap()[0]["content"].as_str().unwrap(), "sem embedding");
+        let v = execute(
+            "MATCH (n) RETURN n ORDER BY DIST_HYP([0.12]) DESC LIMIT 1",
+            &be,
+        )
+        .unwrap();
+        assert_eq!(
+            v.as_array().unwrap()[0]["content"].as_str().unwrap(),
+            "sem embedding"
+        );
 
         // EXPLAIN mostra a chave de ordenação por distância.
         let s = explain("MATCH (n) RETURN n ORDER BY DIST_PRODUCT([0.1, 0.2])").unwrap();

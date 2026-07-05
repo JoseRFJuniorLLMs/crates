@@ -8,13 +8,13 @@
 use heraclitus_core::{Episode, EventId, HeraclitusError, Lsn, ProductPoint};
 use heraclitus_manifold::{ProductMetric, Signature};
 use heraclitus_views::View;
-use serde::{Deserialize, Serialize};
-use std::path::Path;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use roaring::RoaringBitmap;
+use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::path::Path;
 
 const DEFAULT_M: usize = 16;
 const DEFAULT_EF_CONSTRUCTION: usize = 200;
@@ -157,19 +157,26 @@ impl VectorIndex {
         // Tombstones nunca entram nos RESULTADOS mas continuam a ser
         // atravessados (visited/candidates) — remover nós do grafo partiria a
         // conectividade; excluí-los só da seleção preserva o recall.
-        let passes =
-            |id: u32| !self.tombstones.contains(id) && filter.map(|f| f.contains(id)).unwrap_or(true);
+        let passes = |id: u32| {
+            !self.tombstones.contains(id) && filter.map(|f| f.contains(id)).unwrap_or(true)
+        };
         let mut visited: HashSet<u32> = HashSet::from([entry]);
         let d0 = self.dist(entry, query);
         // `candidates` drives traversal over every reachable node; `results`
         // keeps only filter-passing nodes (the ones we may return).
-        let mut candidates = BinaryHeap::from([Candidate { dist: d0, id: entry }]);
+        let mut candidates = BinaryHeap::from([Candidate {
+            dist: d0,
+            id: entry,
+        }]);
         // `results` como MAX-heap (via Reverse): o pior (maior dist) é o topo, então
         // consultar/descartar o pior é O(1)/O(log ef) em vez do fold O(ef) por
         // vizinho visitado. Semântica de seleção idêntica à versão em Vec.
         let mut results: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
         if passes(entry) {
-            results.push(Reverse(Candidate { dist: d0, id: entry }));
+            results.push(Reverse(Candidate {
+                dist: d0,
+                id: entry,
+            }));
         }
 
         while let Some(c) = candidates.pop() {
@@ -357,7 +364,12 @@ impl VectorIndex {
 
     /// Rescore candidate internal ids with the exact f64 metric, take Top-k.
     /// Tombstones ficam fora do rescore (mesma semântica do search HNSW).
-    fn rescore(&self, query: &ProductPoint, cand: impl Iterator<Item = usize>, k: usize) -> Vec<VectorHit> {
+    fn rescore(
+        &self,
+        query: &ProductPoint,
+        cand: impl Iterator<Item = usize>,
+        k: usize,
+    ) -> Vec<VectorHit> {
         let mut scored: Vec<(f64, usize)> = cand
             .filter(|i| !self.tombstones.contains(*i as u32))
             .map(|i| (self.metric.dist(query, &self.nodes[i].point), i))
@@ -366,7 +378,11 @@ impl VectorIndex {
         scored.truncate(k);
         scored
             .into_iter()
-            .map(|(d, i)| VectorHit { id: self.ids[i], lsn: self.lsns[i], dist: d as f32 })
+            .map(|(d, i)| VectorHit {
+                id: self.ids[i],
+                lsn: self.lsns[i],
+                dist: d as f32,
+            })
             .collect()
     }
 
@@ -542,7 +558,11 @@ mod tests {
             }
         }
         let hits = idx.search(&pt(vec![300.0 / 600.0, 0.02]), 5, 64, Some(&keep));
-        assert_eq!(hits.len(), 5, "push-down must return k even under a 5% filter");
+        assert_eq!(
+            hits.len(),
+            5,
+            "push-down must return k even under a 5% filter"
+        );
         for h in &hits {
             assert!(kept.contains(&h.id), "filtered-out id leaked");
         }
@@ -565,7 +585,7 @@ mod tests {
     /// M20.3.1b2 GATE: GPU-accelerated exact search must equal the f64
     /// brute-force ground truth over the *full* product metric (hyp+sph+euc).
     /// With `--features gpu` on real hardware this validates the wired GPU RECALL
-    /// + CPU rescore; without it, the CPU fallback. Either way the HNSW
+    /// followed by CPU rescore; without it, the CPU fallback. Either way the HNSW
     /// `search()` is untouched.
     #[test]
     fn search_exact_gpu_matches_bruteforce() {
@@ -590,12 +610,20 @@ mod tests {
         let k = 8;
 
         // Ground truth: exact f64 brute-force with the REAL ProductMetric.
-        let mut gt: Vec<(f64, usize)> = (0..120).map(|i| (metric.dist(&query, &mk(i)), i)).collect();
+        let mut gt: Vec<(f64, usize)> =
+            (0..120).map(|i| (metric.dist(&query, &mk(i)), i)).collect();
         gt.sort_by(|a, b| a.0.total_cmp(&b.0));
         let gt_ids: Vec<EventId> = gt.iter().take(k).map(|(_, i)| ids[*i]).collect();
 
-        let got: Vec<EventId> = idx.search_exact_gpu(&query, k).iter().map(|h| h.id).collect();
-        assert_eq!(got, gt_ids, "GPU-accelerated exact search must equal f64 brute-force");
+        let got: Vec<EventId> = idx
+            .search_exact_gpu(&query, k)
+            .iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(
+            got, gt_ids,
+            "GPU-accelerated exact search must equal f64 brute-force"
+        );
     }
 
     #[test]
@@ -666,18 +694,32 @@ mod tests {
             idx.insert(id, i, pt(vec![(i as f32) / 250.0, 0.1]));
         }
         let query = pt(vec![0.4, 0.1]);
-        let before: Vec<EventId> = idx.search(&query, 5, 64, None).iter().map(|h| h.id).collect();
+        let before: Vec<EventId> = idx
+            .search(&query, 5, 64, None)
+            .iter()
+            .map(|h| h.id)
+            .collect();
 
         idx.save_checkpoint(dir.path()).unwrap();
 
         // Nova instância vazia restaura do disco (simula restart).
         let mut restored = VectorIndex::new(ProductMetric::default());
-        assert!(restored.load_checkpoint(dir.path()).unwrap(), "checkpoint deve existir");
+        assert!(
+            restored.load_checkpoint(dir.path()).unwrap(),
+            "checkpoint deve existir"
+        );
         assert_eq!(restored.len(), 200);
         assert_eq!(restored.internal_id(&ids[100]), idx.internal_id(&ids[100]));
-        let after: Vec<EventId> = restored.search(&query, 5, 64, None).iter().map(|h| h.id).collect();
+        let after: Vec<EventId> = restored
+            .search(&query, 5, 64, None)
+            .iter()
+            .map(|h| h.id)
+            .collect();
 
-        assert_eq!(before, after, "busca no índice restaurado deve ser idêntica");
+        assert_eq!(
+            before, after,
+            "busca no índice restaurado deve ser idêntica"
+        );
 
         // Sem ficheiro → restore devolve false (view fica vazia → replay desde 0).
         let empty_dir = tempfile::tempdir().unwrap();

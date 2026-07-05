@@ -31,7 +31,9 @@ pub enum VmCodecError {
     #[error("unknown opcode 0x{0:04x}")]
     UnknownOpcode(u16),
     /// The decoded instruction did not consume exactly the declared payload.
-    #[error("payload length mismatch for opcode 0x{op:04x}: declared {declared}, consumed {consumed}")]
+    #[error(
+        "payload length mismatch for opcode 0x{op:04x}: declared {declared}, consumed {consumed}"
+    )]
     LengthMismatch {
         op: u16,
         declared: usize,
@@ -106,7 +108,12 @@ fn put_bytes(buf: &mut Vec<u8>, b: &[u8]) {
 fn encode_payload(instr: &VmInstruction) -> (u16, Vec<u8>) {
     let mut p = Vec::new();
     match instr {
-        VmInstruction::Upsert { key, val, lsn, ev_id } => {
+        VmInstruction::Upsert {
+            key,
+            val,
+            lsn,
+            ev_id,
+        } => {
             p.extend_from_slice(&lsn.to_be_bytes());
             p.extend_from_slice(&ev_id.0.to_bytes());
             put_bytes(&mut p, key);
@@ -119,7 +126,12 @@ fn encode_payload(instr: &VmInstruction) -> (u16, Vec<u8>) {
             put_bytes(&mut p, key);
             (opcode::OP_DELETE_LE, p)
         }
-        VmInstruction::SplitShard { shard_id, split_key, new_shard_id, lsn } => {
+        VmInstruction::SplitShard {
+            shard_id,
+            split_key,
+            new_shard_id,
+            lsn,
+        } => {
             p.extend_from_slice(&lsn.to_be_bytes());
             p.extend_from_slice(&(*shard_id as u64).to_be_bytes());
             p.extend_from_slice(&(*new_shard_id as u64).to_be_bytes());
@@ -178,7 +190,12 @@ fn decode_payload(op: u16, payload: &[u8]) -> Result<VmInstruction, VmCodecError
             let ev_id = r.event_id()?;
             let key = r.var_bytes()?;
             let val = r.var_bytes()?;
-            VmInstruction::Upsert { key, val, lsn, ev_id }
+            VmInstruction::Upsert {
+                key,
+                val,
+                lsn,
+                ev_id,
+            }
         }
         opcode::OP_DELETE_LE => {
             let lsn = r.u64()?;
@@ -191,7 +208,12 @@ fn decode_payload(op: u16, payload: &[u8]) -> Result<VmInstruction, VmCodecError
             let shard_id = r.u64()? as usize;
             let new_shard_id = r.u64()? as usize;
             let split_key = r.var_bytes()?;
-            VmInstruction::SplitShard { shard_id, split_key, new_shard_id, lsn }
+            VmInstruction::SplitShard {
+                shard_id,
+                split_key,
+                new_shard_id,
+                lsn,
+            }
         }
         other => return Err(VmCodecError::UnknownOpcode(other)),
     };
@@ -279,8 +301,11 @@ mod tests {
         for ins in &stream {
             buf.extend_from_slice(&encode(VmVersion(1), ins));
         }
-        let decoded: Vec<VmInstruction> =
-            decode_stream(&buf).unwrap().into_iter().map(|(_, i)| i).collect();
+        let decoded: Vec<VmInstruction> = decode_stream(&buf)
+            .unwrap()
+            .into_iter()
+            .map(|(_, i)| i)
+            .collect();
         assert_eq!(decoded, stream, "stream must survive the round-trip");
 
         let direct = vm.run(VmState::default(), stream.clone());

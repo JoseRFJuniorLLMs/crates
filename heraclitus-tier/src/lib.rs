@@ -56,7 +56,10 @@ pub struct CompactionPolicy {
 
 impl Default for CompactionPolicy {
     fn default() -> Self {
-        Self { delta_ratio_threshold: 0.3, min_records: 1024 }
+        Self {
+            delta_ratio_threshold: 0.3,
+            min_records: 1024,
+        }
     }
 }
 
@@ -319,21 +322,52 @@ fn segment_to_parquet(bytes: &[u8]) -> Result<Vec<u8>, HeraclitusError> {
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(UInt64Array::from(rows.iter().map(|(l, _)| *l).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(StringArray::from(rows.iter().map(|(_, e)| e.id.to_string()).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(rows.iter().map(|(_, e)| e.agent_id.clone()).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(rows.iter().map(|(_, e)| e.session_id.clone()).collect::<Vec<_>>())),
-            Arc::new(UInt64Array::from(rows.iter().map(|(_, e)| e.ts_hlc).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(rows.iter().map(|(_, e)| kind_label(&e.kind)).collect::<Vec<_>>())),
-            Arc::new(BinaryArray::from(rows.iter().map(|(_, e)| e.content.as_slice()).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(rows.iter().map(|(_, e)| attrs_json(e)).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(rows.iter().map(|(_, e)| parents_json(e)).collect::<Vec<_>>())),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, e)| e.id.to_string())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, e)| e.agent_id.clone())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, e)| e.session_id.clone())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|(_, e)| e.ts_hlc).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, e)| kind_label(&e.kind))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(BinaryArray::from(
+                rows.iter()
+                    .map(|(_, e)| e.content.as_slice())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|(_, e)| attrs_json(e)).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, e)| parents_json(e))
+                    .collect::<Vec<_>>(),
+            )),
         ],
     )
     .map_err(|e| serr(e.to_string()))?;
 
     let mut buf = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut buf, schema, None).map_err(|e| serr(e.to_string()))?;
+    let mut writer =
+        ArrowWriter::try_new(&mut buf, schema, None).map_err(|e| serr(e.to_string()))?;
     writer.write(&batch).map_err(|e| serr(e.to_string()))?;
     writer.close().map_err(|e| serr(e.to_string()))?;
     Ok(buf)
@@ -427,7 +461,10 @@ mod tests {
         let seg = log.sealed_segments()[0].clone();
         let (receipt, _) = tier.demote(&log, seg.id).await.unwrap();
 
-        let ppath = receipt.parquet_path.clone().expect("recibo aponta o parquet");
+        let ppath = receipt
+            .parquet_path
+            .clone()
+            .expect("recibo aponta o parquet");
         let obj = tier.store.get(&ObjPath::from(ppath)).await.unwrap();
         let bytes = obj.bytes().await.unwrap();
 
@@ -442,7 +479,10 @@ mod tests {
             rows += batch.num_rows();
             saw_lsn_col = batch.schema().field_with_name("lsn").is_ok();
         }
-        assert_eq!(rows as u64, receipt.record_count, "parquet == segmento, linha a linha");
+        assert_eq!(
+            rows as u64, receipt.record_count,
+            "parquet == segmento, linha a linha"
+        );
         assert!(saw_lsn_col, "schema colunar com lsn");
     }
 
@@ -463,8 +503,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(new_receipt.compacted_from.as_deref(), Some(receipt.object_path.as_str()));
-        assert_eq!(new_receipt.record_count + new_receipt.dropped, receipt.record_count);
+        assert_eq!(
+            new_receipt.compacted_from.as_deref(),
+            Some(receipt.object_path.as_str())
+        );
+        assert_eq!(
+            new_receipt.record_count + new_receipt.dropped,
+            receipt.record_count
+        );
         assert!(new_receipt.dropped > 0);
         assert_ne!(new_receipt.blake3_root, receipt.blake3_root, "raiz nova");
 
@@ -476,7 +522,10 @@ mod tests {
         // O recall devolve SÓ os sobreviventes (LSNs pares).
         let cold = tier.fetch_cold(&new_receipt).await.unwrap();
         assert_eq!(cold.len() as u64, new_receipt.record_count);
-        assert!(cold.iter().all(|(l, _)| l % 2 == 0), "só os pares sobrevivem");
+        assert!(
+            cold.iter().all(|(l, _)| l % 2 == 0),
+            "só os pares sobrevivem"
+        );
 
         // Compaction em cadeia: geração seguinte -c2 funciona sobre -c1.
         let (gen2, _) = tier

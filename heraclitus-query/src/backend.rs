@@ -5,16 +5,16 @@
 
 use crate::ast::{SimulateOp, Value};
 use crate::fusion::{FusedHit, FusionInput, FusionWeights};
-use heraclitus_core::{Episode, EventId, EventKind, HeraclitusError, Lsn};
+use arc_swap::ArcSwap;
+use heraclitus_core::{Episode, EventKind, HeraclitusError, Lsn};
 use heraclitus_index_graph::adaptive::{self, LabeledFlag, PolicyEval};
 use heraclitus_index_graph::decision::{self, DecisionPolicy};
 use heraclitus_index_graph::entity::EntityResolver;
 use heraclitus_index_graph::temporal::{Edge, EdgeType, EdgeVersion, TemporalGraph};
 use heraclitus_log::Log;
-use std::collections::{BTreeMap, HashMap, BinaryHeap, BTreeSet};
-use std::sync::{Arc, Mutex};
 use std::cmp::{Ordering, Reverse};
-use arc_swap::ArcSwap;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
+use std::sync::{Arc, Mutex};
 
 // --- Estruturas Públicas de Linha e Resultados de Query (API M8-M17) ---
 
@@ -125,7 +125,9 @@ struct MinScoreEntry {
 impl Eq for MinScoreEntry {}
 impl Ord for MinScoreEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        other.score.total_cmp(&self.score)
+        other
+            .score
+            .total_cmp(&self.score)
             .then_with(|| other.lsn.cmp(&self.lsn))
     }
 }
@@ -151,7 +153,7 @@ struct HnswIndex {
     pub nodes: HashMap<Lsn, Vec<f32>>,
     // Camadas usam Arc<Vec<Lsn>> para permitir Copy-On-Write ultra-veloz de ponteiros no sync
     pub layers: Vec<HashMap<Lsn, Arc<Vec<Lsn>>>>,
-    pub entry_points: Vec<Lsn>, 
+    pub entry_points: Vec<Lsn>,
 }
 
 impl HnswIndex {
@@ -169,27 +171,47 @@ impl HnswIndex {
         let u = (((seed & 0xFFFFFFFF) as f64) / (u32::MAX as f64)).max(1e-10);
         let m_l = 1.0 / (12.0f64.ln());
         let level = (-u.ln() * m_l).floor() as usize;
-        level.min(4) 
+        level.min(4)
     }
 
     /// Implementação de seleção heurística com base em caminhos alternativos do HNSW original
     /// Impede o colapso do grafo ANN em cliques isolados e limita a densidade local controlando $O(M \log M)$
-    fn select_neighbors_heuristic(&self, base_vec: &[f32], mut candidates: Vec<Lsn>, m: usize) -> Vec<Lsn> {
-        if candidates.len() <= m { return candidates; }
-        
+    fn select_neighbors_heuristic(
+        &self,
+        base_vec: &[f32],
+        mut candidates: Vec<Lsn>,
+        m: usize,
+    ) -> Vec<Lsn> {
+        if candidates.len() <= m {
+            return candidates;
+        }
+
         let mut result = Vec::with_capacity(m);
         // Ordena candidatos por proximidade absoluta ao nó inserido
         candidates.sort_by(|a, b| {
-            let d1 = self.nodes.get(a).map(|v| self.compute_distance(base_vec, v)).unwrap_or(f32::MAX);
-            let d2 = self.nodes.get(b).map(|v| self.compute_distance(base_vec, v)).unwrap_or(f32::MAX);
+            let d1 = self
+                .nodes
+                .get(a)
+                .map(|v| self.compute_distance(base_vec, v))
+                .unwrap_or(f32::MAX);
+            let d2 = self
+                .nodes
+                .get(b)
+                .map(|v| self.compute_distance(base_vec, v))
+                .unwrap_or(f32::MAX);
             d1.total_cmp(&d2)
         });
 
         for c in candidates {
-            if result.len() >= m { break; }
-            let c_vec = match self.nodes.get(&c) { Some(v) => v, None => continue };
+            if result.len() >= m {
+                break;
+            }
+            let c_vec = match self.nodes.get(&c) {
+                Some(v) => v,
+                None => continue,
+            };
             let d_to_base = self.compute_distance(base_vec, c_vec);
-            
+
             let mut keep = true;
             for r in &result {
                 if let Some(r_vec) = self.nodes.get(r) {
@@ -201,20 +223,28 @@ impl HnswIndex {
                     }
                 }
             }
-            if keep { result.push(c); }
+            if keep {
+                result.push(c);
+            }
         }
         result
     }
 
     pub fn search_layer_greedy(&self, query: &[f32], bound: Lsn) -> Option<Lsn> {
-        if self.entry_points.is_empty() { return None; }
-        
+        if self.entry_points.is_empty() {
+            return None;
+        }
+
         let mut current_node = None;
         for &ep in self.entry_points.iter().rev() {
             if ep < bound {
                 // Invariante de Camada M29: Verifica se o nó realmente existe no mapa da camada correspondente
                 let layer_idx = self.entry_points.iter().position(|&x| x == ep).unwrap_or(0);
-                if self.layers.get(layer_idx).map_or(false, |l| l.contains_key(&ep)) {
+                if self
+                    .layers
+                    .get(layer_idx)
+                    .is_some_and(|l| l.contains_key(&ep))
+                {
                     current_node = Some(ep);
                     break;
                 }
@@ -244,11 +274,17 @@ impl HnswIndex {
             let mut changed = true;
             while changed {
                 changed = false;
-                if let Some(neighbors) = self.layers.get(layer_idx).and_then(|l| l.get(&current_node)) {
+                if let Some(neighbors) = self
+                    .layers
+                    .get(layer_idx)
+                    .and_then(|l| l.get(&current_node))
+                {
                     if let Some(current_vec) = self.nodes.get(&current_node) {
                         let mut current_dist = self.compute_distance(query, current_vec);
                         for &neighbor in neighbors.iter() {
-                            if neighbor >= bound { continue; }
+                            if neighbor >= bound {
+                                continue;
+                            }
                             if let Some(neighbor_vec) = self.nodes.get(&neighbor) {
                                 let dist = self.compute_distance(query, neighbor_vec);
                                 if dist < current_dist {
@@ -268,7 +304,7 @@ impl HnswIndex {
     pub fn insert(&mut self, lsn: Lsn, vector: Vec<f32>) {
         self.nodes.insert(lsn, vector.clone());
         let target_layer = self.pick_random_layer(lsn);
-        
+
         while self.layers.len() <= target_layer {
             self.layers.push(HashMap::new());
         }
@@ -287,12 +323,16 @@ impl HnswIndex {
         const M: usize = 12;
         let mut current_entry = self.entry_points[self.layers.len() - 1];
         let start_layer = self.layers.len() - 1;
-        
+
         for layer_idx in (target_layer + 1..=start_layer).rev() {
             let mut changed = true;
             while changed {
                 changed = false;
-                if let Some(neighbors) = self.layers.get(layer_idx).and_then(|l| l.get(&current_entry)) {
+                if let Some(neighbors) = self
+                    .layers
+                    .get(layer_idx)
+                    .and_then(|l| l.get(&current_entry))
+                {
                     if let Some(entry_vec) = self.nodes.get(&current_entry) {
                         let mut current_dist = self.compute_distance(&vector, entry_vec);
                         for &neighbor in neighbors.iter() {
@@ -315,13 +355,17 @@ impl HnswIndex {
         let mut current_node = current_entry;
         for layer_idx in (0..=target_layer).rev() {
             self.layers[layer_idx].insert(lsn, Arc::new(Vec::new()));
-            
+
             let mut changed = true;
             while changed {
                 changed = false;
-                if let Some(neighbors) = self.layers.get(layer_idx).and_then(|l| l.get(&current_node)) {
+                if let Some(neighbors) = self
+                    .layers
+                    .get(layer_idx)
+                    .and_then(|l| l.get(&current_node))
+                {
                     if let Some(node_vec) = self.nodes.get(&current_node) {
-                        let mut current_dist = self.compute_distance(&vector, node_vec);
+                        let current_dist = self.compute_distance(&vector, node_vec);
                         for &neighbor in neighbors.iter() {
                             if neighbor < lsn {
                                 if let Some(n_vec) = self.nodes.get(&neighbor) {
@@ -338,10 +382,14 @@ impl HnswIndex {
             }
 
             let mut candidates = vec![current_node];
-            if let Some(neighbors) = self.layers.get(layer_idx).and_then(|l| l.get(&current_node)) {
+            if let Some(neighbors) = self
+                .layers
+                .get(layer_idx)
+                .and_then(|l| l.get(&current_node))
+            {
                 candidates.extend(neighbors.iter().cloned().filter(|&n| n < lsn));
             }
-            
+
             // Substituição do truncate burro pela poda de diversidade espacial estruturada M29
             let selected = self.select_neighbors_heuristic(&vector, candidates, M);
 
@@ -403,7 +451,10 @@ struct PostingCursor<'a> {
 
 impl<'a> PostingCursor<'a> {
     fn new(slice: &'a [(Lsn, f32)], idf: f32) -> Self {
-        let max_tf = slice.iter().map(|&(_, tf)| tf).fold(0.0f32, |m, v| m.max(v));
+        let max_tf = slice
+            .iter()
+            .map(|&(_, tf)| tf)
+            .fold(0.0f32, |m, v| m.max(v));
         Self {
             slice,
             cursor: 0,
@@ -419,7 +470,10 @@ impl<'a> PostingCursor<'a> {
 
     #[inline(always)]
     fn current_tf(&self) -> f32 {
-        self.slice.get(self.cursor).map(|&(_, tf)| tf).unwrap_or(0.0f32)
+        self.slice
+            .get(self.cursor)
+            .map(|&(_, tf)| tf)
+            .unwrap_or(0.0f32)
     }
 
     #[inline(always)]
@@ -451,9 +505,18 @@ pub trait QueryBackend {
     fn scan_range(&self, from: Lsn, to: Lsn) -> Result<Vec<(Lsn, Episode)>, HeraclitusError>;
     fn head(&self) -> Result<Lsn, HeraclitusError>;
     fn graph(&self) -> Result<TemporalGraph, HeraclitusError>;
-    fn append(&self, label: Option<&str>, props: &[(String, Value)]) -> Result<Lsn, HeraclitusError>;
-    
-    fn attr_lookup(&self, field: &str, value: &str, as_of: Option<Lsn>) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError>;
+    fn append(
+        &self,
+        label: Option<&str>,
+        props: &[(String, Value)],
+    ) -> Result<Lsn, HeraclitusError>;
+
+    fn attr_lookup(
+        &self,
+        field: &str,
+        value: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError>;
     /// Range NUMÉRICO sobre um atributo (`WHERE n.campo > x AND n.campo < y`)
     /// resolvido pelo índice ordenado em vez do scan. Bounds `(valor,
     /// inclusivo?)`. Default `Ok(None)` = backend sem a capacidade → o planner
@@ -468,43 +531,111 @@ pub trait QueryBackend {
     ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
         Ok(None)
     }
-    fn recall(&self, text: &str, k: usize, as_of: Option<Lsn>) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError>;
-    fn nearest(&self, vector: &[f32], k: usize, as_of: Option<Lsn>) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError>;
-    
+    fn recall(
+        &self,
+        text: &str,
+        k: usize,
+        as_of: Option<Lsn>,
+    ) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError>;
+    fn nearest(
+        &self,
+        vector: &[f32],
+        k: usize,
+        as_of: Option<Lsn>,
+    ) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError>;
+
     fn provenance(&self, id: &str) -> Result<Vec<String>, HeraclitusError>;
-    fn neighbors(&self, node: &str, etype: Option<&str>, as_of: Option<Lsn>, min_confidence: f32) -> Result<Vec<NeighborRow>, HeraclitusError>;
-    fn traverse(&self, start: &str, max_depth: usize, as_of: Option<Lsn>, min_confidence: f32) -> Result<Vec<(String, usize)>, HeraclitusError>;
-    fn match_edges(&self, src: Option<&str>, etype: Option<&str>, dst: Option<&str>, as_of: Option<Lsn>) -> Result<Vec<EdgeRow>, HeraclitusError>;
-    fn community(&self, node: &str, as_of: Option<Lsn>) -> Result<Option<CommunityResult>, HeraclitusError>;
+    fn neighbors(
+        &self,
+        node: &str,
+        etype: Option<&str>,
+        as_of: Option<Lsn>,
+        min_confidence: f32,
+    ) -> Result<Vec<NeighborRow>, HeraclitusError>;
+    fn traverse(
+        &self,
+        start: &str,
+        max_depth: usize,
+        as_of: Option<Lsn>,
+        min_confidence: f32,
+    ) -> Result<Vec<(String, usize)>, HeraclitusError>;
+    fn match_edges(
+        &self,
+        src: Option<&str>,
+        etype: Option<&str>,
+        dst: Option<&str>,
+        as_of: Option<Lsn>,
+    ) -> Result<Vec<EdgeRow>, HeraclitusError>;
+    fn community(
+        &self,
+        node: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<CommunityResult>, HeraclitusError>;
     /// Comunidades por LEIDEN (modularidade) — `COMMUNITY ("n", LEIDEN)`.
     /// Default: cai nas componentes conexas do `community` (backends sem a
     /// capacidade continuam corretos, só menos finos).
-    fn community_leiden(&self, node: &str, as_of: Option<Lsn>) -> Result<Option<CommunityResult>, HeraclitusError> {
+    fn community_leiden(
+        &self,
+        node: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<CommunityResult>, HeraclitusError> {
         self.community(node, as_of)
     }
-    fn node_metrics(&self, node: &str, as_of: Option<Lsn>) -> Result<Option<MetricsResult>, HeraclitusError>;
-    fn edge_hypotheses(&self, from: &str, to: &str, etype: &str, as_of: Option<Lsn>) -> Result<Option<EdgeHypotheses>, HeraclitusError>;
+    fn node_metrics(
+        &self,
+        node: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<MetricsResult>, HeraclitusError>;
+    fn edge_hypotheses(
+        &self,
+        from: &str,
+        to: &str,
+        etype: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<EdgeHypotheses>, HeraclitusError>;
     fn lsn_for_timestamp(&self, ts_ms: u64) -> Result<Lsn, HeraclitusError>;
-    fn resolve_entity(&self, key: &str, as_of: Option<Lsn>) -> Result<Option<String>, HeraclitusError>;
-    fn entity_cluster(&self, entity_id: &str, as_of: Option<Lsn>) -> Result<Vec<String>, HeraclitusError>;
+    fn resolve_entity(
+        &self,
+        key: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<String>, HeraclitusError>;
+    fn entity_cluster(
+        &self,
+        entity_id: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Vec<String>, HeraclitusError>;
 
-    fn why(&self, target: &str, max_depth: usize, as_of: Option<Lsn>) -> Result<Trace, HeraclitusError> {
+    fn why(
+        &self,
+        target: &str,
+        max_depth: usize,
+        as_of: Option<Lsn>,
+    ) -> Result<Trace, HeraclitusError> {
         let bound = self.resolve_as_of_bound(as_of)?;
         let events = self.scan_range(0, bound)?;
         let present: BTreeSet<String> = events.iter().map(|(_, e)| e.id.to_string()).collect();
         let mut parents: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (_, e) in &events {
-            let ps: Vec<String> = e.parents.iter().map(|p| p.to_string()).filter(|p| present.contains(p)).collect();
+            let ps: Vec<String> = e
+                .parents
+                .iter()
+                .map(|p| p.to_string())
+                .filter(|p| present.contains(p))
+                .collect();
             parents.insert(e.id.to_string(), ps);
         }
         Ok(trace_causes(&parents, target, max_depth))
     }
 
-    fn decide(&self, policy: DecisionPolicy, as_of: Option<Lsn>) -> Result<DecisionReport, HeraclitusError> {
+    fn decide(
+        &self,
+        policy: DecisionPolicy,
+        as_of: Option<Lsn>,
+    ) -> Result<DecisionReport, HeraclitusError> {
         let bound = self.resolve_as_of_bound(as_of)?;
         let mut g = TemporalGraph::new();
         let mut existing = BTreeSet::new();
-        
+
         let snapshot_events = self.scan_range(0, bound)?;
         for (lsn, e) in snapshot_events {
             g.apply_episode(lsn, &e);
@@ -549,7 +680,11 @@ pub trait QueryBackend {
             .filter(|(_, e)| e.attrs.get("feedback_rule").map(|r| r.as_str()) == Some(rule))
             .filter_map(|(_, e)| {
                 let score = e.attrs.get("score")?.parse::<f32>().ok()?;
-                let confirmed = e.attrs.get("verdict").map(|v| v == "confirm").unwrap_or(false);
+                let confirmed = e
+                    .attrs
+                    .get("verdict")
+                    .map(|v| v == "confirm")
+                    .unwrap_or(false);
                 Some(LabeledFlag { score, confirmed })
             })
             .collect();
@@ -565,7 +700,15 @@ pub trait QueryBackend {
         })
     }
 
-    fn find_fused(&self, text: &str, vector: &[f32], connected_to: &str, weights: FusionWeights, k: usize, as_of: Option<Lsn>) -> Result<Vec<FusedHit>, HeraclitusError> {
+    fn find_fused(
+        &self,
+        text: &str,
+        vector: &[f32],
+        connected_to: &str,
+        weights: FusionWeights,
+        k: usize,
+        as_of: Option<Lsn>,
+    ) -> Result<Vec<FusedHit>, HeraclitusError> {
         let fetch = (k * 4).max(8);
         let head_lsn = self.head()?;
 
@@ -592,17 +735,23 @@ pub trait QueryBackend {
         let mut rows: HashMap<String, (u64, FusionInput)> = HashMap::with_capacity(fetch * 3);
         for (id, lsn, sc) in graph_ch {
             let entry = rows.entry(id).or_insert((0, FusionInput::default()));
-            if lsn > entry.0 { entry.0 = lsn; }
+            if lsn > entry.0 {
+                entry.0 = lsn;
+            }
             entry.1.graph_score = sc;
         }
         for (id, lsn, sc) in vec_ch {
             let entry = rows.entry(id).or_insert((0, FusionInput::default()));
-            if lsn > entry.0 { entry.0 = lsn; }
+            if lsn > entry.0 {
+                entry.0 = lsn;
+            }
             entry.1.vector_score = sc;
         }
         for (id, lsn, sc) in txt_ch {
             let entry = rows.entry(id).or_insert((0, FusionInput::default()));
-            if lsn > entry.0 { entry.0 = lsn; }
+            if lsn > entry.0 {
+                entry.0 = lsn;
+            }
             entry.1.text_score = sc;
         }
 
@@ -630,7 +779,7 @@ pub trait QueryBackend {
     fn resolve_as_of_bound(&self, as_of: Option<Lsn>) -> Result<Lsn, HeraclitusError> {
         match as_of {
             Some(explicit_lsn) => Ok(explicit_lsn),
-            None => self.head()
+            None => self.head(),
         }
     }
 }
@@ -675,34 +824,36 @@ impl LogBackend {
         // Captura monotônica blindada do HEAD físico real antes da janela de processamento
         let pinned_head = self.log.head();
         let current_bundle = self.bundle.load();
-        
+
         if current_bundle.lsn >= pinned_head {
             return Ok(self.bundle.load_full());
         }
 
         let _guard = self.sync_mutex.lock().unwrap();
-        
+
         let current_bundle = self.bundle.load();
         if current_bundle.lsn >= pinned_head {
             return Ok(self.bundle.load_full());
         }
 
         let start_lsn = current_bundle.lsn;
-        
+
         // CORRIGIDO: Eliminação da re-materialização profunda $O(N+E)$.
         // Copiamos os top-level maps por ponteiro imutável compartilhando as sub-listas internas via Arc.
-        let mut updated_graph = (*current_bundle.graph).clone(); 
+        let mut updated_graph = (*current_bundle.graph).clone();
         let mut updated_resolver = (*current_bundle.resolver).clone();
         let mut updated_text = (*current_bundle.text_index).clone();
         let mut updated_attr = (*current_bundle.attr_index).clone();
         let mut updated_vector = (*current_bundle.vector_index).clone();
 
-        let delta = self.log.scan_capped(start_lsn, pinned_head + 1, usize::MAX)?;
+        let delta = self
+            .log
+            .scan_capped(start_lsn, pinned_head + 1, usize::MAX)?;
         for (lsn, ep) in delta {
             if lsn >= start_lsn && lsn <= pinned_head {
                 updated_graph.apply_episode(lsn, &ep);
                 updated_resolver.apply_episode(lsn, &ep);
-                
+
                 // Ingestão incremental com CoW granular. O tf persistido é a
                 // contagem BRUTA do termo (não normalizada pelo comprimento do
                 // doc): a semântica de referência do RECALL — e o gate M10 de
@@ -711,7 +862,10 @@ impl LogBackend {
                 let content_str = String::from_utf8_lossy(&ep.content).to_lowercase();
                 let mut local_frequencies: HashMap<String, f32> = HashMap::new();
 
-                for token in content_str.split(|c: char| !c.is_alphanumeric()).filter(|s| !s.is_empty()) {
+                for token in content_str
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|s| !s.is_empty())
+                {
                     *local_frequencies.entry(token.to_string()).or_insert(0.0f32) += 1.0f32;
                 }
 
@@ -721,12 +875,18 @@ impl LogBackend {
                 }
 
                 for (field, value) in &ep.attrs {
-                    let postings = updated_attr.attributes.entry(field.clone()).or_default().entry(value.clone()).or_default();
+                    let postings = updated_attr
+                        .attributes
+                        .entry(field.clone())
+                        .or_default()
+                        .entry(value.clone())
+                        .or_default();
                     Arc::make_mut(postings).push(lsn);
                 }
 
                 if let Some(emb) = &ep.embedding {
-                    let mut flat_vector = Vec::with_capacity(emb.hyp.len() + emb.sph.len() + emb.euc.len());
+                    let mut flat_vector =
+                        Vec::with_capacity(emb.hyp.len() + emb.sph.len() + emb.euc.len());
                     flat_vector.extend(&emb.hyp);
                     flat_vector.extend(&emb.sph);
                     flat_vector.extend(&emb.euc);
@@ -734,7 +894,7 @@ impl LogBackend {
                 }
             }
         }
-        
+
         updated_resolver.watermark = pinned_head;
 
         let new_bundle = SnapshotBundle {
@@ -769,12 +929,21 @@ impl QueryBackend for LogBackend {
         Ok((*self.sync_bundle()?.graph).clone())
     }
 
-    fn attr_lookup(&self, field: &str, value: &str, as_of: Option<Lsn>) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+    fn attr_lookup(
+        &self,
+        field: &str,
+        value: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
         let b = self.sync_bundle()?;
         let bound = self.resolve_as_of_bound(as_of)?;
 
-        let Some(values_map) = b.attr_index.attributes.get(field) else { return Ok(None); };
-        let Some(postings) = values_map.get(value) else { return Ok(None); };
+        let Some(values_map) = b.attr_index.attributes.get(field) else {
+            return Ok(None);
+        };
+        let Some(postings) = values_map.get(value) else {
+            return Ok(None);
+        };
 
         let idx = match postings.binary_search(&bound) {
             Ok(found_idx) => found_idx,
@@ -782,7 +951,9 @@ impl QueryBackend for LogBackend {
         };
 
         let target_lsns = &postings[..idx];
-        if target_lsns.is_empty() { return Ok(None); }
+        if target_lsns.is_empty() {
+            return Ok(None);
+        }
 
         let mut results = Vec::with_capacity(target_lsns.len());
         for &lsn in target_lsns {
@@ -806,16 +977,20 @@ impl QueryBackend for LogBackend {
         let b = self.sync_bundle()?;
         let bound = self.resolve_as_of_bound(as_of)?;
 
-        let Some(values_map) = b.attr_index.attributes.get(field) else { return Ok(None); };
+        let Some(values_map) = b.attr_index.attributes.get(field) else {
+            return Ok(None);
+        };
 
         let in_range = |n: f64| {
-            min.map_or(true, |(m, inc)| if inc { n >= m } else { n > m })
-                && max.map_or(true, |(m, inc)| if inc { n <= m } else { n < m })
+            min.is_none_or(|(m, inc)| if inc { n >= m } else { n > m })
+                && max.is_none_or(|(m, inc)| if inc { n <= m } else { n < m })
         };
 
         let mut lsns: Vec<Lsn> = Vec::new();
         for (value, postings) in values_map.iter() {
-            let Ok(n) = value.trim().parse::<f64>() else { continue };
+            let Ok(n) = value.trim().parse::<f64>() else {
+                continue;
+            };
             if !n.is_finite() || !in_range(n) {
                 continue;
             }
@@ -841,16 +1016,24 @@ impl QueryBackend for LogBackend {
     }
 
     /// CORRIGIDO: WAND determinístico sem reorder global $O(k \log k)$ e com garantia de avanço monotônico livre de skips.
-    fn recall(&self, text: &str, k: usize, as_of: Option<Lsn>) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
+    fn recall(
+        &self,
+        text: &str,
+        k: usize,
+        as_of: Option<Lsn>,
+    ) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
         let b = self.sync_bundle()?;
         let bound = self.resolve_as_of_bound(as_of)?;
-        let tokens: Vec<String> = text.to_lowercase()
+        let tokens: Vec<String> = text
+            .to_lowercase()
             .split(|c: char| !c.is_alphanumeric())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .collect();
 
-        if tokens.is_empty() { return Ok(Vec::new()); }
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
 
         let total_docs = b.text_index.total_docs.max(1);
         let mut cursors = Vec::with_capacity(tokens.len());
@@ -864,13 +1047,17 @@ impl QueryBackend for LogBackend {
                 let active_slice = &postings[..idx];
                 if !active_slice.is_empty() {
                     let df = active_slice.len() as f32;
-                    let idf = (1.0 + ((total_docs as f32 - df + 0.5) / (df + 0.5))).ln().max(0.0001f32);
+                    let idf = (1.0 + ((total_docs as f32 - df + 0.5) / (df + 0.5)))
+                        .ln()
+                        .max(0.0001f32);
                     cursors.push(PostingCursor::new(active_slice, idf));
                 }
             }
         }
 
-        if cursors.is_empty() { return Ok(Vec::new()); }
+        if cursors.is_empty() {
+            return Ok(Vec::new());
+        }
 
         let mut top_k_heap: BinaryHeap<MinScoreEntry> = BinaryHeap::with_capacity(k);
         let mut score_accumulator: HashMap<Lsn, f32> = HashMap::new();
@@ -885,7 +1072,9 @@ impl QueryBackend for LogBackend {
                 }
             }
 
-            let Some(pivot_lsn) = min_lsn else { break; };
+            let Some(pivot_lsn) = min_lsn else {
+                break;
+            };
 
             let mut accumulated_upper_bound = 0.0f32;
             let mut met_threshold = false;
@@ -900,7 +1089,9 @@ impl QueryBackend for LogBackend {
                 }
             }
 
-            if !met_threshold { break; }
+            if !met_threshold {
+                break;
+            }
 
             // Avaliação e avanço determinístico sincronizado: Garante progresso real descartando loops infinitos
             let mut total_score = 0.0f32;
@@ -916,15 +1107,22 @@ impl QueryBackend for LogBackend {
 
             if matched {
                 score_accumulator.insert(pivot_lsn, total_score);
-                let entry = MinScoreEntry { score: total_score, lsn: pivot_lsn };
-                
+                let entry = MinScoreEntry {
+                    score: total_score,
+                    lsn: pivot_lsn,
+                };
+
                 if top_k_heap.len() < k {
                     top_k_heap.push(entry);
                 } else if total_score > top_k_heap.peek().unwrap().score {
                     top_k_heap.pop();
                     top_k_heap.push(entry);
                 }
-                current_threshold = if top_k_heap.len() >= k { top_k_heap.peek().unwrap().score } else { 0.0f32 };
+                current_threshold = if top_k_heap.len() >= k {
+                    top_k_heap.peek().unwrap().score
+                } else {
+                    0.0f32
+                };
             } else {
                 // Força o alinhamento monotônico de cursors atrasados para o próximo bloco válido
                 for cursor in cursors.iter_mut() {
@@ -951,8 +1149,15 @@ impl QueryBackend for LogBackend {
     /// vetorial; (2) o heap de top-k é um MAX-heap por distância (via `Reverse`),
     /// para que `peek` devolva o PIOR hit retido — era um min-heap, o que fazia
     /// o corte usar o MELHOR hit como limite e a eviction expulsar o mais próximo.
-    fn nearest(&self, vector: &[f32], k: usize, as_of: Option<Lsn>) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
-        if k == 0 { return Ok(Vec::new()); }
+    fn nearest(
+        &self,
+        vector: &[f32],
+        k: usize,
+        as_of: Option<Lsn>,
+    ) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
         let b = self.sync_bundle()?;
         let bound = self.resolve_as_of_bound(as_of)?;
 
@@ -966,29 +1171,64 @@ impl QueryBackend for LogBackend {
 
         if let Some(first_vec) = b.vector_index.nodes.get(&best_routing_node) {
             let initial_dist = b.vector_index.compute_distance(vector, first_vec);
-            candidate_heap.push(MinScoreEntry { score: initial_dist, lsn: best_routing_node });
-            top_hits_heap.push(Reverse(MinScoreEntry { score: initial_dist, lsn: best_routing_node }));
+            candidate_heap.push(MinScoreEntry {
+                score: initial_dist,
+                lsn: best_routing_node,
+            });
+            top_hits_heap.push(Reverse(MinScoreEntry {
+                score: initial_dist,
+                lsn: best_routing_node,
+            }));
             visited.insert(best_routing_node);
         }
 
-        while let Some(MinScoreEntry { score: curr_dist, lsn: current_node }) = candidate_heap.pop() {
-            let limit_dist = if top_hits_heap.len() >= k { top_hits_heap.peek().unwrap().0.score } else { f32::MAX };
-            if curr_dist > limit_dist { break; }
+        while let Some(MinScoreEntry {
+            score: curr_dist,
+            lsn: current_node,
+        }) = candidate_heap.pop()
+        {
+            let limit_dist = if top_hits_heap.len() >= k {
+                top_hits_heap.peek().unwrap().0.score
+            } else {
+                f32::MAX
+            };
+            if curr_dist > limit_dist {
+                break;
+            }
 
-            if let Some(neighbors) = b.vector_index.layers.get(0).and_then(|l| l.get(&current_node)) {
+            if let Some(neighbors) = b
+                .vector_index
+                .layers
+                .first()
+                .and_then(|l| l.get(&current_node))
+            {
                 for &neighbor in neighbors.iter() {
-                    if neighbor >= bound { continue; }
+                    if neighbor >= bound {
+                        continue;
+                    }
                     if visited.insert(neighbor) {
                         if let Some(n_vec) = b.vector_index.nodes.get(&neighbor) {
                             let dist = b.vector_index.compute_distance(vector, n_vec);
 
                             if top_hits_heap.len() < k {
-                                top_hits_heap.push(Reverse(MinScoreEntry { score: dist, lsn: neighbor }));
-                                candidate_heap.push(MinScoreEntry { score: dist, lsn: neighbor });
+                                top_hits_heap.push(Reverse(MinScoreEntry {
+                                    score: dist,
+                                    lsn: neighbor,
+                                }));
+                                candidate_heap.push(MinScoreEntry {
+                                    score: dist,
+                                    lsn: neighbor,
+                                });
                             } else if dist < top_hits_heap.peek().unwrap().0.score {
                                 top_hits_heap.pop();
-                                top_hits_heap.push(Reverse(MinScoreEntry { score: dist, lsn: neighbor }));
-                                candidate_heap.push(MinScoreEntry { score: dist, lsn: neighbor });
+                                top_hits_heap.push(Reverse(MinScoreEntry {
+                                    score: dist,
+                                    lsn: neighbor,
+                                }));
+                                candidate_heap.push(MinScoreEntry {
+                                    score: dist,
+                                    lsn: neighbor,
+                                });
                             }
                         }
                     }
@@ -996,7 +1236,10 @@ impl QueryBackend for LogBackend {
             }
         }
 
-        let mut raw_hits: Vec<(Lsn, f32)> = top_hits_heap.into_iter().map(|Reverse(MinScoreEntry { score, lsn })| (lsn, score)).collect();
+        let mut raw_hits: Vec<(Lsn, f32)> = top_hits_heap
+            .into_iter()
+            .map(|Reverse(MinScoreEntry { score, lsn })| (lsn, score))
+            .collect();
         raw_hits.sort_by(|a, b| a.1.total_cmp(&b.1));
 
         let mut final_hydrated_hits = Vec::with_capacity(raw_hits.len());
@@ -1026,83 +1269,152 @@ impl QueryBackend for LogBackend {
     // off-by-one que fazia `AS OF LSN n` ver eventos do próprio lsn n (e
     // `AS OF LSN 0` devolver dados). Uma única semântica: LogBackend, server
     // e VirtualBackend usam o mesmo caminho.
-    fn neighbors(&self, node: &str, etype: Option<&str>, as_of: Option<Lsn>, min_confidence: f32) -> Result<Vec<NeighborRow>, HeraclitusError> {
+    fn neighbors(
+        &self,
+        node: &str,
+        etype: Option<&str>,
+        as_of: Option<Lsn>,
+        min_confidence: f32,
+    ) -> Result<Vec<NeighborRow>, HeraclitusError> {
         let b = self.sync_bundle()?;
         Ok(neighbors_of(&b.graph, node, etype, as_of, min_confidence))
     }
 
-    fn traverse(&self, start: &str, max_depth: usize, as_of: Option<Lsn>, min_confidence: f32) -> Result<Vec<(String, usize)>, HeraclitusError> {
+    fn traverse(
+        &self,
+        start: &str,
+        max_depth: usize,
+        as_of: Option<Lsn>,
+        min_confidence: f32,
+    ) -> Result<Vec<(String, usize)>, HeraclitusError> {
         let b = self.sync_bundle()?;
-        Ok(traverse_of(&b.graph, start, max_depth, as_of, min_confidence))
+        Ok(traverse_of(
+            &b.graph,
+            start,
+            max_depth,
+            as_of,
+            min_confidence,
+        ))
     }
 
-    fn match_edges(&self, src: Option<&str>, etype: Option<&str>, dst: Option<&str>, as_of: Option<Lsn>) -> Result<Vec<EdgeRow>, HeraclitusError> {
+    fn match_edges(
+        &self,
+        src: Option<&str>,
+        etype: Option<&str>,
+        dst: Option<&str>,
+        as_of: Option<Lsn>,
+    ) -> Result<Vec<EdgeRow>, HeraclitusError> {
         let b = self.sync_bundle()?;
         Ok(match_edges_of(&b.graph, src, etype, dst, as_of))
     }
 
-    fn edge_hypotheses(&self, from: &str, to: &str, etype: &str, as_of: Option<Lsn>) -> Result<Option<EdgeHypotheses>, HeraclitusError> {
+    fn edge_hypotheses(
+        &self,
+        from: &str,
+        to: &str,
+        etype: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<EdgeHypotheses>, HeraclitusError> {
         let b = self.sync_bundle()?;
         Ok(hypotheses_of(&b.graph, from, to, etype, as_of))
     }
 
-    fn community(&self, node: &str, as_of: Option<Lsn>) -> Result<Option<CommunityResult>, HeraclitusError> {
+    fn community(
+        &self,
+        node: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<CommunityResult>, HeraclitusError> {
         let b = self.sync_bundle()?;
         Ok(community_of(&b.graph, node, as_of))
     }
 
-    fn community_leiden(&self, node: &str, as_of: Option<Lsn>) -> Result<Option<CommunityResult>, HeraclitusError> {
+    fn community_leiden(
+        &self,
+        node: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<CommunityResult>, HeraclitusError> {
         let b = self.sync_bundle()?;
         Ok(community_leiden_of(&b.graph, node, as_of))
     }
 
-    fn node_metrics(&self, node: &str, as_of: Option<Lsn>) -> Result<Option<MetricsResult>, HeraclitusError> {
+    fn node_metrics(
+        &self,
+        node: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<MetricsResult>, HeraclitusError> {
         let b = self.sync_bundle()?;
         Ok(node_metrics_of(&b.graph, node, as_of))
     }
 
-    fn resolve_entity(&self, key: &str, as_of: Option<Lsn>) -> Result<Option<String>, HeraclitusError> {
+    fn resolve_entity(
+        &self,
+        key: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<String>, HeraclitusError> {
         let b = self.sync_bundle()?;
         Ok(resolve_of(&b.resolver, key, as_of))
     }
 
-    fn entity_cluster(&self, entity_id: &str, as_of: Option<Lsn>) -> Result<Vec<String>, HeraclitusError> {
+    fn entity_cluster(
+        &self,
+        entity_id: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Vec<String>, HeraclitusError> {
         let b = self.sync_bundle()?;
         Ok(cluster_of(&b.resolver, entity_id, as_of))
     }
 
     fn lsn_for_timestamp(&self, ts_ms: u64) -> Result<Lsn, HeraclitusError> {
         let head = self.log.head();
-        let mut low = 0; let mut high = head; let mut ans = head;
+        let mut low = 0;
+        let mut high = head;
+        let mut ans = head;
         while low <= high {
             let mid = low + (high - low) / 2;
             match self.log.read(mid)? {
                 Some((_, e)) => {
                     let e_ts = e.ts_hlc >> 16;
                     if e_ts > ts_ms {
-                        ans = mid; if mid == 0 { break; }
+                        ans = mid;
+                        if mid == 0 {
+                            break;
+                        }
                         high = mid - 1;
                     } else {
                         low = mid + 1;
                     }
                 }
-                None => { if mid == 0 { break; } high = mid - 1; }
+                None => {
+                    if mid == 0 {
+                        break;
+                    }
+                    high = mid - 1;
+                }
             }
         }
         Ok(ans)
     }
 
-    fn append(&self, label: Option<&str>, props: &[(String, Value)]) -> Result<Lsn, HeraclitusError> {
+    fn append(
+        &self,
+        label: Option<&str>,
+        props: &[(String, Value)],
+    ) -> Result<Lsn, HeraclitusError> {
         let kind = match label {
             Some(l) if l.eq_ignore_ascii_case("action") => EventKind::Action,
             Some(l) if l.eq_ignore_ascii_case("message") => EventKind::Message,
-            Some(l) if l.eq_ignore_ascii_case("observation") || l.is_empty() => EventKind::Observation,
+            Some(l) if l.eq_ignore_ascii_case("observation") || l.is_empty() => {
+                EventKind::Observation
+            }
             Some(l) => EventKind::Custom(l.to_string()),
             None => EventKind::Observation,
         };
         let mut e = Episode::new("query", kind, Vec::new());
         for (k, v) in props {
-            let s = match v { Value::Str(s) => s.clone(), Value::Num(n) => n.to_string() };
+            let s = match v {
+                Value::Str(s) => s.clone(),
+                Value::Num(n) => n.to_string(),
+            };
             e.attrs.insert(k.clone(), s);
         }
         self.log.append(e)
@@ -1122,19 +1434,28 @@ struct LogChunkIterator {
 
 impl LogChunkIterator {
     fn new(log: Arc<Log>, from_lsn: Lsn, to_lsn: Lsn) -> Self {
-        Self { log, current_lsn: from_lsn, to_lsn, current_batch: Vec::new().into_iter() }
+        Self {
+            log,
+            current_lsn: from_lsn,
+            to_lsn,
+            current_batch: Vec::new().into_iter(),
+        }
     }
 
     fn next_item(&mut self) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
-        if let Some(item) = self.current_batch.next() { return Ok(Some(item)); }
-        if self.current_lsn >= self.to_lsn { return Ok(None); }
-        
-        let batch = self.log.scan_capped(self.current_lsn, self.to_lsn, 2048)?;
-        if batch.is_empty() { 
-            self.current_lsn += 1;
-            return Ok(None); 
+        if let Some(item) = self.current_batch.next() {
+            return Ok(Some(item));
         }
-        
+        if self.current_lsn >= self.to_lsn {
+            return Ok(None);
+        }
+
+        let batch = self.log.scan_capped(self.current_lsn, self.to_lsn, 2048)?;
+        if batch.is_empty() {
+            self.current_lsn += 1;
+            return Ok(None);
+        }
+
         if let Some(&(last_lsn, _)) = batch.last() {
             self.current_lsn = last_lsn + 1;
         }
@@ -1152,10 +1473,18 @@ fn fold_normalization(items: &mut [(String, u64, f32)]) {
     }
 }
 
-pub fn trace_causes(parents: &BTreeMap<String, Vec<String>>, target: &str, max_depth: usize) -> Trace {
+pub fn trace_causes(
+    parents: &BTreeMap<String, Vec<String>>,
+    target: &str,
+    max_depth: usize,
+) -> Trace {
     use std::collections::VecDeque;
     if !parents.contains_key(target) {
-        return Trace { target: target.to_string(), steps: Vec::new(), roots: Vec::new() };
+        return Trace {
+            target: target.to_string(),
+            steps: Vec::new(),
+            roots: Vec::new(),
+        };
     }
     let mut depth_of: BTreeMap<String, usize> = BTreeMap::new();
     let mut q: VecDeque<(String, usize)> = VecDeque::new();
@@ -1177,12 +1506,20 @@ pub fn trace_causes(parents: &BTreeMap<String, Vec<String>>, target: &str, max_d
                 }
             }
         }
-        steps.push(CausalStep { id, depth: d, causes });
+        steps.push(CausalStep {
+            id,
+            depth: d,
+            causes,
+        });
     }
     steps.sort_by(|a, b| a.depth.cmp(&b.depth).then(a.id.cmp(&b.id)));
     roots.sort();
     roots.dedup();
-    Trace { target: target.to_string(), steps, roots }
+    Trace {
+        target: target.to_string(),
+        steps,
+        roots,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1203,19 +1540,11 @@ fn as_of_point(as_of: Option<Lsn>) -> Option<Lsn> {
 
 // `EntityResolver` do index-graph (M11) — o mesmo que o server materializa e
 // que o LogBackend agrega no bundle: uma única semântica de resolução.
-pub fn resolve_of(
-    r: &EntityResolver,
-    key: &str,
-    as_of: Option<Lsn>,
-) -> Option<String> {
+pub fn resolve_of(r: &EntityResolver, key: &str, as_of: Option<Lsn>) -> Option<String> {
     r.resolve(key, as_of_point(as_of)?)
 }
 
-pub fn cluster_of(
-    r: &EntityResolver,
-    entity_id: &str,
-    as_of: Option<Lsn>,
-) -> Vec<String> {
+pub fn cluster_of(r: &EntityResolver, entity_id: &str, as_of: Option<Lsn>) -> Vec<String> {
     let Some(point) = as_of_point(as_of) else {
         return Vec::new();
     };
@@ -1356,7 +1685,11 @@ pub fn community_leiden_of(
         .filter(|(_, c)| **c == community)
         .map(|(n, _)| n.clone())
         .collect();
-    Some(CommunityResult { node: node.to_string(), community, members })
+    Some(CommunityResult {
+        node: node.to_string(),
+        community,
+        members,
+    })
 }
 
 /// Replay de referência (recuperado pós-M30): reconstrói o grafo temporal a
@@ -1369,7 +1702,9 @@ pub fn replay_graph(log: &Log) -> Result<TemporalGraph, HeraclitusError> {
     let mut cur: Lsn = 0;
     while cur < head {
         let batch = log.scan_capped(cur, head, 2048)?;
-        let Some(&(last_lsn, _)) = batch.last() else { break; };
+        let Some(&(last_lsn, _)) = batch.last() else {
+            break;
+        };
         for (lsn, e) in &batch {
             g.apply_episode(*lsn, e);
         }
@@ -1385,7 +1720,9 @@ pub fn replay_resolver(log: &Log) -> Result<EntityResolver, HeraclitusError> {
     let mut cur: Lsn = 0;
     while cur < head {
         let batch = log.scan_capped(cur, head, 2048)?;
-        let Some(&(last_lsn, _)) = batch.last() else { break; };
+        let Some(&(last_lsn, _)) = batch.last() else {
+            break;
+        };
         for (lsn, e) in &batch {
             r.apply_episode(*lsn, e);
         }
@@ -1419,7 +1756,10 @@ pub fn materialize_virtual(
         if remove && *id == edge_id {
             continue; // a remoção contrafactual
         }
-        g.upsert_edge(edge.clone(), base.versions.get(id).cloned().unwrap_or_default());
+        g.upsert_edge(
+            edge.clone(),
+            base.versions.get(id).cloned().unwrap_or_default(),
+        );
     }
     if op == SimulateOp::AddEdge {
         let version = EdgeVersion {
@@ -1476,13 +1816,28 @@ impl QueryBackend for VirtualBackend<'_> {
     fn head(&self) -> Result<Lsn, HeraclitusError> {
         self.base.head()
     }
-    fn attr_lookup(&self, field: &str, value: &str, as_of: Option<Lsn>) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+    fn attr_lookup(
+        &self,
+        field: &str,
+        value: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
         self.base.attr_lookup(field, value, as_of)
     }
-    fn recall(&self, t: &str, k: usize, a: Option<Lsn>) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
+    fn recall(
+        &self,
+        t: &str,
+        k: usize,
+        a: Option<Lsn>,
+    ) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
         self.base.recall(t, k, a)
     }
-    fn nearest(&self, v: &[f32], k: usize, a: Option<Lsn>) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
+    fn nearest(
+        &self,
+        v: &[f32],
+        k: usize,
+        a: Option<Lsn>,
+    ) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
         self.base.nearest(v, k, a)
     }
     fn provenance(&self, id: &str) -> Result<Vec<String>, HeraclitusError> {
@@ -1498,7 +1853,11 @@ impl QueryBackend for VirtualBackend<'_> {
         self.base.entity_cluster(id, a)
     }
     /// No-op: um contrafactual nunca escreve no log real.
-    fn append(&self, _label: Option<&str>, _props: &[(String, Value)]) -> Result<Lsn, HeraclitusError> {
+    fn append(
+        &self,
+        _label: Option<&str>,
+        _props: &[(String, Value)],
+    ) -> Result<Lsn, HeraclitusError> {
         Ok(Lsn::MAX)
     }
 
@@ -1506,26 +1865,61 @@ impl QueryBackend for VirtualBackend<'_> {
     fn graph(&self) -> Result<TemporalGraph, HeraclitusError> {
         Ok(self.graph.clone())
     }
-    fn neighbors(&self, node: &str, etype: Option<&str>, a: Option<Lsn>, mc: f32) -> Result<Vec<NeighborRow>, HeraclitusError> {
+    fn neighbors(
+        &self,
+        node: &str,
+        etype: Option<&str>,
+        a: Option<Lsn>,
+        mc: f32,
+    ) -> Result<Vec<NeighborRow>, HeraclitusError> {
         Ok(neighbors_of(&self.graph, node, etype, a, mc))
     }
-    fn traverse(&self, start: &str, d: usize, a: Option<Lsn>, mc: f32) -> Result<Vec<(String, usize)>, HeraclitusError> {
+    fn traverse(
+        &self,
+        start: &str,
+        d: usize,
+        a: Option<Lsn>,
+        mc: f32,
+    ) -> Result<Vec<(String, usize)>, HeraclitusError> {
         Ok(traverse_of(&self.graph, start, d, a, mc))
     }
-    fn match_edges(&self, src: Option<&str>, et: Option<&str>, dst: Option<&str>, a: Option<Lsn>) -> Result<Vec<EdgeRow>, HeraclitusError> {
+    fn match_edges(
+        &self,
+        src: Option<&str>,
+        et: Option<&str>,
+        dst: Option<&str>,
+        a: Option<Lsn>,
+    ) -> Result<Vec<EdgeRow>, HeraclitusError> {
         Ok(match_edges_of(&self.graph, src, et, dst, a))
     }
-    fn edge_hypotheses(&self, f: &str, t: &str, et: &str, a: Option<Lsn>) -> Result<Option<EdgeHypotheses>, HeraclitusError> {
+    fn edge_hypotheses(
+        &self,
+        f: &str,
+        t: &str,
+        et: &str,
+        a: Option<Lsn>,
+    ) -> Result<Option<EdgeHypotheses>, HeraclitusError> {
         Ok(hypotheses_of(&self.graph, f, t, et, a))
     }
-    fn community(&self, node: &str, a: Option<Lsn>) -> Result<Option<CommunityResult>, HeraclitusError> {
+    fn community(
+        &self,
+        node: &str,
+        a: Option<Lsn>,
+    ) -> Result<Option<CommunityResult>, HeraclitusError> {
         Ok(community_of(&self.graph, node, a))
     }
-    fn community_leiden(&self, node: &str, a: Option<Lsn>) -> Result<Option<CommunityResult>, HeraclitusError> {
+    fn community_leiden(
+        &self,
+        node: &str,
+        a: Option<Lsn>,
+    ) -> Result<Option<CommunityResult>, HeraclitusError> {
         Ok(community_leiden_of(&self.graph, node, a))
     }
-    fn node_metrics(&self, node: &str, a: Option<Lsn>) -> Result<Option<MetricsResult>, HeraclitusError> {
+    fn node_metrics(
+        &self,
+        node: &str,
+        a: Option<Lsn>,
+    ) -> Result<Option<MetricsResult>, HeraclitusError> {
         Ok(node_metrics_of(&self.graph, node, a))
     }
 }
-
