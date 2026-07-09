@@ -1,3 +1,5 @@
+> **⚠️ NOTA DE ESTADO (2026-07-09):** **PROPOSTA (RFC)**. Documento de design que caracteriza mal o código atual: afirma que o log é "sem metadados estruturais" quando ele **já** tem segmentos `.hrkl` com `SegmentFooter` (min/max LSN + raiz Merkle blake3) e catálogo em memória (`LogCatalog`). Os componentes propostos — `SegmentCatalog`, `ZoneMap`, replay paralelo, índices efêmeros, `GraphOperator`, `StatisticsCatalog`, Provenance Engine — **não existem**. Ideias aproveitáveis (zone maps por atributo, bloom-no-footer, delta-of-delta) estão na Fase 2 do plano. Detalhe: [STATUS.md](STATUS.md) · [../PLANO-SPECS.md](../PLANO-SPECS.md).
+
 # SPEC-010: Motores de Armazenamento Temporal Segmentado, Índices Efêmeros e Engenharia de Replay Vetorizado Baseado em Custo
 
 ## 1. Alinhamento Filosófico do HeraclitusDB

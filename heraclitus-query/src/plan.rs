@@ -78,6 +78,7 @@ pub enum Plan {
     Why {
         target: String,
         max_depth: Option<u32>,
+        until: Option<String>,
         as_of: Option<AsOf>,
     },
     Community {
@@ -203,10 +204,12 @@ pub fn plan(stmt: &Stmt) -> Plan {
         Stmt::Why {
             target,
             max_depth,
+            until,
             as_of,
         } => Plan::Why {
             target: target.clone(),
             max_depth: *max_depth,
+            until: until.clone(),
             as_of: *as_of,
         },
         Stmt::Community {
@@ -340,8 +343,8 @@ pub fn render(plan: &Plan) -> String {
         Plan::Hypotheses { from, to, etype, as_of } => format!(
             "HypothesisGraph\n  edge = ({from})-[{etype}]->({to})\n  as_of = {as_of:?}\n"
         ),
-        Plan::Why { target, max_depth, as_of } => format!(
-            "CausalTrace(WHY)\n  target = {target}\n  max_depth = {max_depth:?}\n  as_of = {as_of:?}\n"
+        Plan::Why { target, max_depth, until, as_of } => format!(
+            "CausalTrace(WHY)\n  target = {target}\n  max_depth = {max_depth:?}\n  until = {until:?}\n  as_of = {as_of:?}\n"
         ),
         Plan::Community { node, leiden, as_of } => {
             let algo = if *leiden { "Leiden" } else { "ConnectedComponents" };
@@ -639,6 +642,32 @@ fn attr_eq_hint(conditions: &[(BoolOp, Condition)]) -> Option<(String, String)> 
     None
 }
 
+/// Like [`attr_eq_hint`] but for zone-mapped builtin fields (`agent_id`,
+/// `session_id`): extracts `(field, value)` from a conjunctive `WHERE
+/// <field> = "v"` so the planner can push it down to the zone-map skip scan
+/// (`scan_builtin_eq`). An `OR` disqualifies it.
+fn builtin_skip_hint(conditions: &[(BoolOp, Condition)]) -> Option<(String, String)> {
+    if conditions.iter().any(|(op, _)| matches!(op, BoolOp::Or)) {
+        return None;
+    }
+    for (_, c) in conditions {
+        if c.cmp != Cmp::Eq {
+            continue;
+        }
+        let pair = match (&c.lhs, &c.rhs) {
+            (Operand::Prop(_, f), Operand::Str(v)) => Some((f.as_str(), v.clone())),
+            (Operand::Str(v), Operand::Prop(_, f)) => Some((f.as_str(), v.clone())),
+            _ => None,
+        };
+        if let Some((f, v)) = pair {
+            if f == "agent_id" || f == "session_id" {
+                return Some((f.to_string(), v));
+            }
+        }
+    }
+    None
+}
+
 /// Derive the LSN scan window `[lo, hi)` from the `WHERE` clause and the `AS OF`
 /// bound, so `MATCH` pushes a time filter down to a pruned, capped scan
 /// (§query guard). Only conjunctive (`AND`) numeric `n.lsn` comparisons are
@@ -759,7 +788,14 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                     // ÍNDICE ORDENADO (C1.6): WHERE n.<campo> >/< número resolve
                     // pelo range do índice de atributos em vez do scan.
                     Some((field, min, max)) => be.attr_range_lookup(&field, min, max, bound)?,
-                    None => None,
+                    None => match builtin_skip_hint(conditions) {
+                        // SPEC-010 skip-I/O: WHERE agent_id/session_id = "v" salta
+                        // segmentos selados cujo zone map não contém o valor
+                        // (scan_builtin_eq). São builtins (fora do índice de
+                        // atributos); o pós-filtro `matches` revalida o exato.
+                        Some((field, value)) => be.scan_builtin_eq(&field, &value, bound)?,
+                        None => None,
+                    },
                 },
             };
             let candidates: Vec<(Lsn, Episode)> = match indexed {
@@ -1034,9 +1070,21 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
         Plan::Why {
             target,
             max_depth,
+            until,
             as_of,
         } => {
             let bound = resolve_as_of(as_of, be)?;
+            // SPEC-014: `UNTIL "cause"` → minimal causal chain (shortest path in
+            // the parent DAG) instead of the ancestor trace.
+            if let Some(cause) = until {
+                let chain = be.why_chain(target, cause, bound)?;
+                return Ok(json!({
+                    "target": target,
+                    "cause": cause,
+                    "minimal_chain": chain,
+                    "linked": !chain.is_empty(),
+                }));
+            }
             let trace = be.why(target, max_depth.unwrap_or(64) as usize, bound)?;
             Ok(json!({
                 "target": trace.target,

@@ -16,3 +16,7 @@ heraclitus-log = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Proves the core invariant end-to-end: only the log ships over the wire, yet
+# each node's derived graph view hydrates to a bit-identical state_hash.
+heraclitus-index-graph = { workspace = true }
+heraclitus-views = { workspace = true }

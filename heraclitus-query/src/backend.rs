@@ -11,6 +11,7 @@ use heraclitus_index_graph::adaptive::{self, LabeledFlag, PolicyEval};
 use heraclitus_index_graph::decision::{self, DecisionPolicy};
 use heraclitus_index_graph::entity::EntityResolver;
 use heraclitus_index_graph::temporal::{Edge, EdgeType, EdgeVersion, TemporalGraph};
+use heraclitus_log::skip_scan::SkipScanner;
 use heraclitus_log::Log;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
@@ -531,6 +532,20 @@ pub trait QueryBackend {
     ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
         Ok(None)
     }
+    /// SPEC-010 pushdown: optimized scan for `WHERE <builtin> = "v"` on a
+    /// zone-mapped builtin field (`agent_id`, `session_id`). Prunes sealed
+    /// segments whose zone map cannot contain the value (skip-I/O), so those
+    /// segments are never read. Returns a SUPERSET (the post-scan `matches`
+    /// revalidates the exact field), capped at `as_of`. Default `Ok(None)` =
+    /// backend has no zone maps, or the field is not zone-mapped → planner scans.
+    fn scan_builtin_eq(
+        &self,
+        _field: &str,
+        _value: &str,
+        _as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+        Ok(None)
+    }
     fn recall(
         &self,
         text: &str,
@@ -625,6 +640,31 @@ pub trait QueryBackend {
             parents.insert(e.id.to_string(), ps);
         }
         Ok(trace_causes(&parents, target, max_depth))
+    }
+
+    /// SPEC-014: minimal causal chain from `target` down to `cause` (shortest
+    /// path in the parent DAG). Reuses the same parent map as [`why`](Self::why),
+    /// so it needs no extra graph representation. Empty ⇒ `cause` is not a cause.
+    fn why_chain(
+        &self,
+        target: &str,
+        cause: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Vec<String>, HeraclitusError> {
+        let bound = self.resolve_as_of_bound(as_of)?;
+        let events = self.scan_range(0, bound)?;
+        let present: BTreeSet<String> = events.iter().map(|(_, e)| e.id.to_string()).collect();
+        let mut parents: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (_, e) in &events {
+            let ps: Vec<String> = e
+                .parents
+                .iter()
+                .map(|p| p.to_string())
+                .filter(|p| present.contains(p))
+                .collect();
+            parents.insert(e.id.to_string(), ps);
+        }
+        Ok(trace_minimal_chain(&parents, target, cause))
     }
 
     fn decide(
@@ -1013,6 +1053,33 @@ impl QueryBackend for LogBackend {
             }
         }
         Ok(Some(results))
+    }
+
+    fn scan_builtin_eq(
+        &self,
+        field: &str,
+        value: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+        let bound = self.resolve_as_of_bound(as_of)?;
+        // Skip-I/O over sealed segments: segments whose zone map cannot contain
+        // `value` for this field are never read (SPEC-010). Zone maps are cached
+        // in the derived `.zmap` sidecars, so this pays no full-segment warm read
+        // after the first build.
+        let scanner = SkipScanner::new(&self.log);
+        let (mut hits, _stats) = match field {
+            "agent_id" => scanner.scan_pruned(|z| z.may_contain_agent(value))?,
+            "session_id" => scanner.scan_pruned(|z| z.may_contain_session(value))?,
+            _ => return Ok(None), // field not summarized by the zone map
+        };
+        // Respect the AS OF ceiling and the query scan cap. We return a superset
+        // of the surviving segments; the planner's `matches` post-filter checks
+        // the exact field, so correctness never depends on this hint.
+        hits.retain(|(l, _)| *l < bound);
+        if hits.len() > QUERY_SCAN_CAP {
+            hits.truncate(QUERY_SCAN_CAP);
+        }
+        Ok(Some(hits))
     }
 
     /// CORRIGIDO: WAND determinístico sem reorder global $O(k \log k)$ e com garantia de avanço monotônico livre de skips.
@@ -1520,6 +1587,47 @@ pub fn trace_causes(
         steps,
         roots,
     }
+}
+
+/// SPEC-014: minimal causal chain `[effect, …, cause]` — the shortest path from
+/// `effect` up to `cause` in the parent DAG (BFS over `parents`). Returns empty
+/// if `cause` is not an ancestor of `effect`. Same parent map as `trace_causes`.
+pub fn trace_minimal_chain(
+    parents: &BTreeMap<String, Vec<String>>,
+    effect: &str,
+    cause: &str,
+) -> Vec<String> {
+    if effect == cause {
+        return vec![effect.to_string()];
+    }
+    let mut came_from: HashMap<String, String> = HashMap::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    seen.insert(effect.to_string());
+    let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    queue.push_back(effect.to_string());
+    while let Some(node) = queue.pop_front() {
+        if let Some(ps) = parents.get(&node) {
+            for p in ps {
+                if !seen.insert(p.clone()) {
+                    continue;
+                }
+                came_from.insert(p.clone(), node.clone());
+                if p == cause {
+                    // Reconstruct effect → … → cause.
+                    let mut chain = vec![p.clone()];
+                    let mut cur = p.clone();
+                    while let Some(child) = came_from.get(&cur) {
+                        chain.push(child.clone());
+                        cur = child.clone();
+                    }
+                    chain.reverse();
+                    return chain;
+                }
+                queue.push_back(p.clone());
+            }
+        }
+    }
+    Vec::new()
 }
 
 // ─────────────────────────────────────────────────────────────────────────

@@ -63,6 +63,9 @@ pub enum Stmt {
     Why {
         target: String,
         max_depth: Option<u32>,
+        /// SPEC-014: `UNTIL "cause"` — return the minimal causal chain to `cause`
+        /// instead of the ancestor trace.
+        until: Option<String>,
         as_of: Option<AsOf>,
     },
     Community {
@@ -415,12 +418,15 @@ fn build_stmt(pair: Pair<Rule>) -> Result<Stmt, HeraclitusError> {
             })
         }
         Rule::why_stmt => {
-            let mut target = String::new();
+            // Two `string`s may appear: the first is the target, the second
+            // (after UNTIL) is the cause. Literals like WHY/UNTIL are not
+            // captured as pairs, so ordering distinguishes them.
+            let mut strings: Vec<String> = Vec::new();
             let mut max_depth = None;
             let mut as_of = None;
             for p in inner.into_inner() {
                 match p.as_rule() {
-                    Rule::string => target = unquote(p.as_str()),
+                    Rule::string => strings.push(unquote(p.as_str())),
                     Rule::int => {
                         max_depth = Some(p.as_str().parse().map_err(|_| perr("bad depth"))?)
                     }
@@ -428,12 +434,15 @@ fn build_stmt(pair: Pair<Rule>) -> Result<Stmt, HeraclitusError> {
                     _ => {}
                 }
             }
+            let target = strings.first().cloned().unwrap_or_default();
+            let until = strings.get(1).cloned();
             if target.is_empty() {
                 return Err(perr("WHY needs a target id"));
             }
             Ok(Stmt::Why {
                 target,
                 max_depth,
+                until,
                 as_of,
             })
         }

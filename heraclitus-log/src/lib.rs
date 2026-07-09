@@ -16,7 +16,9 @@
 pub mod cpm;
 pub mod format;
 pub mod mmap;
+pub mod skip_scan; // SPEC-010: segment-level skip-I/O scan wired on zone maps
 pub mod vm_bridge;
+pub mod zone_map; // SPEC-010: per-segment min/max skip-I/O primitive
 
 use arc_swap::ArcSwap;
 use format::{Decoded, SegmentFooter, SegmentHeader, HEADER_LEN};

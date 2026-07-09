@@ -1,3 +1,5 @@
+> **⚠️ NOTA DE ESTADO (2026-07-09):** **PROPOSTA (RFC)**, design puro. A "Matriz de Maturidade" com cinco notas **10.0** descreve componentes que **não existem**: `StorageEngine` (só existe como variante de erro), `DatabaseManifest`, `TransactionSnapshot` (o real é `Snapshot(Lsn)`, um newtype simples), `DerivedExecutionArtifact`, `QueryFingerprint`, `MemoryManager`, `ResourceScheduler` — todos zero hits em `crates/*/src`. Detalhe: [STATUS.md](STATUS.md) · [../PLANO-SPECS.md](../PLANO-SPECS.md).
+
 # SPEC-011: Runtime de Infraestrutura, Abstração de Armazenamento e Gerenciamento de Recursos de Execução
 
 ## Lógica, Tempo e Execução: A Consolidação da Trindade do HeraclitusDB

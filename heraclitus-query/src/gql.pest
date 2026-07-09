@@ -68,8 +68,10 @@ resolve_stmt = { ^"RESOLVE" ~ "(" ~ string ~ ")" ~ as_of? }
 cluster_stmt = { ^"CLUSTER" ~ "(" ~ string ~ ")" ~ as_of? }
 // M12 hypothesis graph: HYPOTHESES("from", "to", "edge_type") [AS OF ...]
 hypotheses_stmt = { ^"HYPOTHESES" ~ "(" ~ string ~ "," ~ string ~ "," ~ string ~ ")" ~ as_of? }
-// M13 causal query: WHY("event_id" [, max_depth]) [AS OF ...]
-why_stmt = { ^"WHY" ~ "(" ~ string ~ ("," ~ int)? ~ ")" ~ as_of? }
+// M13 causal query: WHY("event_id" [, max_depth]) [UNTIL "cause_id"] [AS OF ...]
+// SPEC-014: the optional UNTIL clause returns the MINIMAL causal chain from the
+// target down to the named cause (shortest path in the parent DAG).
+why_stmt = { ^"WHY" ~ "(" ~ string ~ ("," ~ int)? ~ ")" ~ (^"UNTIL" ~ string)? ~ as_of? }
 // M14 graph analytics: COMMUNITY("node" [, LEIDEN]) | METRICS("node"), both [AS OF ...]
 // LEIDEN (V2.4) troca as componentes conexas pela partição de modularidade.
 community_stmt = { ^"COMMUNITY" ~ "(" ~ string ~ ("," ~ leiden_kw)? ~ ")" ~ as_of? }

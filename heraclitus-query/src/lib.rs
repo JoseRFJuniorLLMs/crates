@@ -109,6 +109,130 @@ mod tests {
     }
 
     #[test]
+    fn match_agent_id_pushes_down_to_zone_map_skip() {
+        // SPEC-010 pushdown at the query layer: `WHERE agent_id = "alice"` routes
+        // through `scan_agent`, which prunes bob-only sealed segments (skip-I/O)
+        // — yet the result is exactly alice's events (post-filter revalidates).
+        let dir = tempfile::tempdir().unwrap();
+        // Small segments + grouped agents ⇒ whole segments are single-agent and
+        // therefore skippable.
+        let log = Arc::new(Log::open(dir.path(), 2048, FsyncPolicy::Always).unwrap());
+        for i in 0..60 {
+            log.append(Episode::new(
+                "alice",
+                EventKind::Observation,
+                format!("alice-{i:04}-xxxxxxxxxxxxxxxxxxxx").into_bytes(),
+            ))
+            .unwrap();
+        }
+        for i in 0..60 {
+            log.append(Episode::new(
+                "bob",
+                EventKind::Observation,
+                format!("bob-{i:04}-xxxxxxxxxxxxxxxxxxxx").into_bytes(),
+            ))
+            .unwrap();
+        }
+        assert!(
+            log.sealed_segments().len() >= 3,
+            "need multiple sealed segments so pruning has something to skip"
+        );
+
+        let be = LogBackend::new(log);
+        let v = execute("MATCH (n) WHERE n.agent_id = \"alice\" RETURN n", &be).unwrap();
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), 60, "exactly alice's 60 events, none dropped, no bob");
+        assert!(
+            rows.iter().all(|r| r["agent_id"].as_str() == Some("alice")),
+            "pruning + post-filter must yield only alice"
+        );
+    }
+
+    #[test]
+    fn match_session_id_pushes_down_to_zone_map_skip() {
+        // SPEC-010 pushdown generalized to `session_id` — the core "load this
+        // session" query for agentic memory. Segments of other sessions are
+        // pruned, yet the result is exactly session "s-A".
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 2048, FsyncPolicy::Always).unwrap());
+        let mut push = |session: &str, i: usize| {
+            let mut e = Episode::new(
+                "agent",
+                EventKind::Observation,
+                format!("{session}-{i:04}-xxxxxxxxxxxxxxxxxxxx").into_bytes(),
+            );
+            e.session_id = session.to_string();
+            log.append(e).unwrap();
+        };
+        for i in 0..60 {
+            push("s-A", i);
+        }
+        for i in 0..60 {
+            push("s-B", i);
+        }
+        assert!(log.sealed_segments().len() >= 3);
+
+        let be = LogBackend::new(log);
+        let v = execute("MATCH (n) WHERE n.session_id = \"s-A\" RETURN n", &be).unwrap();
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), 60, "exactly session s-A, none dropped, no s-B");
+        assert!(rows
+            .iter()
+            .all(|r| r["session_id"].as_str() == Some("s-A")));
+    }
+
+    #[test]
+    fn why_until_returns_minimal_causal_chain() {
+        // SPEC-014: WHY(effect) UNTIL "cause" returns the shortest path in the
+        // parent DAG, not the full ancestor trace.
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+
+        let mk = |body: &[u8], parents: &[heraclitus_core::EventId]| {
+            let mut e = Episode::new("a", EventKind::Observation, body.to_vec());
+            e.parents = parents.to_vec();
+            e
+        };
+        let e0 = mk(b"e0", &[]);
+        let (id0,) = (e0.id,);
+        let e1 = mk(b"e1", &[id0]);
+        let id1 = e1.id;
+        let e2 = mk(b"e2", &[id1]);
+        let id2 = e2.id;
+        // e3 has two parents: e2 (long path) and e0 (direct shortcut).
+        let e3 = mk(b"e3", &[id2, id0]);
+        let id3 = e3.id;
+        for e in [e0, e1, e2, e3] {
+            log.append(e).unwrap();
+        }
+        let be = LogBackend::new(log);
+
+        let chain_of = |v: &serde_json::Value| -> Vec<String> {
+            v["minimal_chain"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s.as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // WHY(e3) UNTIL e0 → shortest is the direct shortcut edge [e3, e0].
+        let v = execute(&format!("WHY(\"{id3}\") UNTIL \"{id0}\""), &be).unwrap();
+        assert_eq!(v["linked"].as_bool(), Some(true));
+        assert_eq!(chain_of(&v), vec![id3.to_string(), id0.to_string()]);
+
+        // WHY(e3) UNTIL e1 → must go through e2: [e3, e2, e1].
+        let v = execute(&format!("WHY(\"{id3}\") UNTIL \"{id1}\""), &be).unwrap();
+        assert_eq!(chain_of(&v), vec![id3.to_string(), id2.to_string(), id1.to_string()]);
+
+        // A cause that is not an ancestor → not linked, empty chain.
+        let stranger = mk(b"s", &[]);
+        let v = execute(&format!("WHY(\"{id3}\") UNTIL \"{}\"", stranger.id), &be).unwrap();
+        assert_eq!(v["linked"].as_bool(), Some(false));
+        assert!(chain_of(&v).is_empty());
+    }
+
+    #[test]
     fn temporal_as_of_lsn() {
         // M4 acceptance gate: temporal query test.
         let (_d, be) = seeded_backend();

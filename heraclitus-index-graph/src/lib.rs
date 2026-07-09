@@ -12,7 +12,9 @@ use std::collections::HashMap;
 
 pub mod adaptive; // M17: regras aprendidas de feedback (threshold tuning)
 pub mod decision; // M15: regras que agem (Action events no log)
+pub mod dense_map; // SPEC-009: EventId → u32 denso (ordem de LSN)
 pub mod entity; // M11: entity resolution determinística e temporal
+pub mod provenance; // SPEC-014: provenance engine (WHY / minimal causal chain)
 pub mod temporal; // M8: grafo temporal + probabilístico (RFC-004/005/006/007)
 
 #[derive(Default)]
@@ -92,6 +94,38 @@ impl GraphIndex {
 
     pub fn is_empty(&self) -> bool {
         self.by_internal.is_empty()
+    }
+
+    /// Canonical, deterministic BLAKE3 signature of the derived graph state
+    /// (Fase 1.3 / M8–M18 acceptance gate — see docs/md/SPEC-new/PLANO-SPECS.md).
+    ///
+    /// Determinism by construction:
+    /// - nodes are hashed in `by_internal` order — assigned in strict LSN order
+    ///   during replay, so the digest survives a wipe + `rebuild(0)` unchanged;
+    /// - out-edges are mapped to dense internal ids and **sorted**, so DashMap
+    ///   iteration order can never leak into the hash;
+    /// - all integers are big-endian, so the digest is identical on `x86_64`
+    ///   and `AArch64` (no host-endianness dependence).
+    pub fn state_hash(&self) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(b"HGRAPH-STATE-v1");
+        h.update(&(self.by_internal.len() as u64).to_be_bytes());
+        for (i, ev) in self.by_internal.iter().enumerate() {
+            h.update(&(i as u32).to_be_bytes());
+            h.update(&ev.0.to_bytes()); // 16-byte ULID identity
+            // Children (out-edges) resolved to dense internal ids, then sorted.
+            let mut outs: Vec<u32> = self
+                .out
+                .get(ev)
+                .map(|v| v.iter().filter_map(|t| self.internal.get(t).copied()).collect())
+                .unwrap_or_default();
+            outs.sort_unstable();
+            h.update(&(outs.len() as u32).to_be_bytes());
+            for t in outs {
+                h.update(&t.to_be_bytes());
+            }
+        }
+        *h.finalize().as_bytes()
     }
 }
 
@@ -202,6 +236,10 @@ impl View for GraphIndex {
     fn reset(&mut self) {
         *self = GraphIndex::default();
     }
+
+    fn state_hash(&self) -> Option<[u8; 32]> {
+        Some(GraphIndex::state_hash(self))
+    }
 }
 
 #[cfg(test)]
@@ -225,5 +263,65 @@ mod tests {
         assert!(g
             .filter_eq("topic", "rivers")
             .contains(g.internal_id(&a.id).unwrap()));
+    }
+
+    /// Build a small causal DAG once (stable ids reused across replays).
+    fn dag() -> Vec<Episode> {
+        let e0 = Episode::new("x", EventKind::Observation, b"e0".to_vec());
+        let mut e1 = Episode::new("x", EventKind::Observation, b"e1".to_vec());
+        e1.parents.push(e0.id);
+        let mut e2 = Episode::new("x", EventKind::Observation, b"e2".to_vec());
+        e2.parents.push(e0.id);
+        e2.parents.push(e1.id);
+        let mut e3 = Episode::new("x", EventKind::Observation, b"e3".to_vec());
+        e3.parents.push(e2.id);
+        vec![e0, e1, e2, e3]
+    }
+
+    fn hydrate(eps: &[Episode]) -> GraphIndex {
+        let mut g = GraphIndex::new();
+        for (i, e) in eps.iter().enumerate() {
+            g.apply(i as u64, e);
+        }
+        g
+    }
+
+    #[test]
+    fn state_hash_is_deterministic_across_wipe_and_replay() {
+        // M8–M18 acceptance gate: a wipe + rebuild-from-0 yields a bit-identical
+        // state_hash (zero-bit tolerance). `reset()` + re-apply is exactly what
+        // `ViewRegistry::rebuild` does internally.
+        let eps = dag();
+
+        let mut g = hydrate(&eps);
+        let h1 = g.state_hash();
+
+        g.reset();
+        assert!(g.is_empty(), "reset must clear all derived state");
+        for (i, e) in eps.iter().enumerate() {
+            g.apply(i as u64, e);
+        }
+        let h2 = g.state_hash();
+        assert_eq!(h1, h2, "rebuild-from-0 must be bit-identical");
+
+        // A fresh, independent index gives the same digest (no hidden global state).
+        let g3 = hydrate(&eps);
+        assert_eq!(h1, g3.state_hash());
+
+        // Exposed identically through the View trait.
+        assert_eq!(<GraphIndex as View>::state_hash(&g3), Some(h1));
+
+        // Sanity: different content ⇒ different digest.
+        let mut g4 = GraphIndex::new();
+        g4.apply(0, &eps[0]);
+        assert_ne!(h1, g4.state_hash(), "distinct states must not collide");
+    }
+
+    #[test]
+    fn state_hash_ignores_dashmap_iteration_order() {
+        // Two logically identical graphs built via the same LSN-ordered replay
+        // must hash equal regardless of internal DashMap bucket layout.
+        let eps = dag();
+        assert_eq!(hydrate(&eps).state_hash(), hydrate(&eps).state_hash());
     }
 }

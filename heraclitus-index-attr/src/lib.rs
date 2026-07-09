@@ -14,7 +14,7 @@
 //! O planeador de queries usa `lookup` para resolver `WHERE n.<campo> = "v"` sem
 //! varrer a janela (ver heraclitus-query::plan).
 
-use heraclitus_core::{Episode, HeraclitusError, Lsn};
+use heraclitus_core::{CanonicalKeyCodec, Episode, HeraclitusError, Lsn};
 use heraclitus_views::View;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -47,16 +47,11 @@ struct Snapshot {
     numeric: HashMap<String, BTreeMap<u64, Vec<Lsn>>>,
 }
 
-/// Mapeia um f64 num u64 que preserva a ordem total (`a < b ⟺ enc(a) < enc(b)`):
-/// positivos: flip do bit de sinal; negativos: complemento de todos os bits.
-fn f64_ordered(v: f64) -> u64 {
-    let bits = v.to_bits();
-    if bits >> 63 == 0 {
-        bits | (1 << 63)
-    } else {
-        !bits
-    }
-}
+// SPEC-009: a chave numérica ordenável é o `CanonicalKeyCodec::encode_f64` do
+// core — ordem total correta, com colapso de NaN e normalização de -0.0→+0.0
+// (o `f64_ordered` ad-hoc anterior não tratava esses casos). Para todo valor
+// finito ≠ -0.0 a codificação é bit-idêntica à anterior, logo os checkpoints
+// existentes permanecem legíveis.
 
 /// Índice invertido de atributos. Persistido e reconstruível por replay.
 #[derive(Default)]
@@ -108,8 +103,8 @@ impl AttrIndex {
             return Vec::new();
         };
         let enc = |b: Bound<f64>| match b {
-            Bound::Included(v) => Bound::Included(f64_ordered(v)),
-            Bound::Excluded(v) => Bound::Excluded(f64_ordered(v)),
+            Bound::Included(v) => Bound::Included(CanonicalKeyCodec::encode_f64(v)),
+            Bound::Excluded(v) => Bound::Excluded(CanonicalKeyCodec::encode_f64(v)),
             Bound::Unbounded => Bound::Unbounded,
         };
         let mut out: Vec<Lsn> = by_value
@@ -177,7 +172,7 @@ impl View for AttrIndex {
                         .numeric
                         .entry(field.clone())
                         .or_default()
-                        .entry(f64_ordered(n))
+                        .entry(CanonicalKeyCodec::encode_f64(n))
                         .or_default()
                         .push(lsn);
                 }
@@ -311,6 +306,29 @@ mod tests {
         assert_eq!(
             re.lookup_range("valor", Included(10.0), Included(100.0)),
             &[1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn negative_zero_unifies_with_positive_zero_in_range() {
+        // Regressão do `f64_ordered` ad-hoc: "-0.0" recebia uma chave distinta de
+        // "0.0", pelo que um range [0,0] perdia o evento com -0.0. O
+        // CanonicalKeyCodec normaliza -0.0→+0.0, corrigindo isto.
+        let mut idx = AttrIndex::new();
+        let val = |v: &str| {
+            let mut e = Episode::new("etl", EventKind::Observation, vec![]);
+            e.attrs.insert("saldo".into(), v.into());
+            e
+        };
+        idx.apply(0, &val("0.0"));
+        idx.apply(1, &val("-0.0"));
+
+        use std::ops::Bound::*;
+        // Um range exatamente em zero deve apanhar AMBOS os eventos.
+        assert_eq!(
+            idx.lookup_range("saldo", Included(0.0), Included(0.0)),
+            &[0, 1],
+            "-0.0 e +0.0 são o mesmo número e têm de partilhar a chave"
         );
     }
 

@@ -40,6 +40,9 @@ pub enum EventKind {
     FactDerived,
     /// Cryptographic receipt of cold-tier demotion (§3.10).
     DemotionReceipt,
+    /// SPEC-027 — endogenous telemetry sample, persisted as an ordinary event
+    /// so the database can query its own vitals through the normal engine.
+    SystemMetric,
     Custom(String),
 }
 

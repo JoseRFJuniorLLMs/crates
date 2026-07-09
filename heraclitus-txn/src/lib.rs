@@ -8,7 +8,9 @@
 
 use heraclitus_core::{Episode, HeraclitusError, Lsn};
 use heraclitus_log::Log;
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// A consistent read point: every event with `lsn < self.lsn()` is inside
 /// the snapshot; everything at or after the captured head is invisible.
@@ -68,6 +70,123 @@ impl TxnManager {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Fase 1.1 (M4) — TransactionSnapshot + SnapshotManager
+//
+// Reconciled with the v3.2.0 briefing but adapted to THIS codebase's real
+// types: `Lsn`/`SegmentId` are `u64` aliases (heraclitus-core/src/id.rs), NOT
+// newtypes. We deliberately do NOT introduce `Lsn(pub u64)` — that would be a
+// breaking change rippling through all 26 crates, which is the premature
+// over-engineering the plan (Fase 3, benchmark-gated) explicitly defers.
+//
+// The briefing gave two contradictory shapes for `TransactionSnapshot`
+// (one with `visible_segments: Vec<u64>`, one with `catalog_epoch`, `Copy`,
+// 24 bytes). We keep the second: a fixed-size, `Copy`, allocation-free logical
+// snapshot. Segment visibility is derived from `target_lsn`, not carried.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A strictly logical, allocation-free temporal snapshot (24 bytes, `Copy`).
+///
+/// - `target_lsn`   — exclusive upper bound: events with `lsn < target_lsn`
+///   are visible; everything at/after the captured head is invisible.
+/// - `watermark_lsn`— lowest LSN still pinned by any *active* reader; the GC
+///   floor below which derived views may compact/demote safely.
+/// - `catalog_epoch`— bumps on view/catalog blue-green swaps, so a reader can
+///   detect that the physical layout it was planned against was replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionSnapshot {
+    pub target_lsn: Lsn,
+    pub watermark_lsn: Lsn,
+    pub catalog_epoch: u64,
+}
+
+impl TransactionSnapshot {
+    /// True iff `lsn` is inside this snapshot's visible history.
+    pub fn contains(&self, lsn: Lsn) -> bool {
+        lsn < self.target_lsn
+    }
+}
+
+/// Tracks active read points to compute a safe watermark (the oldest LSN still
+/// pinned by a live snapshot). Views consult `watermark()` as the floor below
+/// which frozen state can be compacted/demoted without breaking any live read.
+///
+/// Isolation invariant: once `begin()` returns, appends past `target_lsn` are
+/// mathematically invisible to that snapshot (`contains` is a pure `<` test).
+pub struct SnapshotManager {
+    current_lsn: AtomicU64,
+    watermark_lsn: AtomicU64,
+    current_epoch: AtomicU64,
+    /// `target_lsn -> refcount` of live snapshots pinned at that head.
+    active: Mutex<BTreeMap<Lsn, usize>>,
+}
+
+impl SnapshotManager {
+    pub fn new(initial_lsn: Lsn, initial_epoch: u64) -> Self {
+        Self {
+            current_lsn: AtomicU64::new(initial_lsn),
+            watermark_lsn: AtomicU64::new(initial_lsn),
+            current_epoch: AtomicU64::new(initial_epoch),
+            active: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Advance the visible head as the log grows (monotonic; never regresses).
+    pub fn advance_head(&self, head: Lsn) {
+        self.current_lsn.fetch_max(head, Ordering::AcqRel);
+    }
+
+    /// Publish a new catalog epoch (e.g. after a blue-green view swap).
+    pub fn bump_epoch(&self) -> u64 {
+        self.current_epoch.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Open a snapshot pinned at the current head. Refcounts the head so the
+    /// watermark cannot advance past a still-active reader.
+    pub fn begin(&self) -> TransactionSnapshot {
+        let mut active = self.active.lock().unwrap();
+        let target = self.current_lsn.load(Ordering::Acquire);
+        let epoch = self.current_epoch.load(Ordering::Acquire);
+        *active.entry(target).or_insert(0) += 1;
+        // Watermark = oldest pinned read point (first key of the BTreeMap).
+        let wm = *active.keys().next().unwrap_or(&target);
+        self.watermark_lsn.store(wm, Ordering::Release);
+        TransactionSnapshot {
+            target_lsn: target,
+            watermark_lsn: wm,
+            catalog_epoch: epoch,
+        }
+    }
+
+    /// Release a snapshot. When the last reader at a head drops, the watermark
+    /// advances to the next-oldest pinned read point, or to the head if none.
+    pub fn release(&self, snap: &TransactionSnapshot) {
+        let mut active = self.active.lock().unwrap();
+        if let Some(count) = active.get_mut(&snap.target_lsn) {
+            *count -= 1;
+            if *count == 0 {
+                active.remove(&snap.target_lsn);
+            }
+        }
+        let wm = active
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or_else(|| self.current_lsn.load(Ordering::Acquire));
+        self.watermark_lsn.store(wm, Ordering::Release);
+    }
+
+    /// The current GC floor: no live snapshot depends on anything below this.
+    pub fn watermark(&self) -> Lsn {
+        self.watermark_lsn.load(Ordering::Acquire)
+    }
+
+    /// The current visible head.
+    pub fn head(&self) -> Lsn {
+        self.current_lsn.load(Ordering::Acquire)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +231,45 @@ mod tests {
         // …a second writer using the same stale snapshot must conflict.
         let err = txn.compare_and_append(snap.lsn(), ep("stale")).unwrap_err();
         assert!(matches!(err, HeraclitusError::CasConflict { .. }));
+    }
+
+    #[test]
+    fn snapshot_manager_watermark_tracks_oldest_reader() {
+        let sm = SnapshotManager::new(100, 0);
+        // A reader pins head=100.
+        let s1 = sm.begin();
+        assert_eq!(s1.target_lsn, 100);
+        assert_eq!(sm.watermark(), 100);
+
+        // Head advances; a newer reader pins 150, but the watermark stays at
+        // the oldest live read point (100) — the GC floor cannot pass s1.
+        sm.advance_head(150);
+        let s2 = sm.begin();
+        assert_eq!(s2.target_lsn, 150);
+        assert_eq!(sm.watermark(), 100);
+
+        // Releasing the old reader lets the watermark jump to the next-oldest.
+        sm.release(&s1);
+        assert_eq!(sm.watermark(), 150);
+
+        // Releasing the last reader floats the watermark up to the head.
+        sm.release(&s2);
+        assert_eq!(sm.watermark(), 150);
+    }
+
+    #[test]
+    fn snapshot_isolation_and_epoch() {
+        let sm = SnapshotManager::new(10, 7);
+        let snap = sm.begin();
+        assert_eq!(snap.catalog_epoch, 7);
+        // Appends past the captured head are invisible to a `<` test.
+        sm.advance_head(42);
+        assert!(snap.contains(9));
+        assert!(!snap.contains(10));
+        assert!(!snap.contains(41));
+        // A blue-green swap bumps the epoch for *new* snapshots only.
+        assert_eq!(sm.bump_epoch(), 8);
+        assert_eq!(sm.begin().catalog_epoch, 8);
+        assert_eq!(snap.catalog_epoch, 7); // the old snapshot is immutable
     }
 }

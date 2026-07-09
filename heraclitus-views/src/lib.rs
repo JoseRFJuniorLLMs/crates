@@ -80,6 +80,13 @@ pub trait View: Send + Sync {
     fn restore(&mut self, _dir: &Path) -> Result<bool, HeraclitusError> {
         Ok(false)
     }
+    /// Canonical BLAKE3 digest of the view's derived state (Fase 1.3 / M8–M18
+    /// acceptance gate). Default `None` = the view opts out. Any view that
+    /// implements it MUST be deterministic: the digest is bit-identical after a
+    /// wipe + rebuild-from-0, independent of thread count or CPU architecture.
+    fn state_hash(&self) -> Option<[u8; 32]> {
+        None
+    }
     /// Reset internal state ahead of a rebuild from `lsn`.
     fn reset(&mut self);
 }
