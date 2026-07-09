@@ -48,8 +48,12 @@ pub fn router(engine: Arc<Engine>, basic_auth: Option<String>) -> Router {
         .route("/stats", get(stats))
         .route("/state", get(state))
         .route("/verify", get(verify))
-        .route("/verify/:segment", get(verify_segment))
-        .with_state(engine);
+        .route("/verify/:segment", get(verify_segment));
+    // SPEC-016 (feature `analytics`): data plane Flight — o log inteiro como um
+    // stream Arrow IPC, legível por pyarrow/Polars/DuckDB sem parsing por linha.
+    #[cfg(feature = "analytics")]
+    let routes = routes.route("/flight/events", get(flight_events));
+    let routes = routes.with_state(engine);
 
     match basic_auth {
         None => routes,
@@ -76,6 +80,36 @@ pub fn router(engine: Arc<Engine>, basic_auth: Option<String>) -> Router {
                 }
             }))
         }
+    }
+}
+
+/// `GET /flight/events[?as_of=N]` → corpo `application/vnd.apache.arrow.stream`.
+#[cfg(feature = "analytics")]
+async fn flight_events(
+    State(engine): State<Arc<Engine>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let as_of = q.get("as_of").and_then(|v| v.parse::<u64>().ok());
+    let log = engine.log.clone();
+    // Materialização em spawn_blocking: nunca no executor async.
+    let body = tokio::task::spawn_blocking(move || {
+        heraclitus_analytics::flight::events_as_single_ipc(&log, as_of)
+    })
+    .await;
+    match body {
+        Ok(Ok(bytes)) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/vnd.apache.arrow.stream")
+            .body(bytes.into())
+            .unwrap(),
+        Ok(Err(e)) => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(format!("flight: {e}").into())
+            .unwrap(),
+        Err(e) => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(format!("join: {e}").into())
+            .unwrap(),
     }
 }
 

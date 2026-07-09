@@ -14,6 +14,10 @@
 //! # Ok(()) }
 //! ```
 
+pub use datafusion;
+pub mod flight; // SPEC-016: data plane Flight (Arrow IPC) sobre o log
+pub mod vectorized; // SPEC-012/013: motor de execução vetorizada Arrow
+
 use datafusion::arrow::array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::datasource::MemTable;
@@ -45,7 +49,7 @@ impl From<HeraclitusError> for AnalyticsError {
     }
 }
 
-fn kind_label(k: &EventKind) -> String {
+pub(crate) fn kind_label(k: &EventKind) -> String {
     match k {
         EventKind::Custom(s) => s.clone(),
         other => format!("{other:?}"),

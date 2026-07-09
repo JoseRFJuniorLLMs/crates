@@ -40,10 +40,14 @@ pub enum EventKind {
     FactDerived,
     /// Cryptographic receipt of cold-tier demotion (§3.10).
     DemotionReceipt,
+    Custom(String),
     /// SPEC-027 — endogenous telemetry sample, persisted as an ordinary event
     /// so the database can query its own vitals through the normal engine.
+    ///
+    /// MUST stay LAST: enum variants serialize by positional discriminant, so a
+    /// mid-enum insertion shifts `Custom` (6→7) and breaks deserialization of
+    /// already-written data. Appending keeps every pre-existing discriminant.
     SystemMetric,
-    Custom(String),
 }
 
 /// The unit of truth. Episodes are appended to the log and never mutated.

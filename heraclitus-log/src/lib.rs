@@ -17,6 +17,7 @@ pub mod cpm;
 pub mod format;
 pub mod mmap;
 pub mod skip_scan; // SPEC-010: segment-level skip-I/O scan wired on zone maps
+pub mod subscribe; // SPEC-022: StreamSubscriber ligado ao tail do log
 pub mod vm_bridge;
 pub mod zone_map; // SPEC-010: per-segment min/max skip-I/O primitive
 
@@ -293,11 +294,13 @@ pub struct Log {
     keystore: Option<Arc<KeyStore>>,
 }
 
-fn sync_parent_dir(_dir: &Path) -> Result<(), HeraclitusError> {
+fn sync_parent_dir(dir: &Path) -> Result<(), HeraclitusError> {
     #[cfg(unix)]
     {
         OpenOptions::new().read(true).open(dir)?.sync_all()?;
     }
+    #[cfg(not(unix))]
+    let _ = dir;
     Ok(())
 }
 
@@ -1263,9 +1266,64 @@ impl Log {
         catalog.sealed.iter().map(|c| c.meta.clone()).collect()
     }
 
+    /// SPEC-011 wired — o macro-estado do storage como `DatabaseManifest`
+    /// (SegmentDescriptors + watermark committed). Derivado do catálogo em
+    /// memória: barato, sem I/O, e consistente com o head fsync-acked.
+    pub fn manifest(&self) -> heraclitus_core::DatabaseManifest {
+        use heraclitus_core::runtime::{SegmentDescriptor, SegmentState};
+        let catalog = self.catalog.load();
+        let mut segments: Vec<SegmentDescriptor> = catalog
+            .sealed
+            .iter()
+            .map(|c| SegmentDescriptor {
+                segment_id: c.meta.id,
+                first_lsn: c.meta.base_lsn,
+                last_lsn: c.meta.max_lsn,
+                event_count: c.meta.max_lsn - c.meta.base_lsn + 1,
+                payload_hash: c.meta.blake3_root.unwrap_or([0; 32]),
+                state: SegmentState::Frozen,
+            })
+            .collect();
+        let active = &catalog.active.meta;
+        let head = self.head();
+        if head > active.base_lsn {
+            segments.push(SegmentDescriptor {
+                segment_id: active.id,
+                first_lsn: active.base_lsn,
+                last_lsn: head.saturating_sub(1),
+                event_count: head - active.base_lsn,
+                payload_hash: [0; 32], // ativo: Merkle só ao selar
+                state: SegmentState::Active,
+            });
+        }
+        heraclitus_core::DatabaseManifest {
+            manifest_version: 1,
+            format_identifier: *b"HRKL",
+            segments,
+            cumulative_watermark: head,
+            statistics_root_hash: [0; 32],
+        }
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }
+}
+
+/// SPEC-024 wired — o Log implementa o contrato de catálogo de segmentos: o
+/// planner resolve que segmentos são visíveis sob um snapshot sem conhecer o
+/// layout físico.
+impl heraclitus_core::contracts::SegmentCatalog for Log {
+    fn resolve_visible(&self, target_lsn: Lsn) -> Vec<SegmentId> {
+        self.manifest()
+            .visible_segments(target_lsn)
+            .map(|s| s.segment_id)
+            .collect()
+    }
+}
+
+#[allow(clippy::needless_lifetimes)]
+impl Log {
 
     fn decrypt_in_place(&self, ep: &mut Episode) -> Result<(), HeraclitusError> {
         let Some(ks) = &self.keystore else {

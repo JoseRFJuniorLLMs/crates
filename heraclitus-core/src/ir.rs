@@ -11,7 +11,16 @@ use crate::EventId;
 /// Declarative query intent (Compiler 1 input).
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalPlan {
-    Select { relations: Vec<String>, predicate_id: u32 },
+    Select {
+        relations: Vec<String>,
+        /// Conjunctive predicate ids (registered with the executor). The
+        /// OPTIMIZER decides their physical order by estimated selectivity —
+        /// the cost-based decision of SPEC-012.
+        predicates: Vec<u32>,
+        /// Optional aggregation: `(group_key_columns, sum_columns)`. Count is
+        /// always produced per group.
+        aggregate: Option<(Vec<u32>, Vec<u32>)>,
+    },
     GraphMatch { pattern_id: u32 },
     TraceProvenance { target: EventId },
 }

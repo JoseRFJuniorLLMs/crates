@@ -31,8 +31,8 @@ pub struct PruneStats {
     pub episodes_returned: usize,
 }
 
-pub struct SkipScanner<'a> {
-    log: &'a Log,
+pub struct SkipScanner {
+    log: Arc<Log>,
     cache: Mutex<HashMap<SegmentId, Arc<ZoneMap>>>,
     /// Zone maps built from a full segment scan (cold).
     built: AtomicUsize,
@@ -40,8 +40,11 @@ pub struct SkipScanner<'a> {
     loaded: AtomicUsize,
 }
 
-impl<'a> SkipScanner<'a> {
-    pub fn new(log: &'a Log) -> Self {
+impl SkipScanner {
+    /// Owns an `Arc<Log>` so a backend can keep ONE scanner alive across
+    /// queries — the in-RAM zone-map cache then pays off on every hit
+    /// (SPEC-028 reuse), not just within a single scan.
+    pub fn new(log: Arc<Log>) -> Self {
         Self {
             log,
             cache: Mutex::new(HashMap::new()),
@@ -55,6 +58,18 @@ impl<'a> SkipScanner<'a> {
     /// scanner should load everything and build nothing.
     pub fn build_stats(&self) -> (usize, usize) {
         (self.built.load(Ordering::Relaxed), self.loaded.load(Ordering::Relaxed))
+    }
+
+    /// Drop one segment's zone map from the in-RAM cache (SPEC-031 eviction
+    /// hook — the ArtifactRegistry drives WHAT to evict; this executes it).
+    /// The persisted sidecar survives, so a later query reloads it cheaply.
+    pub fn evict(&self, seg: SegmentId) -> bool {
+        self.cache.lock().unwrap().remove(&seg).is_some()
+    }
+
+    /// Number of zone maps currently held in RAM.
+    pub fn cached(&self) -> usize {
+        self.cache.lock().unwrap().len()
     }
 
     /// Path of a segment's derived zone-map sidecar (`<id>.zmap`). Derived and
@@ -166,7 +181,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Small segments → many sealed segments, so whole segments are alice-only
         // or bob-only and become skippable.
-        let log = Log::open(dir.path(), 2048, FsyncPolicy::Always).unwrap();
+        let log = std::sync::Arc::new(Log::open(dir.path(), 2048, FsyncPolicy::Always).unwrap());
         for i in 0..80 {
             log.append(ep("alice", i)).unwrap();
         }
@@ -181,7 +196,7 @@ mod tests {
             "need multiple sealed segments to demonstrate skipping"
         );
 
-        let scanner = SkipScanner::new(&log);
+        let scanner = SkipScanner::new(log.clone());
         scanner.warm().unwrap();
 
         // Query agent = "bob": alice-only segments must be skipped (zero I/O).
@@ -212,7 +227,7 @@ mod tests {
     #[test]
     fn persisted_sidecars_avoid_the_warm_rebuild() {
         let dir = tempfile::tempdir().unwrap();
-        let log = Log::open(dir.path(), 2048, FsyncPolicy::Always).unwrap();
+        let log = std::sync::Arc::new(Log::open(dir.path(), 2048, FsyncPolicy::Always).unwrap());
         for i in 0..120 {
             log.append(ep(if i % 2 == 0 { "alice" } else { "bob" }, i)).unwrap();
         }
@@ -220,7 +235,7 @@ mod tests {
         assert!(n_sealed >= 2);
 
         // First scanner: cold — builds every zone map and persists a sidecar.
-        let s1 = SkipScanner::new(&log);
+        let s1 = SkipScanner::new(log.clone());
         s1.warm().unwrap();
         let (built1, loaded1) = s1.build_stats();
         assert_eq!(built1, n_sealed, "cold run builds all");
@@ -228,7 +243,7 @@ mod tests {
 
         // Second scanner (fresh cache, same data dir) — loads every zone map from
         // the persisted sidecar, scanning zero full segments to build them.
-        let s2 = SkipScanner::new(&log);
+        let s2 = SkipScanner::new(log.clone());
         let (_res, stats) = s2.scan_pruned(|z| z.may_contain_agent("bob")).unwrap();
         let (built2, loaded2) = s2.build_stats();
         assert_eq!(built2, 0, "warm data dir must rebuild nothing");

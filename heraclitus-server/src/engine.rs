@@ -333,6 +333,24 @@ impl Engine {
         self.checkpoint_attr()
     }
 
+    /// SPEC-027 wired — endogenous telemetry: append the engine's vitals as
+    /// ordinary `SystemMetric` episodes, so the DB can query its own history
+    /// through the normal GQL engine (`WHERE n.kind = "SystemMetric"`).
+    /// Returns how many metric episodes were appended.
+    pub fn emit_telemetry(&self) -> Result<u64, HeraclitusError> {
+        use heraclitus_core::telemetry::SystemMetric;
+        let head = self.log.head();
+        let sealed = self.log.sealed_segments().len();
+        let metrics = [
+            SystemMetric::new("log_head_lsn", head as f64),
+            SystemMetric::new("sealed_segments", sealed as f64),
+        ];
+        for m in &metrics {
+            self.log.append(m.to_episode("heraclitus-engine"))?;
+        }
+        Ok(metrics.len() as u64)
+    }
+
     // ── H-VM ledger (M20) ────────────────────────────────────────────────────
     // The Sovereignty-Layer key/value ledger, reachable from the engine. Writes
     // are H-VM ISA bytecode appended to the *same* durable log as episodes
@@ -895,6 +913,31 @@ mod tests {
             ..Default::default()
         };
         Engine::open(&cfg).unwrap()
+    }
+
+    #[test]
+    fn spec027_telemetry_lands_in_log_and_is_gql_queryable() {
+        // SPEC-027 wired: emit_telemetry appends SystemMetric episodes to the
+        // ordinary log, and the DB can investigate itself via the normal GQL
+        // engine — the self-query the spec promises.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path());
+        let before = engine.log.head();
+        let n = engine.emit_telemetry().unwrap();
+        assert_eq!(n, 2, "log_head_lsn + sealed_segments");
+        assert_eq!(engine.log.head(), before + n);
+
+        // Self-query: the engine finds its own vitals through GQL.
+        let rows = heraclitus_query::execute(
+            "MATCH (n) WHERE n.agent_id = \"heraclitus-engine\" RETURN n",
+            &engine,
+        )
+        .unwrap();
+        let arr = rows.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "both metric episodes visible via GQL");
+        let dump = rows.to_string();
+        assert!(dump.contains("log_head_lsn"), "got: {dump}");
+        assert!(dump.contains("sealed_segments"));
     }
 
     #[test]

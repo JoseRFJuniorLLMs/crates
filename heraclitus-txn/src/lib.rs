@@ -43,6 +43,25 @@ impl TxnManager {
         Snapshot(self.log.head())
     }
 
+    /// SPEC-019 wired — open a snapshot under an explicit isolation level.
+    /// All levels resolve to a pinned LSN (reads never see past it):
+    /// - `HistoricalSnapshot(l)` — anchored at `l` (`AS OF`), ignoring newer data;
+    /// - `RepeatableSnapshot` / `ReadCommittedSnapshot` — pinned at the current
+    ///   committed head (the log only exposes fsync-acked events, so "committed"
+    ///   is exactly `head()`);
+    /// - `StreamingSnapshot` — same pin; the live tail arrives via
+    ///   `heraclitus_log::subscribe::attach_subscriber` (SPEC-022), never by
+    ///   mutating this snapshot.
+    pub fn begin_with(&self, level: heraclitus_core::IsolationLevel) -> Snapshot {
+        use heraclitus_core::IsolationLevel::*;
+        match level {
+            HistoricalSnapshot(lsn) => Snapshot(lsn.min(self.log.head())),
+            RepeatableSnapshot(_) | ReadCommittedSnapshot(_) | StreamingSnapshot(_) => {
+                Snapshot(self.log.head())
+            }
+        }
+    }
+
     /// Read everything visible in `snap` within `[from, to)`.
     pub fn read_at(
         &self,
@@ -231,6 +250,28 @@ mod tests {
         // …a second writer using the same stale snapshot must conflict.
         let err = txn.compare_and_append(snap.lsn(), ep("stale")).unwrap_err();
         assert!(matches!(err, HeraclitusError::CasConflict { .. }));
+    }
+
+    #[test]
+    fn isolation_levels_pin_the_right_lsn() {
+        use heraclitus_core::IsolationLevel::*;
+        let (_d, txn) = open();
+        for i in 0..10 {
+            txn.append(ep(&format!("e{i}"))).unwrap();
+        }
+        // Historical: anchored at 4 — sees exactly e0..e3.
+        let hist = txn.begin_with(HistoricalSnapshot(4));
+        assert_eq!(txn.read_at(hist, 0, u64::MAX).unwrap().len(), 4);
+        // Historical beyond head clamps to head (cannot see the future).
+        let fut = txn.begin_with(HistoricalSnapshot(999));
+        assert_eq!(fut.lsn(), 10);
+        // Repeatable: pinned at open; later appends are invisible to it.
+        let rep = txn.begin_with(RepeatableSnapshot(0));
+        txn.append(ep("later")).unwrap();
+        assert_eq!(txn.read_at(rep, 0, u64::MAX).unwrap().len(), 10);
+        // ReadCommitted/Streaming re-opened after the append see it.
+        let rc = txn.begin_with(ReadCommittedSnapshot(0));
+        assert_eq!(txn.read_at(rc, 0, u64::MAX).unwrap().len(), 11);
     }
 
     #[test]

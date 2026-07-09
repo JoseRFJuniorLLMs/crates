@@ -10,6 +10,7 @@ description = "SQL analytics (DataFusion) over the immutable log — read-only, 
 [dependencies]
 heraclitus-core = { workspace = true }
 heraclitus-log = { workspace = true }
+core_affinity = "0.8"
 datafusion = "54.0.0"
 serde_json = { workspace = true }
 tokio = { workspace = true }

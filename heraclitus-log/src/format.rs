@@ -77,11 +77,25 @@ impl SegmentHeader {
             });
         }
         let version = u16::from_le_bytes(buf[4..6].try_into().unwrap());
-        if version > FORMAT_VERSION {
-            return Err(HeraclitusError::Corruption {
-                context: "segment header".into(),
-                detail: format!("unknown format version {version}"),
-            });
+        // SPEC-029 wired: a validação passa pelo negociador formal de versões.
+        // O u16 do disco mapeia para (major=version, minor=0, flags=0); um
+        // major mais novo que o suportado é rejeição dura (nunca interpretar
+        // bytes que este binário não entende); minor/flags ficam prontos para
+        // quando o header os carregar. Bytes no disco: INTOCADOS.
+        use heraclitus_core::format_version::{Compatibility, StorageFormatVersion};
+        let on_disk = StorageFormatVersion::new(version, 0, 0);
+        let supported = StorageFormatVersion::new(FORMAT_VERSION, 0, 0);
+        match on_disk.negotiate(supported, 0) {
+            Compatibility::Reject(reason) if version > FORMAT_VERSION => {
+                return Err(HeraclitusError::Corruption {
+                    context: "segment header".into(),
+                    detail: format!("format negotiation failed: {reason}"),
+                });
+            }
+            // Major mais ANTIGO é legível por construção neste log (os decoders
+            // v<=N são mantidos), por isso o Reject "needs migration" do
+            // negociador genérico não se aplica aqui.
+            _ => {}
         }
         Ok(Self {
             version,

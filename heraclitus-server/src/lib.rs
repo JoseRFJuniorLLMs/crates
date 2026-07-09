@@ -5,6 +5,8 @@ pub mod boot;
 pub mod embedded;
 pub mod engine;
 pub mod grpc;
+#[cfg(feature = "analytics")]
+pub mod flight_grpc; // SPEC-016: protocolo Arrow Flight real (gRPC, tonic 0.14)
 pub mod rest;
 
 pub use embedded::Embedded;
@@ -123,6 +125,53 @@ pub async fn serve_with(
         None
     };
 
+    // SPEC-027 — telemetria endógena: os vitais do motor entram no PRÓPRIO log
+    // como episódios `SystemMetric` (opt-in via telemetry_interval_secs > 0),
+    // consultáveis por GQL. Nunca no caminho de escrita do cliente.
+    let telemetry_task = if config.telemetry_interval_secs > 0 {
+        let engine_tl = engine.clone();
+        let every = std::time::Duration::from_secs(config.telemetry_interval_secs);
+        boot.warn_line(
+            "Telemetria endógena",
+            &format!("SystemMetric a cada {}s", config.telemetry_interval_secs),
+        );
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // primeiro tick dispara já; salta-o
+            loop {
+                tick.tick().await;
+                let e = engine_tl.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(err) = e.emit_telemetry() {
+                        tracing::warn!(error = %err, "telemetria endógena falhou neste tick");
+                    }
+                })
+                .await;
+            }
+        }))
+    } else {
+        None
+    };
+
+    // SPEC-016 — servidor Arrow Flight (gRPC, tonic 0.14, listener próprio).
+    // Opt-in via flight_addr; só existe com a feature `analytics`.
+    #[cfg(feature = "analytics")]
+    let flight_task = if let Some(addr) = config.flight_addr.clone() {
+        match flight_grpc::serve_flight(engine.log.clone(), &addr).await {
+            Ok((local, handle)) => {
+                boot.ok_line("Arrow Flight (gRPC)", &format!("grpc://{local}"));
+                Some(handle)
+            }
+            Err(e) => {
+                boot.warn_line("Arrow Flight", &format!("falhou a arrancar: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Compliance daemon (RFC 3161 watermark timestamping). Off by default; never
     // on the append path. Receipts under `<data_dir>/receipts`.
     let compliance_task = if config.compliance_enabled {
@@ -172,6 +221,13 @@ pub async fn serve_with(
         t.abort();
     }
     if let Some(t) = checkpoint_task {
+        t.abort();
+    }
+    if let Some(t) = telemetry_task {
+        t.abort();
+    }
+    #[cfg(feature = "analytics")]
+    if let Some(t) = flight_task {
         t.abort();
     }
     // Shutdown gracioso = checkpoint das views (fast boot): o próximo arranque

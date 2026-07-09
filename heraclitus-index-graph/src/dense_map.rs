@@ -67,6 +67,23 @@ impl DenseEntityMap {
         self.backward.is_empty()
     }
 
+    /// All mapped events in dense-id order (`events()[i]` has dense id `i`).
+    /// This is the LSN-replay order, so iterating it is deterministic.
+    pub fn events(&self) -> &[EventId] {
+        &self.backward
+    }
+
+    /// Rebuild from a dense-ordered event list (checkpoint restore): the ids
+    /// are re-assigned `0..n` in slice order, matching the original mapping.
+    pub fn from_events(events: Vec<EventId>) -> Self {
+        let forward = events
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, i as u32))
+            .collect();
+        Self { forward, backward: events }
+    }
+
     /// Phase 2+3 (Optimize → Freeze): publish an immutable, shareable view.
     /// Phase 2 (physical renumbering for cache affinity) is intentionally a
     /// no-op here; any such permutation MUST keep `forward`/`backward` in sync

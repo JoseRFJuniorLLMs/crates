@@ -73,6 +73,8 @@ pub enum ArtifactType {
     RoaringBitmapFilter,
     VectorCacheHnsw,
     ArrowColumnarBatch,
+    /// Per-segment min/max summary used for skip-I/O (SPEC-010).
+    ZoneMap,
 }
 
 /// Homogeneous lifecycle contract for any accelerator structure (CSR, HNSW

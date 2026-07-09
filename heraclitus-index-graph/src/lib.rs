@@ -25,9 +25,9 @@ pub struct GraphIndex {
     inn: DashMap<EventId, Vec<EventId>>,
     /// (key=value) -> internal id bitmap
     attr_idx: DashMap<String, RoaringBitmap>,
-    /// event -> dense internal id (assigned in LSN order: deterministic)
-    internal: HashMap<EventId, u32>,
-    by_internal: Vec<EventId>,
+    /// SPEC-009 wired: event ↔ dense internal id (assigned in LSN order,
+    /// deterministic) via the DenseEntityMap instead of an ad-hoc map pair.
+    dense: dense_map::DenseEntityMap,
     /// event -> lsn (snapshot reads)
     lsn_of: HashMap<EventId, Lsn>,
     watermark: Lsn,
@@ -77,11 +77,11 @@ impl GraphIndex {
     }
 
     pub fn internal_id(&self, id: &EventId) -> Option<u32> {
-        self.internal.get(id).copied()
+        self.dense.lookup_id(id)
     }
 
     pub fn event_of_internal(&self, internal: u32) -> Option<EventId> {
-        self.by_internal.get(internal as usize).copied()
+        self.dense.lookup_event(internal)
     }
 
     pub fn lsn_of(&self, id: &EventId) -> Option<Lsn> {
@@ -89,11 +89,11 @@ impl GraphIndex {
     }
 
     pub fn len(&self) -> usize {
-        self.by_internal.len()
+        self.dense.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_internal.is_empty()
+        self.dense.is_empty()
     }
 
     /// Canonical, deterministic BLAKE3 signature of the derived graph state
@@ -109,15 +109,15 @@ impl GraphIndex {
     pub fn state_hash(&self) -> [u8; 32] {
         let mut h = blake3::Hasher::new();
         h.update(b"HGRAPH-STATE-v1");
-        h.update(&(self.by_internal.len() as u64).to_be_bytes());
-        for (i, ev) in self.by_internal.iter().enumerate() {
+        h.update(&(self.dense.len() as u64).to_be_bytes());
+        for (i, ev) in self.dense.events().iter().enumerate() {
             h.update(&(i as u32).to_be_bytes());
             h.update(&ev.0.to_bytes()); // 16-byte ULID identity
             // Children (out-edges) resolved to dense internal ids, then sorted.
             let mut outs: Vec<u32> = self
                 .out
                 .get(ev)
-                .map(|v| v.iter().filter_map(|t| self.internal.get(t).copied()).collect())
+                .map(|v| v.iter().filter_map(|t| self.dense.lookup_id(t)).collect())
                 .unwrap_or_default();
             outs.sort_unstable();
             h.update(&(outs.len() as u32).to_be_bytes());
@@ -171,7 +171,7 @@ impl View for GraphIndex {
                     .map(|e| (*e.key(), e.value().clone()))
                     .collect(),
                 attr,
-                by_internal: self.by_internal.clone(),
+                by_internal: self.dense.events().to_vec(),
                 lsn_of: self.lsn_of.iter().map(|(k, v)| (*k, *v)).collect(),
                 watermark: self.watermark,
             },
@@ -193,13 +193,7 @@ impl View for GraphIndex {
                     .map_err(|e| heraclitus_core::HeraclitusError::Serialization(e.to_string()))
             })
             .collect::<Result<_, _>>()?;
-        self.internal = snap
-            .by_internal
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (*id, i as u32))
-            .collect();
-        self.by_internal = snap.by_internal;
+        self.dense = dense_map::DenseEntityMap::from_events(snap.by_internal);
         self.lsn_of = snap.lsn_of.into_iter().collect();
         self.watermark = snap.watermark;
         Ok(true)
@@ -208,13 +202,11 @@ impl View for GraphIndex {
     fn apply(&mut self, lsn: Lsn, event: &Episode) {
         // Audit #9: idempotent replay must bail out entirely — continuing
         // would duplicate adjacency rows and index a wrong internal id.
-        if self.internal.contains_key(&event.id) {
+        if self.dense.lookup_id(&event.id).is_some() {
             self.watermark = lsn;
             return;
         }
-        let internal = self.by_internal.len() as u32;
-        self.internal.insert(event.id, internal);
-        self.by_internal.push(event.id);
+        let internal = self.dense.get_or_alloc(event.id);
         self.lsn_of.insert(event.id, lsn);
         for parent in &event.parents {
             self.out.entry(*parent).or_default().push(event.id);

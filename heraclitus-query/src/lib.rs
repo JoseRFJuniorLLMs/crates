@@ -182,6 +182,74 @@ mod tests {
     }
 
     #[test]
+    fn spec028_zone_maps_are_registered_and_reused_across_queries() {
+        // SPEC-028/031 wired: o scanner é persistente no backend; a 1ª query
+        // regista os zone maps no ArtifactRegistry e a 2ª reutiliza-os do cache
+        // em RAM (sem rebuild) — o registry cataloga cada um.
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 2048, FsyncPolicy::Always).unwrap());
+        for i in 0..90 {
+            log.append(Episode::new(
+                if i % 2 == 0 { "alice" } else { "bob" },
+                EventKind::Observation,
+                format!("e{i:04}-xxxxxxxxxxxxxxxxxxxxxxxx").into_bytes(),
+            ))
+            .unwrap();
+        }
+        let n_sealed = log.sealed_segments().len();
+        assert!(n_sealed >= 2);
+        let be = LogBackend::new(log);
+
+        let q = "MATCH (n) WHERE n.agent_id = \"alice\" RETURN n";
+        let v1 = execute(q, &be).unwrap();
+        let (artifacts, cached) = be.artifact_stats();
+        assert_eq!(artifacts, n_sealed, "um artefacto por zone map de segmento");
+        assert_eq!(cached, n_sealed, "zone maps vivos em RAM entre queries");
+
+        // 2ª query: mesmos resultados, cache persistente (nada rebuildado).
+        let v2 = execute(q, &be).unwrap();
+        assert_eq!(v1, v2);
+        assert_eq!(be.artifact_stats(), (n_sealed, n_sealed));
+    }
+
+    #[test]
+    fn spec032_adaptive_fallback_when_skip_scan_proves_slow() {
+        // SPEC-032 wired: se o EMA diz que o skip-scan é >20% mais lento que o
+        // window-scan, scan_builtin_eq devolve None (fallback) — e a query
+        // continua CORRETA pelo window scan + pós-filtro.
+        use backend::QueryBackend as _;
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        for i in 0..10 {
+            log.append(Episode::new(
+                if i % 2 == 0 { "alice" } else { "bob" },
+                EventKind::Observation,
+                format!("e{i}").into_bytes(),
+            ))
+            .unwrap();
+        }
+        let be = LogBackend::new(log);
+
+        // Histórico: skip lento (1ms) vs window rápido (0.1ms) → fallback.
+        for _ in 0..5 {
+            be.observe_access_path("skip", 1_000_000.0);
+            be.observe_access_path("window", 100_000.0);
+        }
+        let hint = be.scan_builtin_eq("agent_id", "alice", None).unwrap();
+        assert!(hint.is_none(), "EMA manda cair para o window scan");
+        // A query continua correta (planner usa o scan + pós-filtro).
+        let v = execute("MATCH (n) WHERE n.agent_id = \"alice\" RETURN n", &be).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 5);
+
+        // Histórico invertido: skip rápido → o hint volta a existir.
+        for _ in 0..50 {
+            be.observe_access_path("skip", 10_000.0);
+        }
+        let hint = be.scan_builtin_eq("agent_id", "alice", None).unwrap();
+        assert!(hint.is_some(), "skip volta a ser o caminho preferido");
+    }
+
+    #[test]
     fn why_until_returns_minimal_causal_chain() {
         // SPEC-014: WHY(effect) UNTIL "cause" returns the shortest path in the
         // parent DAG, not the full ancestor trace.

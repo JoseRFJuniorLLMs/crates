@@ -74,6 +74,16 @@ pub struct HeraclitusConfig {
     pub compliance_tsa_url: String,
     /// Authority/policy name recorded in each receipt.
     pub compliance_tsa_policy: String,
+
+    /// SPEC-016 — endereço do servidor Arrow Flight (gRPC, feature `analytics`).
+    /// `None` = desligado (default).
+    pub flight_addr: Option<String>,
+
+    /// SPEC-027 — endogenous telemetry: append `SystemMetric` episodes with the
+    /// engine's vitals every N seconds, so the DB can query its own history via
+    /// GQL (`WHERE n.kind = "SystemMetric"`). `0` = off (default; each tick
+    /// grows the log by a few events, so it is an explicit opt-in).
+    pub telemetry_interval_secs: u64,
 }
 
 impl Default for HeraclitusConfig {
@@ -99,6 +109,8 @@ impl Default for HeraclitusConfig {
             compliance_tsa_mode: "local".to_string(),
             compliance_tsa_url: String::new(),
             compliance_tsa_policy: "ACT-dev".to_string(),
+            flight_addr: None,
+            telemetry_interval_secs: 0,
         }
     }
 }
@@ -169,6 +181,14 @@ impl HeraclitusConfig {
         if let Ok(v) = std::env::var("HERACLITUS_COMPLIANCE_STEP") {
             if let Ok(s) = v.parse() {
                 self.compliance_min_lsn_step = s;
+            }
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_FLIGHT_ADDR") {
+            self.flight_addr = if v.is_empty() { None } else { Some(v) };
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_TELEMETRY_INTERVAL") {
+            if let Ok(s) = v.parse() {
+                self.telemetry_interval_secs = s;
             }
         }
         if let Ok(v) = std::env::var("HERACLITUS_COMPLIANCE_TSA_URL") {

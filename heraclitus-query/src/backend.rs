@@ -841,6 +841,17 @@ pub struct LogBackend {
     log: Arc<Log>,
     bundle: ArcSwap<SnapshotBundle>,
     sync_mutex: Mutex<()>,
+    /// SPEC-028 wired: um SkipScanner vivo entre queries — o cache de zone maps
+    /// em RAM paga-se a cada hit, e o ArtifactRegistry cataloga cada zone map
+    /// (fingerprint por segmento) para reuso/evicção LRU sob pressão.
+    scanner: SkipScanner,
+    artifacts: Mutex<heraclitus_core::artifact_registry::ArtifactRegistry>,
+    /// artifact_id → segment (para a evicção em cascata executar no scanner).
+    artifact_segments: Mutex<std::collections::HashMap<u64, heraclitus_core::SegmentId>>,
+    /// SPEC-032 wired: calibrador EMA por fingerprint de caminho de acesso; se
+    /// o skip-scan se provar mais lento que o window-scan, o planner cai de
+    /// volta (adaptativo, sem redes neuronais — pura estatística).
+    calibrator: Mutex<heraclitus_core::cost::EmaCalibrator>,
 }
 
 impl LogBackend {
@@ -854,10 +865,74 @@ impl LogBackend {
             vector_index: Arc::new(HnswIndex::default()),
         };
         Self {
+            scanner: SkipScanner::new(log.clone()),
             log,
             bundle: ArcSwap::from_pointee(initial_bundle),
             sync_mutex: Mutex::new(()),
+            artifacts: Mutex::new(Default::default()),
+            artifact_segments: Mutex::new(std::collections::HashMap::new()),
+            calibrator: Mutex::new(heraclitus_core::cost::EmaCalibrator::new(0.3)),
         }
+    }
+
+    /// Fingerprint de intenção para um caminho de acesso (SPEC-011/028).
+    fn access_fingerprint(kind: &str, seed: u64) -> heraclitus_core::QueryFingerprint {
+        let mut h = blake3::Hasher::new();
+        h.update(kind.as_bytes());
+        h.update(&seed.to_be_bytes());
+        heraclitus_core::QueryFingerprint {
+            logical_intent_hash: *h.finalize().as_bytes(),
+            applicable_snapshot: seed,
+        }
+    }
+
+    /// SPEC-032: regista uma medição de latência de um caminho de acesso
+    /// (`"skip"` ou `"window"`). Público para o executor — e para testes.
+    pub fn observe_access_path(&self, path: &str, nanos: f64) {
+        let fp = Self::access_fingerprint(path, 0);
+        self.calibrator.lock().unwrap().observe(fp.logical_intent_hash, nanos);
+    }
+
+    fn predicted_access_path(&self, path: &str) -> Option<f64> {
+        let fp = Self::access_fingerprint(path, 0);
+        self.calibrator.lock().unwrap().predicted(&fp.logical_intent_hash)
+    }
+
+    /// SPEC-028/031: cataloga os zone maps tocados; sob pressão (mais entradas
+    /// em RAM que `cap`), evicta o LRU do registry E do cache do scanner.
+    fn register_zone_maps(&self, cap: usize) {
+        let sealed = self.log.sealed_segments();
+        let mut reg = self.artifacts.lock().unwrap();
+        let mut seg_of = self.artifact_segments.lock().unwrap();
+        for meta in &sealed {
+            let fp = Self::access_fingerprint("zonemap", meta.id);
+            if reg.lookup(&fp).is_none() {
+                let id = reg.register(
+                    fp,
+                    heraclitus_core::ArtifactType::ZoneMap,
+                    1024, // estimativa fixa por zone map
+                    vec![],
+                );
+                seg_of.insert(id, meta.id);
+            }
+        }
+        while self.scanner.cached() > cap {
+            let Some(evicted) = reg.evict_lru() else { break };
+            let mut dropped = false;
+            for id in evicted {
+                if let Some(seg) = seg_of.remove(&id) {
+                    dropped |= self.scanner.evict(seg);
+                }
+            }
+            if !dropped {
+                break; // registry esvaziou sem reduzir o cache — evita loop
+            }
+        }
+    }
+
+    /// Estatísticas do registry (testes/introspecção): `(artefactos, zone maps em RAM)`.
+    pub fn artifact_stats(&self) -> (usize, usize) {
+        (self.artifacts.lock().unwrap().len(), self.scanner.cached())
     }
 
     fn sync_bundle(&self) -> Result<Arc<SnapshotBundle>, HeraclitusError> {
@@ -1062,16 +1137,30 @@ impl QueryBackend for LogBackend {
         as_of: Option<Lsn>,
     ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
         let bound = self.resolve_as_of_bound(as_of)?;
-        // Skip-I/O over sealed segments: segments whose zone map cannot contain
-        // `value` for this field are never read (SPEC-010). Zone maps are cached
-        // in the derived `.zmap` sidecars, so this pays no full-segment warm read
-        // after the first build.
-        let scanner = SkipScanner::new(&self.log);
+        // SPEC-032 (adaptativo): se o histórico EMA diz que o skip-scan tem sido
+        // >20% mais lento que o window-scan, devolve None — o planner cai no
+        // window scan e o pós-filtro mantém a correção. Sem histórico, skip.
+        if let (Some(skip_ns), Some(win_ns)) = (
+            self.predicted_access_path("skip"),
+            self.predicted_access_path("window"),
+        ) {
+            if skip_ns > win_ns * 1.2 {
+                return Ok(None);
+            }
+        }
+        // Skip-I/O over sealed segments (SPEC-010) com o scanner PERSISTENTE
+        // (SPEC-028: o cache de zone maps sobrevive entre queries; sidecars
+        // .zmap cobrem o cold boot).
+        let t0 = std::time::Instant::now();
         let (mut hits, _stats) = match field {
-            "agent_id" => scanner.scan_pruned(|z| z.may_contain_agent(value))?,
-            "session_id" => scanner.scan_pruned(|z| z.may_contain_session(value))?,
+            "agent_id" => self.scanner.scan_pruned(|z| z.may_contain_agent(value))?,
+            "session_id" => self.scanner.scan_pruned(|z| z.may_contain_session(value))?,
             _ => return Ok(None), // field not summarized by the zone map
         };
+        self.observe_access_path("skip", t0.elapsed().as_nanos() as f64);
+        // SPEC-028/031: cataloga os zone maps tocados e aplica a política de
+        // evicção (cap de zone maps em RAM; o registry escolhe o LRU).
+        self.register_zone_maps(1024);
         // Respect the AS OF ceiling and the query scan cap. We return a superset
         // of the surviving segments; the planner's `matches` post-filter checks
         // the exact field, so correctness never depends on this hint.

@@ -33,6 +33,9 @@ heraclitus-retrieval = { workspace = true }
 heraclitus-query = { workspace = true }
 heraclitus-proto = { workspace = true }
 heraclitus-analytics = { workspace = true, optional = true }
+arrow-flight = { version = "58", optional = true }
+tonic-flight = { package = "tonic", version = "0.14", optional = true }
+futures = { version = "0.3", optional = true }
 tonic = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
@@ -50,7 +53,7 @@ gpu = ["heraclitus-index-vector/gpu"]
 # SQL analytics over the log (DataFusion). Off by default — DataFusion is a
 # heavy dependency and the default server/service stays lean. Enables
 # `Embedded::analytics()` and the REST `POST /sql` route.
-analytics = ["dep:heraclitus-analytics"]
+analytics = ["dep:heraclitus-analytics", "dep:arrow-flight", "dep:futures", "dep:tonic-flight"]
 
 # Only the service binary needs these, and only on Windows.
 [target.'cfg(windows)'.dependencies]
