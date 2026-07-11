@@ -27,34 +27,171 @@ código v3.2.0 verbatim, que não compilava).
 
 | SPEC | Módulo real | Testado | Wired ao motor vivo |
 |---|---|---|---|
-| 009 | `core::canonical::CanonicalKeyCodec` · `index_graph::dense_map` | ✅ | 🟡 `CanonicalKeyCodec` **wired** no `index-attr` (range scans; corrigiu bug −0.0/+0.0). `DenseEntityMap` ainda não usado |
+| 009 | `core::canonical::CanonicalKeyCodec` · `index_graph::dense_map` | ✅ | ✅ **completo**: codec no `index-attr` (bug −0.0/+0.0 corrigido) + `DenseEntityMap` é agora o mapa denso interno do `GraphIndex` |
 | 010 | `zone_map::ZoneMap` (lsn/ts/agent/session/attrs) + `skip_scan::SkipScanner` (+ sidecar `.zmap`) + pushdown GQL `scan_builtin_eq` | ✅ | ✅ **ponta-a-ponta**: query `WHERE agent_id/session_id=…` → planner → skip por zone map → sidecar persistente (cold-boot). Salta segmentos, nunca perde match. |
-| 011 | `core::runtime` (StorageEngine, DatabaseManifest, DerivedExecutionArtifact, budgets) · `txn::SnapshotManager` | ✅ | 🟡 parcial |
-| 012/013 | `core::ir` (LogicalPlan/PhysicalIr/DAG) · `core::cost` | ✅ | ❌ |
+| 011 | `core::runtime` (StorageEngine, DatabaseManifest, DerivedExecutionArtifact, budgets) · `txn::SnapshotManager` | ✅ | ✅ `Log::manifest()` produz o `DatabaseManifest` real (segmentos+watermark, Merkle nos selados); `StorageEngine` trait fica p/ backend alternativo |
+| 012/013 | `core::ir` · `core::cost` · **`analytics::vectorized`** (motor Arrow real) | ✅ | ✅ **engine v1**: `SelectivityOptimizer` (filtros ordenados por seletividade — cost-based) → DAG `PhysicalIr` → `VecExecutor` (batches 1024, kernel `filter_record_batch`, aggregate, hash join). Gate C testado (ordem de plano nunca muda o resultado). SQL continua no DataFusion (não duplicado). |
 | 014 | `index_graph::provenance::ProvenanceEngine` · `core::dispatcher` · query `WHY(…) UNTIL "cause"` (minimal chain) | ✅ | ✅ **WHY UNTIL wired na GQL** (gramática→AST→plan→backend); minimal causal chain, shortest path testado |
-| 016 | `core::flight::FlightService` (contrato) | ✅ | ❌ (falta gRPC+Arrow IPC) |
-| 019 | `core::consistency::IsolationLevel` | ✅ | ❌ |
-| 022 | `core::streaming::StreamSubscriber` | ✅ | ❌ |
+| 016 | `core::flight` · `analytics::flight` (IPC) · **`server::flight_grpc` (protocolo REAL)** | ✅ | ✅ **COMPLETO**: servidor `arrow.flight.protocol` (arrow-flight 58 + tonic 0.14, listener próprio `flight_addr`, opt-in) — **`FlightClient` oficial testado ponta-a-ponta** (DoGet 2500 linhas, `as_of`, GetSchema, erro limpo). + data plane IPC + rota REST. |
+| 019 | `core::consistency::IsolationLevel` | ✅ | ✅ **wired**: `TxnManager::begin_with(level)` pina o LSN por nível (Historical clampa ao head; Repeatable fixa; RC/Streaming = head committed) |
+| 022 | `core::streaming::StreamSubscriber` | ✅ | ✅ **wired**: `log::subscribe::attach_subscriber` liga ao `tail_subscribe` real (on_append por evento; overflow → catch-up LSN) |
 | 023 | **HQL — REJEITADO por design** (mantém GQL) | — | — |
-| 024 | `core::contracts` (Planner/Optimizer/TaskScheduler/SegmentCatalog) | ✅ | ❌ |
-| 025 | `core::plugin` (HeraclitusPlugin + PluginHost) | ✅ | ❌ |
-| 026 | `core::capability::CapabilityCatalog` (detect real) | ✅ | ❌ |
-| 027 | `EventKind::SystemMetric` · `core::telemetry` | ✅ | ❌ (falta thread de telemetria) |
-| 028/031 | `core::artifact_registry` (registry + evicção em cascata) | ✅ | ❌ |
-| 029 | `core::format_version::StorageFormatVersion` (negociação) | ✅ | ❌ (log usa `u16` simples) |
+| 024 | `core::contracts` (Planner/Optimizer/TaskScheduler/SegmentCatalog) | ✅ | ✅ **os 6 contratos com impl viva**: `StorageEngine`+`SegmentCatalog` no `Log` real, `Optimizer`/`TaskScheduler` no motor vetorizado (012/013), `ReplaySink` no dispatcher, e agora **`Planner` = `analytics::planner::AnalyticalPlanner`** (query string → `LogicalPlan`). `run_analytical` corre Planner→Optimizer→Executor ponta-a-ponta a partir de texto (Gate C testado) |
+| 025 | `core::plugin` (HeraclitusPlugin + PluginHost) | ✅ | ✅ **wired via WASM**: `heraclitus-wasm::WasmPluginAdapter` regista plugins WASM no `PluginHost` (operador `wasm:<nome>`); execução na sandbox |
+| 026 | `core::capability::CapabilityCatalog` (detect real) | ✅ | ✅ **wired**: o `VecExecutor` consulta o catálogo — >1 CPU + input grande ⇒ filtro paralelo por partições indexadas; paralelo ≡ serial **bit-idêntico** (testado) |
+| 027 | `EventKind::SystemMetric` · `core::telemetry` | ✅ | ✅ **wired**: `Engine::emit_telemetry` + task periódica no server (`telemetry_interval_secs`, opt-in); self-query GQL testado |
+| 028/031 | `core::artifact_registry` (registry + evicção em cascata) | ✅ | ✅ **wired**: `LogBackend` mantém um `SkipScanner` persistente; cada zone map é catalogado (fingerprint/segmento) e a evicção LRU do registry despeja o cache do scanner |
+| 029 | `core::format_version::StorageFormatVersion` (negociação) | ✅ | ✅ **wired**: o decode do header do segmento negoceia via SPEC-029 (major novo = rejeição dura); bytes no disco intocados; `v2_compat` verde |
 | 030 | `index_graph::GraphIndex::state_hash` + trait `View` | ✅ | ✅ |
-| 032 | `core::cost::EmaCalibrator` | ✅ | ❌ |
-| 033 | `core::numa` (política; pinning real = follow-up OS) | ✅ | ❌ |
-| 034 | `core::ebr::Versioned<T>` (reclamação por Arc) | ✅ | ❌ |
-| 035 | `core::sandbox::run_sandboxed` (crash boundary; WASM = follow-up) | ✅ | ❌ |
-| 015/021 | `raft` log-shipping v0 + hardening (partição/heal/state_hash) | ✅ | 🟡 |
+| 032 | `core::cost::EmaCalibrator` | ✅ | ✅ **wired**: o `LogBackend` mede cada skip-scan e, se o EMA disser que é >20% mais lento que o window-scan, o planner cai de volta (adaptativo, testado nos dois sentidos) |
+| 033 | `core::numa` (política) + **pinning real (`core_affinity`)** | ✅ | ✅ **wired (v1)**: `pin_workers` no `VecExecutor` pina as worker threads do filtro paralelo a cores reais (round-robin; `set_for_current` verificado no host). Alocação node-local NUMA plena = follow-up multi-socket. |
+| 034 | `core::ebr::Versioned<T>` (reclamação por Arc) | ✅ | ✅ **satisfeito por equivalente superior**: o `SnapshotBundle` do backend já faz blue-green via `ArcSwap` (lock-free no load); `Versioned<T>` fica como utilitário p/ novos usos |
+| 035 | `core::sandbox::run_sandboxed` · **`heraclitus-wasm` (wasmtime 31)** | ✅ | ✅ **sandbox WASM real**: isolamento de memória por construção, **fuel metering** (loop infinito → Err tratado, host vivo — testado), traps contidos, módulo inválido rejeitado no load. Crate separado = opt-in (tese preservada). |
+| 015/021 | `raft` log-shipping v0 + hardening **+ consenso openraft real (feature `replication`)** | ✅ | 🟡→✅ **consenso provado in-process** (`raft::consensus`, openraft 0.9.24): eleição+aplicação idêntica+`state_hash` bit-idêntico, **failover** (líder morto → maioria elege → writes continuam → heal → convergência), minoria isolada não faz falso ack + reintegra limpa, redirect `ForwardToLeader`, duplo failover, snapshot (round-trip **e transferência real**: líder purga o log → seguidor atrasado apanha via `install_snapshot`), **raft-log DURÁVEL em disco (`FileRaftLog`) com restart de processo provado (sem duplicar/perder), e transporte de rede TCP real (`net`: eleição/replicação/failover sobre sockets)**. Só bytes de episódios viajam (`AppData` = bincode do `Episode`). Endurecido por revisão adversarial (corrigido 1 bug real de TOCTOU no `build_snapshot`). Resta apenas um wrapper gRPC/tonic cosmético sobre os mesmos tipos serde. |
 | 020 | crash recovery (torn-write) — **já existia** no log | ✅ | ✅ |
 
-**Próximo nível (não feito):** *wiring* — pôr o `ZoneMap` no planner de scan, o
-`CanonicalKeyCodec` nos índices, expor `FlightService` por gRPC, ligar a thread de
-telemetria, enforçar `IsolationLevel` no servidor. E os que são honestamente
-"referência, não produção": Flight real (gRPC+Arrow), NUMA pinning (libnuma),
-sandbox WASM (wasmtime). Cada um é um milestone próprio.
+**Próximo nível (o que realmente falta):** o *wiring* dos módulos ao caminho vivo
+está **feito** (ver coluna "Wired" — a maioria ✅; este parágrafo antigo dizia o
+contrário e ficou desatualizado). O que genuinamente resta é de outra ordem de
+grandeza e está deliberadamente adiado:
+
+- **SPEC-015/021 — consenso Raft real** — **fechado em 2026-07-10** (ver linha
+  015/021 da tabela): openraft 0.9 atrás da feature `replication`, com eleição,
+  quórum, failover e **raft-log durável + restart de processo** provados por
+  testes de cluster in-process (30× sem flake), endurecidos por revisão
+  adversarial multi-agente. Corre também sobre **transporte de rede TCP real**
+  (não só o router in-process). Resta apenas um wrapper gRPC/tonic cosmético.
+- **Itens "referência, não produção" já com impl real mas a endurecer:** NUMA
+  node-local pleno (multi-socket; hoje só pinning round-robin), kernels AVX
+  explícitos (hoje os kernels Arrow já são SIMD por baixo), quórum distribuído.
+
+## ATUALIZAÇÃO 2026-07-10 — SPEC-024 fechado (o 6.º contrato: `Planner`)
+
+Dos seis contratos de subsistema da SPEC-024, cinco já tinham impl viva; faltava
+o **`Planner`** (query string → `LogicalPlan`, o front-end do Compiler 1).
+Implementado como `heraclitus-analytics::planner::AnalyticalPlanner` — uma
+gramática analítica mínima (`SELECT [WHERE …] [GROUP BY … [SUM …]]`) sobre o
+schema `events`, **sem inventar linguagem de grafo** (invariante #4: GQL continua
+a única linguagem da superfície de grafo/temporal). `run_analytical` liga
+Planner (024) → `SelectivityOptimizer` (012) → `VecExecutor` (013) ponta-a-ponta a
+partir de texto. +5 testes (parsing, erros sem pânico, e2e vs força bruta, Gate C
+a partir de string). Workspace continua verde.
+
+## ATUALIZAÇÃO 2026-07-10 — SPEC-015/021 fechado (consenso Raft real)
+
+`heraclitus-raft` ganha `consensus` (openraft 0.9.24) atrás da feature
+`replication`, cumprindo a promessa antiga do header do crate: **eleição de
+líder + commit por quórum + failover automático**. Peças: `MemRaftLog` (raft-log
+em memória), `EpisodeStateMachine` (apply = `append_replicated` no log local,
+LSN denso), `Router` in-process com links cortáveis. Tese SPEC-015 preservada:
+só bytes de `Episode` (bincode) viajam; cada nó hidrata as suas views localmente.
+
+**Endurecido por revisão adversarial multi-agente** (4 dimensões; 2 completaram
+antes do limite de sessão e produziram 8 findings — verificados à mão contra o
+source real do openraft). Achado principal, **bug real** que os testes verdes
+escondiam: `build_snapshot` (que o openraft corre *spawnado em paralelo* com o
+`apply`) lia o log e o `applied` sem lock comum ⇒ par rasgado. Corrigido com um
+lock de consistência partilhado. Também: `no_quorum` reescrito (o antigo tinha
+uma cauda vácua com claim falso), `wait_leader` simplificado (era código morto),
+e +3 testes novos (redirect `ForwardToLeader`, duplo failover, round-trip de
+snapshot). 6 testes de cluster, 30× sem flake; workspace verde.
+
+## ATUALIZAÇÃO 2026-07-10 — raft-log durável + restart de processo
+
+Fechada a maior lacuna de produção do consenso: **durabilidade**.
+- `crate::durable::FileRaftLog` — raft-log durável (WAL append-only com
+  `Insert`/`Truncate`/`Purge`, `fsync` ANTES do ack de quórum, meta atómica para
+  voto/committed, cauda torn descartada no `open`). O voto durável é a garantia
+  anti-split-brain (um nó reiniciado não vota duas vezes no mesmo termo).
+- `EpisodeStateMachine::open_durable` — recupera `applied`/membership de um
+  sidecar e usa `skip_normals = head − normals` para NÃO re-aplicar (duplicar) os
+  episódios que já estavam em disco quando o openraft re-envia
+  `[applied+1, committed)` no arranque. Ordem de escrita: episódios primeiro
+  (fsync), meta depois ⇒ o meta nunca fica à frente (nunca se perde um episódio).
+- Teste `durable_node_survives_restart_without_dup_or_loss`: um nó durável
+  encerra, reabre do disco, re-lidera com o voto durável, mantém `head`
+  inalterado (sem dup/perda) e continua a comitar. +4 testes (3 de `FileRaftLog`
+  + 1 e2e). 15 testes com a feature, 30× sem flake; workspace verde.
+
+## ATUALIZAÇÃO 2026-07-10 — transporte de rede TCP real
+
+`crate::net` — o consenso deixa de viver só no router in-process e passa a
+correr sobre **sockets TCP reais**. `serve()` liga um servidor TCP por nó que
+despacha RPCs (`AppendEntries`/`Vote`/`InstallSnapshot`, enquadrados por
+comprimento + bincode) para o `Raft` local; `TcpNetworkFactory`/`TcpConnection`
+implementam o `RaftNetwork` do openraft ligando ao `BasicNode.addr` que viaja na
+membership. `spawn_node_tcp` liga um listener efémero e serve.
+
+2 testes de integração (portas efémeras em `127.0.0.1`): (1) 3 nós elegem líder
+e replicam 20 writes com os 3 logs byte-equivalentes — tudo pela rede; (2)
+**failover sobre TCP**: o líder morre (`raft.shutdown()`), os 2 sobreviventes
+elegem novo líder pela rede e continuam a comitar. Honestidade: é TCP puro, não
+gRPC literal — um wrapper tonic sobre os mesmos tipos serde é o passo cosmético
+que resta. 18 testes com a feature, 25× sem flake; clippy limpo; workspace verde.
+
+## ATUALIZAÇÃO 2026-07-10 — consenso LIGADO ao servidor (o wiring final)
+
+O consenso deixa de ser um módulo testado à parte e passa a ser um **modo do
+`heraclitus-server`** (feature `replication` + `config.replication`):
+- **Config**: `ReplicationConfig` em `heraclitus-core` (`node_id`, `raft_addr`,
+  `peers`, `bootstrap`, `raft_dir`, `sm_dir`) — TOML retrocompatível
+  (`replication` ausente = nó único, o caminho normal, intocado).
+- **`server::cluster`**: arranca o nó de cluster sobre o log do `Engine`
+  (raft-log durável `FileRaftLog` + transporte TCP + state machine durável) com
+  um **hook de apply** que indexa cada episódio replicado nas views locais
+  (`Engine::index_applied`, `Weak` p/ evitar ciclo) — read-your-writes
+  preservado em TODOS os nós.
+- **`Engine::append` roteia pelo consenso** quando ativo: o líder submete via
+  `client_write` (ack só por quórum); um não-líder devolve erro com hint do
+  líder. O caminho de nó único não muda uma linha de comportamento.
+- **`heraclitus-raft`** ganhou a API de alto nível (`submit_episode`,
+  `initialize_cluster`, `node_status`, `production_config`,
+  `spawn_node_tcp_on`) e o hook `with_apply_hook` (dispara só em appends
+  genuínos, nunca nas re-aplicações de restart).
+
+Teste de integração `three_server_cluster_replicates_writes_and_indexes`:
+3 servidores in-process (portas efémeras) formam o cluster, 8 escritas passam
+pelo `Engine::append` do líder, os 3 nós replicam o log **e a query GQL devolve
+os dados em todos** (a prova de indexação); um seguidor recusa a escrita com
+hint; `state()` expõe papel/líder. 23 testes no server com a feature; suites
+raft (21) e default intocadas.
+
+**Endurecido por revisão adversarial multi-agente** (o wiring novo tinha 3
+defeitos reais que testes verdes + clippy esconderam):
+- **telemetria contornava o consenso** — `emit_telemetry` fazia `log.append`
+  direto ⇒ com replicação divergiria/derrubaria o nó (o `append_replicated` do
+  raft colide, `CasConflict`). Corrigido: passa por `Engine::append`.
+- **deadlock no handler `query`** — GQL escreve (`CREATE`/`DECIDE` → `append`) e
+  a auditoria também; sem `spawn_blocking`, N queries-escrita concorrentes
+  parqueavam todos os workers do tokio à espera do quórum e o `RaftCore` não
+  podia ser escalonado ⇒ deadlock. Corrigido (`spawn_blocking` no `append` E no
+  `query`).
+- **`install_snapshot` não indexava** — appendava ao log mas não disparava o
+  hook ⇒ um nó que apanhava via snapshot tinha os episódios no log mas não nas
+  views (queries erradas até ao boot). Corrigido: o hook dispara nos episódios
+  recém-instalados; +asserção no teste de snapshot.
+
+## ATUALIZAÇÃO 2026-07-10 — endurecimento pré-merge (revisão adversarial)
+
+Antes de consolidar, uma revisão adversarial multi-agente dos módulos novos
+(`durable`/`net`/`planner`) encontrou **5 defeitos reais** que testes verdes +
+clippy + gauntlet não apanharam (o `planner` saiu limpo):
+- **durável, `fsync` do diretório** — o `rename` do `meta.bin` (voto/committed)
+  não era tornado durável com um fsync do diretório-pai; um crash podia reverter
+  o voto → **split-brain**. Corrigido (`fsync_dir`, best-effort: total no Linux
+  de produção, no-op documentado no Windows). Idem no `sm_meta` da máquina.
+- **durável, falha alta em meta corrompido** — `load_meta`/`load_sm_meta` repunham
+  o voto/`applied` a vazio em silêncio num decode falhado; agora **recusam
+  arrancar** (um voto persistido nunca é descartado sem ruído).
+- **rede, teto de frame** — `read_frame` alocava até ~4 GiB a partir do
+  comprimento vindo do fio (DoS/abort); agora há `MAX_FRAME = 256 MiB`.
+- **rede, resiliência do `accept`** — um erro de `accept()` matava o servidor
+  para sempre; agora recua e continua.
+- **rede, honestidade** — o header afirmava keep-alive que o cliente (liga por
+  pedido) não faz; corrigido.
+
++2 testes de segurança (`corrupt_meta_refuses_to_start`,
+`read_frame_rejects_oversized`). 20 testes com a feature, 25× sem flake.
 
 ---
 
