@@ -32,6 +32,7 @@ heraclitus-activation = { workspace = true }
 heraclitus-retrieval = { workspace = true }
 heraclitus-query = { workspace = true }
 heraclitus-proto = { workspace = true }
+heraclitus-raft = { workspace = true, optional = true }
 heraclitus-analytics = { workspace = true, optional = true }
 arrow-flight = { version = "58", optional = true }
 tonic-flight = { package = "tonic", version = "0.14", optional = true }
@@ -54,6 +55,10 @@ gpu = ["heraclitus-index-vector/gpu"]
 # heavy dependency and the default server/service stays lean. Enables
 # `Embedded::analytics()` and the REST `POST /sql` route.
 analytics = ["dep:heraclitus-analytics", "dep:arrow-flight", "dep:futures", "dep:tonic-flight"]
+# SPEC-015/021 — replicação por consenso Raft (openraft). Off por default: o
+# servidor de nó único é o caminho normal; ligar forma um cluster e faz as
+# escritas passarem pelo líder. Puxa heraclitus-raft com a sua feature própria.
+replication = ["dep:heraclitus-raft", "heraclitus-raft/replication"]
 
 # Only the service binary needs these, and only on Windows.
 [target.'cfg(windows)'.dependencies]

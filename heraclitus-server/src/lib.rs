@@ -2,6 +2,8 @@
 //! The server composes; the storage knows nothing about HTTP or LLMs.
 
 pub mod boot;
+#[cfg(feature = "replication")]
+pub mod cluster; // SPEC-015/021: wiring do consenso Raft (nó de cluster sobre o log)
 pub mod embedded;
 pub mod engine;
 pub mod grpc;
@@ -53,6 +55,34 @@ pub async fn serve_with(
     );
 
     let engine = Arc::new(Engine::open_with_boot(&config, &boot)?);
+
+    // SPEC-015/021 — replicação por consenso Raft (opt-in). Quando configurada,
+    // o nó junta-se/forma o cluster e as escritas passam a ir pelo líder.
+    #[cfg(feature = "replication")]
+    let cluster_tasks = if let Some(rep) = config.replication.clone() {
+        match cluster::spawn(&engine, &rep, &config.data_dir).await {
+            Ok((handle, tasks)) => {
+                engine.set_replication(handle);
+                boot.warn_line(
+                    "Replicação Raft",
+                    &format!(
+                        "nó {} · TCP {} · {} membros{}",
+                        rep.node_id,
+                        rep.raft_addr,
+                        rep.peers.len(),
+                        if rep.bootstrap { " · semente" } else { "" }
+                    ),
+                );
+                Some(tasks)
+            }
+            Err(e) => {
+                boot.warn_line("Replicação Raft", &format!("falhou a arrancar: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let grpc_addr: std::net::SocketAddr = config
         .grpc_addr
@@ -228,6 +258,10 @@ pub async fn serve_with(
     }
     #[cfg(feature = "analytics")]
     if let Some(t) = flight_task {
+        t.abort();
+    }
+    #[cfg(feature = "replication")]
+    if let Some(t) = cluster_tasks {
         t.abort();
     }
     // Shutdown gracioso = checkpoint das views (fast boot): o próximo arranque

@@ -66,7 +66,15 @@ impl pb::heraclitus_server::Heraclitus for Service {
                     .map_err(|_| Status::invalid_argument("bad parent ULID"))?,
             );
         }
-        let lsn = self.engine.append(e).map_err(internal)?;
+        // `append` BLOQUEIA (fsync do log e, com replicação, o commit por quórum
+        // do raft). Correr isso num worker assíncrono estagnaria o reactor sob
+        // escrita concorrente — daí `spawn_blocking`, o padrão correto para uma
+        // operação bloqueante dentro de um handler async.
+        let engine = self.engine.clone();
+        let lsn = tokio::task::spawn_blocking(move || engine.append(e))
+            .await
+            .map_err(internal)?
+            .map_err(internal)?;
         Ok(Response::new(pb::AppendResponse { lsn }))
     }
 
@@ -75,10 +83,20 @@ impl pb::heraclitus_server::Heraclitus for Service {
         req: Request<pb::QueryRequest>,
     ) -> Result<Response<pb::QueryResponse>, Status> {
         let gql = req.into_inner().gql;
-        let result = heraclitus_query::execute(&gql, self.engine.as_ref());
-        // Meta-auditoria (quando ligada por config): a execução — com sucesso
-        // OU falha — vira um evento AuditQuery no log, antes de responder.
-        self.engine.audit_query(&gql, result.is_ok());
+        // GQL pode ESCREVER (`CREATE` → append; `DECIDE` → append por ação) e a
+        // meta-auditoria também appenda — todos bloqueiam no quórum quando a
+        // replicação está ativa. Corre o bloco inteiro em `spawn_blocking` para
+        // não estagnar o reactor (mesmo motivo do `append`).
+        let engine = self.engine.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let result = heraclitus_query::execute(&gql, engine.as_ref());
+            // Meta-auditoria (quando ligada por config): a execução — com sucesso
+            // OU falha — vira um evento AuditQuery no log, antes de responder.
+            engine.audit_query(&gql, result.is_ok());
+            result
+        })
+        .await
+        .map_err(internal)?;
         let v = result.map_err(|e| Status::invalid_argument(e.to_string()))?;
         Ok(Response::new(pb::QueryResponse {
             json: v.to_string(),

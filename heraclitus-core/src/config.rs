@@ -84,6 +84,45 @@ pub struct HeraclitusConfig {
     /// GQL (`WHERE n.kind = "SystemMetric"`). `0` = off (default; each tick
     /// grows the log by a few events, so it is an explicit opt-in).
     pub telemetry_interval_secs: u64,
+
+    /// SPEC-015/021 — replicação por consenso Raft (opt-in). `None` = servidor
+    /// autónomo de nó único (default). Quando presente, o servidor forma um
+    /// cluster e as escritas passam pelo líder. Requer a feature `replication`
+    /// no `heraclitus-server` (sem ela o campo é ignorado com um aviso).
+    pub replication: Option<ReplicationConfig>,
+}
+
+/// Configuração de um nó no cluster de consenso (SPEC-015/021).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReplicationConfig {
+    /// Id deste nó (único no cluster).
+    pub node_id: u64,
+    /// Endereço TCP onde este nó serve os RPCs de raft (ex.: `127.0.0.1:8474`).
+    pub raft_addr: String,
+    /// Todos os membros do cluster (incluindo este): `node_id -> raft_addr`.
+    pub peers: std::collections::BTreeMap<u64, String>,
+    /// Se `true`, este nó inicializa o cluster (semente). Exatamente UM nó deve
+    /// ter `bootstrap = true` num arranque de raiz; os outros esperam para serem
+    /// admitidos pela semente.
+    pub bootstrap: bool,
+    /// Diretório do raft-log durável (`FileRaftLog`). Vazio ⇒ `<data_dir>/raft`.
+    pub raft_dir: PathBuf,
+    /// Diretório do meta durável da máquina de estados. Vazio ⇒ `<data_dir>/raft-sm`.
+    pub sm_dir: PathBuf,
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            node_id: 0,
+            raft_addr: "127.0.0.1:8474".to_string(),
+            peers: std::collections::BTreeMap::new(),
+            bootstrap: false,
+            raft_dir: PathBuf::new(),
+            sm_dir: PathBuf::new(),
+        }
+    }
 }
 
 impl Default for HeraclitusConfig {
@@ -111,6 +150,7 @@ impl Default for HeraclitusConfig {
             compliance_tsa_policy: "ACT-dev".to_string(),
             flight_addr: None,
             telemetry_interval_secs: 0,
+            replication: None,
         }
     }
 }

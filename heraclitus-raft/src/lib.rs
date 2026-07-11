@@ -1,17 +1,42 @@
 //! heraclitus-raft — replication (§3.13).
 //!
-//! v0 (RFC-003): **single-leader log shipping with anti-entropy catch-up.**
-//! The log *is* the state machine input; followers pull batches from the
-//! leader's head and replay them into their own log (preserving LSN + HLC),
-//! and their views replay locally. Full openraft consensus (leader election,
-//! quorum commit) is the planned upgrade behind the `replication` feature;
-//! until the turmoil leader-kill suite is green we do NOT claim automatic
-//! failover — we claim, and test, that a partitioned follower converges to
-//! every leader-acked event after healing, losing nothing.
+//! Two replication modes, honestly delimited:
+//!
+//! **v0 (RFC-003, default): single-leader log shipping with anti-entropy
+//! catch-up.** The log *is* the state machine input; followers pull batches
+//! from the leader's head and replay them into their own log (preserving
+//! LSN + HLC), and their views replay locally. No failover claim: we claim,
+//! and test, that a partitioned follower converges to every leader-acked
+//! event after healing, losing nothing.
+//!
+//! **`replication` feature (SPEC-015/021): real openraft 0.9 consensus** —
+//! see [`consensus`]. Leader election, quorum-gated acks and automatic
+//! failover, proven by in-process cluster tests (leader killed → majority
+//! elects a new leader → writes continue → healed node converges; a leader
+//! without quorum can NEVER ack). The raft-log can be **durable on disk**
+//! ([`durable::FileRaftLog`]) and a fully-durable node **survives process
+//! restart** without duplicating or losing episodes (tested). Consensus also
+//! runs over a **real TCP network transport** ([`net`]) — election,
+//! replication and failover proven over sockets; the in-process
+//! [`consensus::Router`] remains for deterministic partition/failover tests.
+//! (A gRPC/tonic wrapper over the same serde types is the only cosmetic step
+//! left, if a specific wire protocol is required.) Default build stays on v0.
 
 use heraclitus_core::{Episode, HeraclitusError, Lsn};
 use heraclitus_log::Log;
 use std::sync::Arc;
+
+/// SPEC-015/021 — o upgrade openraft: eleição + quórum + failover (opt-in).
+#[cfg(feature = "replication")]
+pub mod consensus;
+
+/// SPEC-015/021 — raft-log durável em disco (WAL + recuperação), opt-in.
+#[cfg(feature = "replication")]
+pub mod durable;
+
+/// SPEC-015/021 — transporte de rede real (TCP) para o consenso, opt-in.
+#[cfg(feature = "replication")]
+pub mod net;
 
 /// Transport boundary: how a follower fetches batches from a leader.
 /// Implementations: in-process (tests), TCP (sim/turmoil), gRPC Subscribe.
@@ -86,13 +111,10 @@ impl Follower {
         let mut applied = 0u64;
         let mut stalls = 0u32;
         while self.log.head() < target {
-            let progress = match self.sync_once(transport) {
-                Ok(n) => n,
-                // A partition surfaces as a transport error; treat it as a
-                // transient stall, not a data fault. The contiguous prefix that
-                // did apply (if any) is already durable.
-                Err(_) => 0,
-            };
+            // A partition surfaces as a transport error; treat it as a
+            // transient stall (progress 0), not a data fault. The contiguous
+            // prefix that did apply (if any) is already durable.
+            let progress = self.sync_once(transport).unwrap_or_default();
             applied += progress;
             if progress == 0 {
                 stalls += 1;

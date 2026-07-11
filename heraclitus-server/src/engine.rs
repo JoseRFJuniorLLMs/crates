@@ -52,6 +52,21 @@ pub struct Engine {
     /// gera um evento `AuditQuery` no próprio log — quem consultou o quê é,
     /// ele próprio, evidência imutável. Liga por config (audit_queries).
     audit_queries: bool,
+    /// SPEC-015/021 — quando a replicação está ativa, as escritas passam por
+    /// aqui (o líder do raft) em vez de irem direto ao log. Vazio = nó autónomo
+    /// (o caminho normal). Preenchido uma vez por `set_replication`.
+    replication: std::sync::OnceLock<Arc<dyn ReplRouter>>,
+}
+
+/// Contrato de encaminhamento de escritas pelo consenso. Implementado pelo
+/// módulo `cluster` (feature `replication`); sem a feature nunca é preenchido, e
+/// `Engine::append` segue o caminho direto ao log.
+pub trait ReplRouter: Send + Sync {
+    /// Submete um episódio ao líder do raft e devolve o LSN denso quando fica
+    /// comitado e aplicado localmente. Num não-líder devolve um erro com o hint.
+    fn append(&self, episode: Episode) -> Result<Lsn, HeraclitusError>;
+    /// Estado do nó no cluster (papel, líder atual, membros) para `/state`.
+    fn status(&self) -> serde_json::Value;
 }
 
 /// Wrapper so the same index object can be both registered as a View and
@@ -293,7 +308,26 @@ impl Engine {
             keystore,
             log_only,
             audit_queries: config.audit_queries,
+            replication: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Ativa a replicação: a partir daqui `append` encaminha pelo consenso.
+    /// Chamado uma vez no boot quando `config.replication` está presente.
+    pub fn set_replication(&self, router: Arc<dyn ReplRouter>) {
+        let _ = self.replication.set(router);
+    }
+
+    /// Indexação síncrona de um episódio já no log (memtable + views + attr).
+    /// É o núcleo partilhado por `append` e pelo hook de apply do consenso — ao
+    /// replicar, cada nó indexa localmente o que aplica (read-your-writes).
+    pub fn index_applied(&self, lsn: Lsn, episode: &Episode) {
+        if self.log_only {
+            return;
+        }
+        self.memtable.apply(lsn, episode.clone());
+        self.views.lock().unwrap().apply(lsn, episode);
+        self.attr.lock().unwrap().apply(lsn, episode);
     }
 
     /// Meta-auditoria: regista a execução de uma query como EVENTO no log
@@ -345,8 +379,13 @@ impl Engine {
             SystemMetric::new("log_head_lsn", head as f64),
             SystemMetric::new("sealed_segments", sealed as f64),
         ];
+        // CRÍTICO com replicação: passa por `append` (não `log.append` direto).
+        // Uma escrita direta ao log local contornaria o consenso e faria o
+        // `append_replicated` do raft colidir (`lsn < head` ⇒ CasConflict),
+        // divergindo/derrubando o nó. Via `append`, a telemetria vai pelo líder
+        // e replica; num seguidor devolve "não sou líder" e o tick apenas salta.
         for m in &metrics {
-            self.log.append(m.to_episode("heraclitus-engine"))?;
+            self.append(m.to_episode("heraclitus-engine"))?;
         }
         Ok(metrics.len() as u64)
     }
@@ -413,15 +452,20 @@ impl Engine {
     /// Append + synchronously index into memtable AND views.
     /// Read-your-own-writes holds for every index path.
     pub fn append(&self, episode: Episode) -> Result<Lsn, HeraclitusError> {
+        // SPEC-015/021: com replicação ativa, a escrita passa pelo consenso (o
+        // líder aplica via a state machine, que grava no log de CADA nó e chama
+        // de volta `index_applied` aqui). Num não-líder, devolve um erro com o
+        // hint do líder — a fonte da verdade continua a ser o log replicado.
+        if let Some(router) = self.replication.get() {
+            return router.append(episode);
+        }
         // Bulk-ingest: grava só no log (RAM limitada p/ cargas massivas). As
         // views/attr se reconstroem depois do log (a fonte da verdade).
         if self.log_only {
             return self.log.append(episode);
         }
         let lsn = self.log.append(episode.clone())?;
-        self.memtable.apply(lsn, episode.clone());
-        self.views.lock().unwrap().apply(lsn, &episode);
-        self.attr.lock().unwrap().apply(lsn, &episode);
+        self.index_applied(lsn, &episode);
         Ok(lsn)
     }
 
@@ -474,7 +518,7 @@ impl Engine {
             })
             .collect();
         let views = self.views.lock().unwrap();
-        serde_json::json!({
+        let mut out = serde_json::json!({
             "head_lsn": self.log.head(),
             "sealed_segments": segments,
             "views": {
@@ -482,7 +526,13 @@ impl Engine {
                 "min_watermark": views.min_watermark(),
             },
             "log_only": self.log_only,
-        })
+        });
+        // SPEC-015/021: com replicação ativa, expõe papel/líder/membros do nó —
+        // o que um operador precisa para diagnosticar o cluster.
+        if let Some(rep) = self.replication.get() {
+            out["replication"] = rep.status();
+        }
+        out
     }
 
     /// `heraclitus_verify_segment(id)` — prova de integridade pontual.
