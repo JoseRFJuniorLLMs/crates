@@ -961,11 +961,15 @@ impl LogBackend {
         let mut updated_attr = (*current_bundle.attr_index).clone();
         let mut updated_vector = (*current_bundle.vector_index).clone();
 
-        let delta = self
-            .log
-            .scan_capped(start_lsn, pinned_head + 1, usize::MAX)?;
+        // Correção R4: o scan cobre EXATAMENTE [start_lsn, pinned_head) e o
+        // bundle novo declara `lsn = pinned_head` (o PRÓXIMO LSN a indexar).
+        // A versão anterior punha `pinned_head + 1`, reclamando cobertura de um
+        // LSN que ainda não existia — quando ele era escrito, o guard
+        // `bundle.lsn >= head` dava o bundle como fresco e o episódio ficava
+        // invisível para sempre nos índices (confirmado por sonda).
+        let delta = self.log.scan_capped(start_lsn, pinned_head, usize::MAX)?;
         for (lsn, ep) in delta {
-            if lsn >= start_lsn && lsn <= pinned_head {
+            if lsn >= start_lsn && lsn < pinned_head {
                 updated_graph.apply_episode(lsn, &ep);
                 updated_resolver.apply_episode(lsn, &ep);
 
@@ -1013,7 +1017,7 @@ impl LogBackend {
         updated_resolver.watermark = pinned_head;
 
         let new_bundle = SnapshotBundle {
-            lsn: pinned_head + 1,
+            lsn: pinned_head,
             graph: Arc::new(updated_graph),
             resolver: Arc::new(updated_resolver),
             text_index: Arc::new(updated_text),
@@ -1977,6 +1981,7 @@ pub fn materialize_virtual(
                 valid_to_lsn: None,
                 world_valid_from: None,
                 world_valid_to: None,
+                closed_intervals: Vec::new(),
             },
             vec![version],
         );

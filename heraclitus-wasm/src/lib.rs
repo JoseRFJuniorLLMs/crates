@@ -1,5 +1,16 @@
 //! SPEC-025/035 — sandbox WASM real (wasmtime) para extensões.
 //!
+//! > **ESTADO: REFERÊNCIA DE I&D — NÃO LIGADO AO CAMINHO VIVO** (decisão P4,
+//! > 2026-07-16 — `docs/md/DECISAO-P4-plugins-wasm.md`). Nenhum crate depende
+//! > deste. O isolamento aqui (memória/fuel/traps) é real e testado **em
+//! > unidade**, mas não há sítio no query/executor que **invoque** um operador
+//! > `wasm:<nome>`: o `PluginHost` só cataloga nomes, e a ABI de UDF é o
+//! > `(i64,i64)->i64` de brinquedo abaixo. Ligar plugins a sério = uma feature
+//! > (superfície GQL para UDF + dispatch no executor + ABI real) mais uma
+//! > decisão sobre a invariante I2 ("inteligência no agente, não no banco"),
+//! > que o próprio `core::plugin` admite. Fica como referência; não promover
+//! > sem reabrir a P4.
+//!
 //! Um plugin de terceiros NUNCA pode derrubar o banco. Aqui isso é garantido
 //! por construção, não por disciplina:
 //!

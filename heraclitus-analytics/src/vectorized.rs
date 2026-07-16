@@ -1,5 +1,13 @@
 //! SPEC-012/013 — motor de execução vetorizada Arrow (v1 honesto).
 //!
+//! > **ESTADO: REFERÊNCIA DE I&D — NÃO LIGADO AO CAMINHO VIVO** (decisão P1,
+//! > 2026-07-16 — `docs/md/DECISAO-P1-motor-analitico.md`). Nenhum handler do
+//! > servidor/CLI/GQL invoca `VecExecutor`/`run_analytical`. A via de agregação
+//! > sobre o log **ligada** é o `LogAnalytics` (DataFusion) em `POST /sql`, que
+//! > não duplicamos (I4). Este módulo mantém-se como implementação de
+//! > referência dos contratos SPEC-012/013 e substrato de I&D do `hume-kernel`;
+//! > não o promover ao caminho vivo sem reabrir a decisão P1.
+//!
 //! O pipeline completo dos specs, a funcionar de verdade:
 //!
 //! ```text
@@ -30,20 +38,24 @@
 use datafusion::arrow::array::{
     Array, ArrayRef, BooleanArray, RecordBatch, StringArray, UInt64Array,
 };
-use datafusion::arrow::compute::{concat_batches, filter_record_batch};
+use datafusion::arrow::compute::{concat_batches, filter_record_batch, take};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use heraclitus_core::contracts::{Optimizer, TaskScheduler};
 use heraclitus_core::ir::{ExecutionNode, LogicalPlan, PhysicalIr};
 use heraclitus_core::{Episode, Lsn};
+use hume_kernel::{MorselSizer, SelectionVector};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::AnalyticsError;
 
-/// SPEC-013: lote vetorizado fixo.
+/// Tamanho de lote fixo para *streaming* (SPEC-013). Já não é o default de
+/// materialização (ver [`episodes_to_batches`], agora adaptativo), mas continua
+/// a ser o chunk incremental do plano de dados Arrow Flight e o piso da escada
+/// de morsels.
 pub const BATCH_ROWS: usize = 1024;
 
-// ── Fonte: episódios → batches Arrow de 1024 ───────────────────────────────
+// ── Fonte: episódios → batches Arrow (morsel adaptativo / tamanho fixo) ─────
 
 /// Schema público da tabela `events` (Flight `get_schema`).
 pub fn batch_schema() -> SchemaRef {
@@ -56,11 +68,36 @@ pub fn batch_schema() -> SchemaRef {
     ]))
 }
 
-/// Materializa episódios em batches Arrow de [`BATCH_ROWS`] linhas.
+/// Materializa episódios em batches Arrow com **morsel adaptativo** (o default).
+/// O tamanho do lote é escolhido pela largura da linha via
+/// `hume_kernel::MorselSizer` (SPEC-0041 §2, Marco 3), em vez do antigo fixo de
+/// 1024. O tamanho fixo continua disponível em [`episodes_to_batches_sized`].
+///
+/// **Invariante (Gate C):** o tamanho do morsel muda apenas a granularidade da
+/// materialização, **nunca** o resultado da consulta a jusante — provado no
+/// teste `gate_c_morsel_size_never_changes_results`.
 pub fn episodes_to_batches(events: &[(Lsn, Episode)]) -> Result<Vec<RecordBatch>, AnalyticsError> {
+    // Alvo: cache L2 típico (256 KiB). A linha do schema `events` é estreita —
+    // 3 colunas u64 (lsn/ts/content_len) = 24 B fixos + 2 refs de string; usamos
+    // os bytes fixos como estimativa conservadora da largura por linha.
+    const L2_TARGET_BYTES: usize = 256 * 1024;
+    const BYTES_PER_ROW: usize = 3 * std::mem::size_of::<u64>();
+    let rows = MorselSizer::new(L2_TARGET_BYTES).fit(BYTES_PER_ROW);
+    episodes_to_batches_sized(events, rows)
+}
+
+/// Materializa episódios em batches de tamanho **fixo** `rows_per_batch`.
+/// É o caminho que o plano de dados Arrow Flight usa deliberadamente
+/// (streaming incremental em lotes de [`BATCH_ROWS`]), e a base partilhada do
+/// default adaptativo.
+pub fn episodes_to_batches_sized(
+    events: &[(Lsn, Episode)],
+    rows_per_batch: usize,
+) -> Result<Vec<RecordBatch>, AnalyticsError> {
+    let rows_per_batch = rows_per_batch.max(1);
     let schema = batch_schema();
-    let mut out = Vec::with_capacity(events.len().div_ceil(BATCH_ROWS));
-    for chunk in events.chunks(BATCH_ROWS) {
+    let mut out = Vec::with_capacity(events.len().div_ceil(rows_per_batch));
+    for chunk in events.chunks(rows_per_batch) {
         let lsn: UInt64Array = chunk.iter().map(|(l, _)| *l).collect();
         let agent: StringArray = chunk.iter().map(|(_, e)| Some(e.agent_id.as_str())).collect();
         let kind: StringArray = chunk
@@ -108,6 +145,44 @@ pub struct Predicate {
     pub value: Literal,
 }
 
+/// Fecho de avaliação por-linha de um predicado: faz o `downcast` da coluna
+/// UMA vez e devolve `Fn(row) -> bool`. É a fonte única da semântica de
+/// comparação (usada tanto pelo `eval_predicate` denso como pelo retain esparso
+/// do `fused_filter_one`), evitando divergência entre os dois caminhos.
+fn predicate_matcher<'a>(
+    batch: &'a RecordBatch,
+    p: &'a Predicate,
+) -> Result<Box<dyn Fn(usize) -> bool + 'a>, AnalyticsError> {
+    let col = batch.column(p.column);
+    let op = p.op;
+    match (&p.value, col.data_type()) {
+        (Literal::U64(v), DataType::UInt64) => {
+            let a = col.as_any().downcast_ref::<UInt64Array>().unwrap();
+            let v = *v;
+            Ok(Box::new(move |i| match op {
+                CmpOp::Eq => a.value(i) == v,
+                CmpOp::Gt => a.value(i) > v,
+                CmpOp::Lt => a.value(i) < v,
+            }))
+        }
+        (Literal::Str(v), DataType::Utf8) => {
+            let a = col.as_any().downcast_ref::<StringArray>().unwrap();
+            let v = v.as_str();
+            Ok(Box::new(move |i| match op {
+                CmpOp::Eq => a.value(i) == v,
+                CmpOp::Gt => a.value(i) > v,
+                CmpOp::Lt => a.value(i) < v,
+            }))
+        }
+        (lit, dt) => Err(AnalyticsError::Arrow(format!(
+            "predicate type mismatch: literal {lit:?} vs column {dt}"
+        ))),
+    }
+}
+
+// Caminho eager: loop direto monomorfizado (rápido, sem dispatch dinâmico). NÃO
+// partilha o `predicate_matcher` boxed de propósito — o `Box<dyn Fn>` custaria
+// uma chamada virtual por linha e abrandaria o filtro vivo.
 fn eval_predicate(batch: &RecordBatch, p: &Predicate) -> Result<BooleanArray, AnalyticsError> {
     let col = batch.column(p.column);
     let mask: BooleanArray = match (&p.value, col.data_type()) {
@@ -211,7 +286,19 @@ pub struct VecExecutor {
     /// SPEC-033: pinar as worker threads do filtro paralelo a cores físicos
     /// (round-robin). Off por default — só compensa em multi-socket.
     pub pin_workers: bool,
+    /// `predicate_id → fração sobrevivente estimada` (do `SelectivityOptimizer`).
+    /// Alimenta a decisão ADAPTATIVA de fundir uma cadeia de filtros: só quando
+    /// o produto estimado fica abaixo de [`ADAPTIVE_FUSE_THRESHOLD`]. Vazio ⇒
+    /// 0.5 por predicado ⇒ nunca funde (caminho eager, o default seguro).
+    pub selectivities: HashMap<u32, f64>,
 }
+
+/// Abaixo desta seletividade **final** estimada, fundir uma cadeia de filtros
+/// (materialização tardia) compensa; acima, o eager é melhor. Calibrado pelo
+/// benchmark `benches/fused_vs_sequential.rs` (ganho limpo só em ~0.01; empate
+/// em ~0.1; perda em ~0.5) — 0.05 é o ponto conservador que colhe o ganho sem a
+/// regressão de meio-termo.
+pub const ADAPTIVE_FUSE_THRESHOLD: f64 = 0.05;
 
 impl VecExecutor {
     pub fn new(source: Vec<RecordBatch>, predicates: Vec<Predicate>) -> Self {
@@ -220,10 +307,13 @@ impl VecExecutor {
             predicates,
             capabilities: heraclitus_core::CapabilityCatalog::detect(),
             pin_workers: false,
+            selectivities: HashMap::new(),
         }
     }
 
-    fn run_filter(
+    /// Filtro simples de um predicado (materialização ansiosa via
+    /// `filter_record_batch`). Público como primitiva de execução/benchmark.
+    pub fn run_filter(
         &self,
         input: &[RecordBatch],
         pid: u32,
@@ -296,6 +386,123 @@ impl VecExecutor {
             out.extend(r?); // ordem por partição indexada = ordem global serial
         }
         Ok(out)
+    }
+
+    /// Filtro **fundido** de uma cadeia de predicados com materialização tardia
+    /// (hume-kernel `SelectionVector` wired). Em vez de materializar um
+    /// `RecordBatch` novo por predicado (N filtros ⇒ N cópias), acumula a
+    /// seleção de todos os predicados num único `SelectionVector` — a moeda de
+    /// troca do SPEC-0040 §5 — e materializa **uma só vez** no fim via `take()`.
+    ///
+    /// **VEREDICTO DO BENCHMARK v2 (medido, `benches/fused_vs_sequential.rs`):**
+    /// depois de otimizado (retain esparso — o 2.º predicado avaliado só nas
+    /// linhas sobreviventes — sem dupla varredura e com materialização única),
+    /// este caminho **ganha ao eager em BAIXA seletividade** (~0.01 → ~20% mais
+    /// rápido, faixas separadas), **empata** no meio (~0.1) e **ainda perde
+    /// ~14%** a ~0.5 (o acesso disperso do retain domina). Não é ganho
+    /// universal, e a variância da máquina é alta. Crossover físico: em queries
+    /// muito seletivas a poupança de materialização domina; a meio, não.
+    ///
+    /// Por isso **NÃO é o `execute()` default** (regrediria queries a meio
+    /// termo). Candidata a **wiring ADAPTATIVO**: usar só quando o
+    /// `SelectivityOptimizer` estima seletividade final muito baixa. O resultado
+    /// é sempre bit-idêntico ao filtro sequencial (Gate C).
+    pub fn run_fused_filters(
+        &self,
+        input: &[RecordBatch],
+        pids: &[u32],
+    ) -> Result<Vec<RecordBatch>, AnalyticsError> {
+        let preds: Vec<Predicate> = pids
+            .iter()
+            .map(|p| {
+                self.predicates
+                    .get(*p as usize)
+                    .cloned()
+                    .ok_or_else(|| AnalyticsError::Arrow(format!("predicate {p} não registado")))
+            })
+            .collect::<Result<_, _>>()?;
+        let cpus = self.capabilities.logical_cpus.max(1);
+        if cpus > 1 && input.len() >= 4 {
+            let chunk = input.len().div_ceil(cpus);
+            let pin = self.pin_workers;
+            let preds_ref = &preds;
+            let results: Vec<Result<Vec<RecordBatch>, AnalyticsError>> = std::thread::scope(|s| {
+                let handles: Vec<_> = input
+                    .chunks(chunk)
+                    .enumerate()
+                    .map(|(wi, part)| {
+                        s.spawn(move || {
+                            if pin {
+                                let cores = core_affinity::get_core_ids().unwrap_or_default();
+                                if !cores.is_empty() {
+                                    let _ = core_affinity::set_for_current(cores[wi % cores.len()]);
+                                }
+                            }
+                            let mut out = Vec::with_capacity(part.len());
+                            for b in part {
+                                let fb = Self::fused_filter_one(b, preds_ref)?;
+                                if fb.num_rows() > 0 {
+                                    out.push(fb);
+                                }
+                            }
+                            Ok(out)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let mut out = Vec::new();
+            for r in results {
+                out.extend(r?);
+            }
+            return Ok(out);
+        }
+        let mut out = Vec::with_capacity(input.len());
+        for b in input {
+            let fb = Self::fused_filter_one(b, &preds)?;
+            if fb.num_rows() > 0 {
+                out.push(fb);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Materialização tardia de um batch (v2 — otimizada).
+    ///
+    /// - **Sem dupla varredura:** o 1.º predicado é avaliado numa única passagem
+    ///   que já constrói a lista de índices sobreviventes (nada de `BooleanArray`
+    ///   intermédio).
+    /// - **AND no domínio esparso:** os predicados seguintes são avaliados
+    ///   **só nas linhas sobreviventes** (`retain`) — a interseção acontece
+    ///   sobre a lista esparsa que encolhe, sem tocar nas linhas já cortadas nem
+    ///   materializar bitmaps densos.
+    /// - **Materialização única:** um só `take()` no fim, das linhas finais.
+    fn fused_filter_one(b: &RecordBatch, preds: &[Predicate]) -> Result<RecordBatch, AnalyticsError> {
+        let n = b.num_rows();
+        let mut survivors: Vec<u32> = if let Some((p0, rest)) = preds.split_first() {
+            let m0 = predicate_matcher(b, p0)?;
+            let mut s: Vec<u32> = (0..n).filter(|&i| m0(i)).map(|i| i as u32).collect();
+            for p in rest {
+                if s.is_empty() {
+                    break;
+                }
+                let m = predicate_matcher(b, p)?;
+                s.retain(|&i| m(i as usize));
+            }
+            s
+        } else {
+            (0..n as u32).collect()
+        };
+        // SelectionVector como container esparso adaptativo (sem bitmap denso no
+        // caso esparso); `survivors` já está ordenado e único.
+        let sel = SelectionVector::from_sorted_indices(n, std::mem::take(&mut survivors));
+        let idx: UInt64Array = sel.to_indices().into_iter().map(|x| x as u64).collect();
+        let cols: Result<Vec<ArrayRef>, AnalyticsError> = b
+            .columns()
+            .iter()
+            .map(|c| take(c.as_ref(), &idx, None).map_err(|e| AnalyticsError::Arrow(e.to_string())))
+            .collect();
+        RecordBatch::try_new(b.schema(), cols?).map_err(|e| AnalyticsError::Arrow(e.to_string()))
     }
 
     fn run_aggregate(
@@ -428,11 +635,24 @@ impl TaskScheduler for VecExecutor {
     /// Executa o DAG em ordem topológica (deps antes do nó — validado pelo
     /// `PhysicalPlan::is_well_formed`); devolve os batches do nó final.
     fn execute(&self, dag: Vec<ExecutionNode>) -> Result<Vec<RecordBatch>, String> {
+        // WIRING ADAPTATIVO (benchmark v2): uma cadeia de filtros consecutivos é
+        // FUNDIDA (materialização tardia) só quando a seletividade final
+        // estimada fica abaixo de ADAPTIVE_FUSE_THRESHOLD — o regime onde o
+        // benchmark mostra ganho. Caso contrário corre eager (um filtro por
+        // passo). A escolha muda a latência, NUNCA o resultado (Gate C testado).
+        let mut consumers: HashMap<u64, usize> = HashMap::new();
+        for node in &dag {
+            for d in &node.dependencies {
+                *consumers.entry(*d).or_insert(0) += 1;
+            }
+        }
         let mut results: HashMap<u64, Vec<RecordBatch>> = HashMap::new();
         let mut scans_seen = 0usize;
         let mut last = None;
-        for node in &dag {
-            let out = match &node.operation {
+        let mut i = 0;
+        while i < dag.len() {
+            let node = &dag[i];
+            let (out, produced_id, next_i) = match &node.operation {
                 PhysicalIr::ColumnScan { .. } => {
                     let src = self
                         .sources
@@ -440,30 +660,71 @@ impl TaskScheduler for VecExecutor {
                         .ok_or_else(|| format!("sem source para o ColumnScan #{scans_seen}"))?
                         .clone();
                     scans_seen += 1;
-                    src
+                    (src, node.node_id, i + 1)
                 }
                 PhysicalIr::VectorFilter { predicate_id } => {
-                    let input = results
-                        .get(&node.dependencies[0])
-                        .ok_or("filter sem input")?;
-                    self.run_filter(input, *predicate_id).map_err(|e| e.to_string())?
+                    // Cadeia maximal de filtros consecutivos (guarda de consumidor
+                    // único → seguro em DAGs com fan-out).
+                    let mut pids = vec![*predicate_id];
+                    let mut j = i;
+                    while j + 1 < dag.len() {
+                        let nxt = &dag[j + 1];
+                        let chains =
+                            nxt.dependencies.len() == 1 && nxt.dependencies[0] == dag[j].node_id;
+                        let single = consumers.get(&dag[j].node_id).copied().unwrap_or(0) == 1;
+                        if let (true, true, PhysicalIr::VectorFilter { predicate_id: np }) =
+                            (chains, single, &nxt.operation)
+                        {
+                            pids.push(*np);
+                            j += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    // Seletividade final estimada = produto (0.5 por omissão).
+                    let est: f64 = pids
+                        .iter()
+                        .map(|p| self.selectivities.get(p).copied().unwrap_or(0.5))
+                        .product();
+                    let out = {
+                        let input = results.get(&node.dependencies[0]).ok_or("filter sem input")?;
+                        if pids.len() >= 2 && est < ADAPTIVE_FUSE_THRESHOLD {
+                            // Muito seletivo → materialização tardia (fundido).
+                            self.run_fused_filters(input, &pids).map_err(|e| e.to_string())?
+                        } else {
+                            // Eager: um filtro por passo (materializa entre eles).
+                            let mut cur =
+                                self.run_filter(input, pids[0]).map_err(|e| e.to_string())?;
+                            for &pid in &pids[1..] {
+                                cur = self.run_filter(&cur, pid).map_err(|e| e.to_string())?;
+                            }
+                            cur
+                        }
+                    };
+                    (out, dag[j].node_id, j + 1)
                 }
                 PhysicalIr::VectorAggregate { keys, aggregations } => {
-                    let input = results
-                        .get(&node.dependencies[0])
-                        .ok_or("aggregate sem input")?;
-                    self.run_aggregate(input, keys, aggregations)
-                        .map_err(|e| e.to_string())?
+                    let out = {
+                        let input =
+                            results.get(&node.dependencies[0]).ok_or("aggregate sem input")?;
+                        self.run_aggregate(input, keys, aggregations)
+                            .map_err(|e| e.to_string())?
+                    };
+                    (out, node.node_id, i + 1)
                 }
                 PhysicalIr::HashJoin { left_key, right_key } => {
-                    let l = results.get(&node.dependencies[0]).ok_or("join sem lado esq")?;
-                    let r = results.get(&node.dependencies[1]).ok_or("join sem lado dir")?;
-                    self.run_hash_join(l, r, *left_key, *right_key)
-                        .map_err(|e| e.to_string())?
+                    let out = {
+                        let l = results.get(&node.dependencies[0]).ok_or("join sem lado esq")?;
+                        let r = results.get(&node.dependencies[1]).ok_or("join sem lado dir")?;
+                        self.run_hash_join(l, r, *left_key, *right_key)
+                            .map_err(|e| e.to_string())?
+                    };
+                    (out, node.node_id, i + 1)
                 }
             };
-            results.insert(node.node_id, out);
-            last = Some(node.node_id);
+            results.insert(produced_id, out);
+            last = Some(produced_id);
+            i = next_i;
         }
         let last = last.ok_or("DAG vazio")?;
         Ok(results.remove(&last).unwrap_or_default())
@@ -490,10 +751,46 @@ mod tests {
     }
 
     #[test]
-    fn batches_are_1024_rows() {
+    fn default_is_adaptive_morsel() {
+        // O default passou a adaptativo: a linha de `events` é estreita → o
+        // MorselSizer sobe ao topo da escada (131 072), logo 3000 episódios
+        // cabem num único batch.
         let b = episodes_to_batches(&eps(3000)).unwrap();
+        assert_eq!(b.len(), 1, "default adaptativo agrega linhas estreitas");
+        assert_eq!(b[0].num_rows(), 3000);
+    }
+
+    #[test]
+    fn fixed_sized_batching_still_available() {
+        // O caminho fixo (usado pelo streaming Flight) continua a existir e a
+        // fatiar em lotes de 1024 — o contrato SPEC-013, agora explícito.
+        let b = episodes_to_batches_sized(&eps(3000), BATCH_ROWS).unwrap();
         let sizes: Vec<usize> = b.iter().map(|x| x.num_rows()).collect();
         assert_eq!(sizes, vec![1024, 1024, 952], "SPEC-013: lotes fixos de 1024");
+    }
+
+    #[test]
+    fn gate_c_morsel_size_never_changes_results() {
+        // Gate C aplicado ao dimensionamento de morsel (hume-kernel wired):
+        // o tamanho do lote muda a granularidade da materialização, NUNCA um bit
+        // do resultado. Mesmo DAG, fontes fatiadas de forma diferente (1024 fixo
+        // vs. adaptativo default) → saída bit-idêntica.
+        let events = eps(3000);
+        let fixed =
+            VecExecutor::new(episodes_to_batches_sized(&events, BATCH_ROWS).unwrap(), preds());
+        let adaptive = VecExecutor::new(episodes_to_batches(&events).unwrap(), preds());
+        let dag = || {
+            SelectivityOptimizer { selectivities: HashMap::new() }
+                .optimize(LogicalPlan::Select {
+                    relations: vec![],
+                    predicates: vec![0, 1],
+                    aggregate: Some((vec![2], vec![4])), // group by kind; sum content_len
+                })
+                .unwrap()
+        };
+        let a = fixed.execute(dag()).unwrap();
+        let b = adaptive.execute(dag()).unwrap();
+        assert_eq!(format!("{a:?}"), format!("{b:?}"), "morsel-size ≡ resultado bit a bit");
     }
 
     fn preds() -> Vec<Predicate> {
@@ -503,6 +800,73 @@ mod tests {
             // p1: lsn < 100            (sobrevive ~3%)
             Predicate { column: 0, op: CmpOp::Lt, value: Literal::U64(100) },
         ]
+    }
+
+    #[test]
+    fn fused_filters_equal_sequential_late_materialization() {
+        // A primitiva fundida (run_fused_filters, materialização tardia via
+        // SelectionVector) dá bit-idêntico ao filtro sequencial. Prova de
+        // CORREÇÃO — a performance está no benchmark (e perde ao eager).
+        let batches = episodes_to_batches_sized(&eps(3000), 512).unwrap(); // 6 batches
+        let mut exec = VecExecutor::new(batches.clone(), preds());
+        exec.capabilities.logical_cpus = 1; // serial determinístico
+        let fused = exec.run_fused_filters(&batches, &[0, 1]).unwrap();
+
+        // Referência: a materialização ANSIOSA (dois filter_record_batch).
+        let p = preds();
+        let mut refb = Vec::new();
+        for b in &batches {
+            let m0 = eval_predicate(b, &p[0]).unwrap();
+            let f0 = filter_record_batch(b, &m0).unwrap();
+            let m1 = eval_predicate(&f0, &p[1]).unwrap();
+            let f1 = filter_record_batch(&f0, &m1).unwrap();
+            if f1.num_rows() > 0 {
+                refb.push(f1);
+            }
+        }
+        let sch = batch_schema();
+        let f = concat_batches(&sch, &fused).unwrap();
+        let r = concat_batches(&sch, &refb).unwrap();
+        assert!(f.num_rows() > 0, "há sobreviventes (alice ∩ lsn<100)");
+        assert_eq!(format!("{f:?}"), format!("{r:?}"), "fundido ≡ sequencial, bit a bit");
+    }
+
+    #[test]
+    fn gate_c_adaptive_fusion_never_changes_results() {
+        // O wiring adaptativo escolhe fundido (baixa seletividade) ou eager, mas
+        // o resultado tem de ser bit-idêntico entre as duas rotas — a escolha só
+        // muda a latência.
+        let batches = episodes_to_batches_sized(&eps(3000), 512).unwrap();
+        let dag = || {
+            vec![
+                ExecutionNode::new(0, PhysicalIr::ColumnScan { projection: vec![] }, vec![]),
+                ExecutionNode::new(1, PhysicalIr::VectorFilter { predicate_id: 0 }, vec![0]),
+                ExecutionNode::new(2, PhysicalIr::VectorFilter { predicate_id: 1 }, vec![1]),
+            ]
+        };
+        // Rota fundida: seletividade final estimada 0.03·0.5 = 0.015 < 0.05.
+        let mut fused_route = VecExecutor::new(batches.clone(), preds());
+        fused_route.selectivities = HashMap::from([(0u32, 0.03), (1u32, 0.5)]);
+        // Rota eager: sem estimativas ⇒ 0.5·0.5 = 0.25 > 0.05.
+        let eager_route = VecExecutor::new(batches, preds());
+
+        let a = fused_route.execute(dag()).unwrap();
+        let b = eager_route.execute(dag()).unwrap();
+        assert!(!a.is_empty(), "há sobreviventes");
+        assert_eq!(format!("{a:?}"), format!("{b:?}"), "adaptativo (fundido) ≡ eager, bit a bit");
+    }
+
+    #[test]
+    fn fused_filter_parallel_equals_serial() {
+        // Gate C na primitiva fundida: paralelo (partições indexadas) ≡ serial.
+        let batches = episodes_to_batches_sized(&eps(4096), 512).unwrap(); // 8 batches
+        let mut serial = VecExecutor::new(batches.clone(), preds());
+        serial.capabilities.logical_cpus = 1;
+        let mut parallel = VecExecutor::new(batches.clone(), preds());
+        parallel.capabilities.logical_cpus = 8;
+        let a = serial.run_fused_filters(&batches, &[0, 1]).unwrap();
+        let b = parallel.run_fused_filters(&batches, &[0, 1]).unwrap();
+        assert_eq!(format!("{a:?}"), format!("{b:?}"), "fundido paralelo ≡ serial");
     }
 
     #[test]
@@ -596,7 +960,9 @@ mod tests {
     fn spec026_parallel_and_serial_filters_are_bit_identical() {
         // SPEC-026: a decisão capability-driven (paralelo vs serial) NUNCA muda
         // o resultado — só a latência (Gate C aplicado ao paralelismo).
-        let batches = episodes_to_batches(&eps(8192)).unwrap(); // 8 batches
+        // Tamanho fixo de 1024 (8 batches) para exercitar de facto o caminho
+        // multi-batch paralelo, independentemente do default adaptativo.
+        let batches = episodes_to_batches_sized(&eps(8192), BATCH_ROWS).unwrap(); // 8 batches
         let mut serial = VecExecutor::new(batches.clone(), preds());
         serial.capabilities.logical_cpus = 1; // força o caminho serial
         let mut parallel = VecExecutor::new(batches, preds());
@@ -618,7 +984,8 @@ mod tests {
     fn spec033_worker_pinning_executes_and_preserves_results() {
         // SPEC-033: com pin_workers, as worker threads pedem afinidade a cores
         // reais (round-robin). Em qualquer host o resultado é idêntico.
-        let batches = episodes_to_batches(&eps(8192)).unwrap();
+        // Tamanho fixo (múltiplos batches) para exercitar o round-robin real.
+        let batches = episodes_to_batches_sized(&eps(8192), BATCH_ROWS).unwrap();
         let mut pinned = VecExecutor::new(batches.clone(), preds());
         pinned.capabilities.logical_cpus = 4;
         pinned.pin_workers = true;
@@ -650,6 +1017,7 @@ mod tests {
             predicates: vec![],
             capabilities: heraclitus_core::CapabilityCatalog::detect(),
             pin_workers: false,
+            selectivities: HashMap::new(),
         };
         let dag = vec![
             ExecutionNode::new(0, PhysicalIr::ColumnScan { projection: vec![] }, vec![]),

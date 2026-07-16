@@ -9,6 +9,10 @@
 //! *memory* isolation via a WebAssembly runtime (`wasmtime`/`extism`) is the
 //! feature-gated upgrade — it also sits in tension with the "intelligence lives
 //! in the agent, not the DB" thesis, so it stays deliberately behind a flag.
+//!
+//! Wiring status (P4, 2026-07-16): **reference — 0 callers.** `run_sandboxed`
+//! works but nothing on the live path wraps extension code with it (there is no
+//! extension execution site yet). See `docs/md/DECISAO-P4-plugins-wasm.md`.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 

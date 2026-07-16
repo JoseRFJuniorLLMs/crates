@@ -86,6 +86,14 @@ pub struct RaftEntry {
 }
 
 /// Interface formal de acoplamento com o Consenso Distribuído (Raft).
+///
+/// **LEGADO v0 (R13/§2.3):** o consenso real (openraft, feature `replication`)
+/// NÃO usa esta superfície — usa `append_replicated` + `FileRaftLog`. Este
+/// trait tem 0 callers fora do próprio crate e fica como referência. Limitação
+/// conhecida: `opaque_meta[8..16]` só é um índice raft em entradas escritas
+/// por `append_raft_entry`; em appends normais são bytes do ULID — num log
+/// misto, `resolve_lsn_from_consensus_index` degrada para o valor PROTETOR
+/// (bloqueia truncates em vez de permitir apagar committed).
 pub trait RaftLogStorage: Send + Sync {
     fn append_raft_entry(
         &self,
@@ -554,17 +562,15 @@ impl Log {
                     }
 
                     batch.push(first_cmd);
+                    // R6: um Truncate que chegue durante o batching NÃO envenena
+                    // o worker — fecha o lote, deixa-o concluir (write/sync/ack)
+                    // e processa o truncate a seguir, na mesma iteração.
+                    let mut pending_truncate: Option<LogCommand> = None;
                     while batch.len() < 128 {
                         match cmd_rx.try_recv() {
-                            Ok(LogCommand::Truncate {
-                                from_lsn: _,
-                                allowed_max_lsn: _,
-                                resp_tx,
-                            }) => {
-                                let _ = resp_tx.send(Err(HeraclitusError::StorageEngine(
-                                    "Truncamento interceptou processamento do lote ativo".into(),
-                                )));
-                                worker_poisoned.store(true, Ordering::SeqCst);
+                            Ok(t @ LogCommand::Truncate { .. }) => {
+                                pending_truncate = Some(t);
+                                break;
                             }
                             Ok(cmd) => batch.push(cmd),
                             Err(_) => break,
@@ -572,9 +578,13 @@ impl Log {
                     }
 
                     let mut sync_required = false;
-                    let initial_bytes_written = active.bytes_written;
-                    let initial_hashes_len = active.record_hashes.len();
-                    let initial_max_lsn = active.max_lsn;
+                    // Baseline de rollback do ficheiro ATIVO. Mutável (R7): um
+                    // roll de segmento a meio do lote troca o ficheiro ativo, e
+                    // o baseline tem de acompanhar — aplicar o byte-count do
+                    // segmento antigo ao novo estendia-o com zeros no set_len.
+                    let mut initial_bytes_written = active.bytes_written;
+                    let mut initial_hashes_len = active.record_hashes.len();
+                    let mut initial_max_lsn = active.max_lsn;
                     let mut physical_io_error = false;
                     let mut tentative_lsn = current_lsn;
 
@@ -663,6 +673,17 @@ impl Log {
                                         physical_io_error = true;
                                         break;
                                     }
+                                    // R7: novo ficheiro ativo ⇒ novo baseline de
+                                    // rollback. Os registos anteriores do lote já
+                                    // ficaram selados no segmento anterior (com
+                                    // fsync); um erro daqui em diante só pode
+                                    // reverter o ficheiro ATUAL. Nota honesta:
+                                    // esses registos selados ficam duráveis mesmo
+                                    // que o cliente receba erro (ambiguidade
+                                    // inerente a qualquer WAL — documentada).
+                                    initial_bytes_written = active.bytes_written;
+                                    initial_hashes_len = active.record_hashes.len();
+                                    initial_max_lsn = active.max_lsn;
                                 }
 
                                 // RESOLUÇÃO DE DRIFT: Captura do offset físico EXATO antes do write_all
@@ -798,6 +819,35 @@ impl Log {
                     for flush_tx in stashed_flushes.drain(..) {
                         let _ = flush_tx.send(Ok(()));
                     }
+
+                    // R6: o truncate adiado corre agora, com o lote já
+                    // publicado e ack'ado — a mesma semântica do caminho
+                    // "primeiro comando", sem envenenar appends concorrentes.
+                    if let Some(LogCommand::Truncate {
+                        from_lsn,
+                        allowed_max_lsn,
+                        resp_tx,
+                    }) = pending_truncate
+                    {
+                        match handle_truncation_protected(
+                            &worker_dir,
+                            &mut active,
+                            &worker_catalog,
+                            from_lsn,
+                            allowed_max_lsn,
+                            &mut current_lsn,
+                            &worker_committed_lsn,
+                        ) {
+                            Ok(_) => {
+                                let _ = resp_tx.send(Ok(()));
+                            }
+                            Err(e) => {
+                                let _ = resp_tx.send(Err(e));
+                                worker_poisoned.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                        }
+                    }
                 }
             }));
         });
@@ -841,7 +891,11 @@ impl Log {
                 return entry.lsn + 1;
             }
         }
-        0
+        // R13: sem entrada classificável, o default é PROTETOR — devolver o
+        // head bloqueia qualquer truncate (`from_lsn < allowed_max` rejeita),
+        // em vez do antigo `0`, que desligava a proteção de quórum por completo
+        // num log misto/ilegível.
+        self.head()
     }
 
     pub fn read_committed(
@@ -1627,53 +1681,118 @@ fn handle_truncation_protected(
         valid_len = entry.offset + format::RECORD_HEADER_LEN as u64 + len as u64;
     }
 
-    // PHASE 1 (2PC): Marcador de intenção físico confere idempotência contra falhas elétricas abruptas
+    // PHASE 1 (2PC): Marcador de intenção físico confere idempotência contra falhas elétricas abruptas.
+    // R5: o intent cobre o plano COMPLETO — o set_len do alvo E a lista de
+    // segmentos seguintes a remover. Sem a lista, um crash entre o set_len e os
+    // remove_file fazia os segmentos "truncados" ressuscitarem no reopen.
+    let mut victims: Vec<SegmentId> = Vec::new();
+    if let Some(pos) = target_idx {
+        victims.extend(catalog.sealed[pos + 1..].iter().map(|s| s.meta.id));
+    }
+    if !is_in_active {
+        victims.push(catalog.active.meta.id);
+    }
     let intent_path = dir.join("truncate.intent");
     let mut intent_file = File::create(&intent_path)?;
     intent_file.write_all(&target_container.meta.id.to_le_bytes())?;
     intent_file.write_all(&valid_len.to_le_bytes())?;
+    intent_file.write_all(&(victims.len() as u32).to_le_bytes())?;
+    for v in &victims {
+        intent_file.write_all(&v.to_le_bytes())?;
+    }
     intent_file.sync_all()?;
+    sync_parent_dir(dir)?;
 
     file.set_len(valid_len)?;
     file.sync_all()?;
 
-    if let Some(pos) = target_idx {
-        for seg in &catalog.sealed[pos + 1..] {
-            let _ = std::fs::remove_file(&seg.meta.path);
+    for v in &victims {
+        let _ = std::fs::remove_file(segment_path(dir, *v));
+    }
+
+    // R14: um segmento de versão ANTIGA nunca é reativado como ativo — o worker
+    // escreve novos registos sempre com FORMAT_VERSION atual, e misturar regras
+    // de CRC/layout num ficheiro cujo header declara a versão antiga tornaria os
+    // registos novos ilegíveis. Sela-se o alvo truncado e abre-se um segmento
+    // novo na versão corrente.
+    let next_active_container = if target_container.meta.version != format::FORMAT_VERSION {
+        let footer = SegmentFooter {
+            record_count: hashes.len() as u64,
+            min_lsn: target_container.meta.base_lsn,
+            max_lsn,
+            blake3_root: merkle_root(&hashes),
+        };
+        file.seek(SeekFrom::Start(valid_len))?;
+        file.write_all(&footer.encode())?;
+        file.sync_all()?;
+
+        let sealed_target = Arc::new(SegmentContainer {
+            meta: SegmentMeta {
+                id: target_container.meta.id,
+                path: path.clone(),
+                base_lsn: target_container.meta.base_lsn,
+                max_lsn,
+                sealed: true,
+                blake3_root: Some(footer.blake3_root),
+                version: target_container.meta.version,
+            },
+            index: Arc::new(SegmentIndex {
+                entries: Arc::new(new_entries),
+            }),
+        });
+        if is_in_active {
+            new_sealed.push(sealed_target);
+        } else {
+            *new_sealed.last_mut().expect("alvo presente no catálogo") = sealed_target;
         }
-    }
-    if !is_in_active {
-        let _ = std::fs::remove_file(&catalog.active.meta.path);
-    }
 
-    *active = Active {
-        file,
-        segment_id: target_container.meta.id,
-        bytes_written: valid_len,
-        record_hashes: hashes,
-        base_lsn: target_container.meta.base_lsn,
-        max_lsn,
-        last_sync: Instant::now(),
-    };
+        let next_id = catalog.active.meta.id + 1;
+        *active = new_active(dir, next_id, from_lsn, &Hlc::new())?;
 
-    let next_active_container = Arc::new(SegmentContainer {
-        meta: SegmentMeta {
-            id: target_container.meta.id,
-            path: path.clone(),
+        Arc::new(SegmentContainer {
+            meta: SegmentMeta {
+                id: next_id,
+                path: segment_path(dir, next_id),
+                base_lsn: from_lsn,
+                max_lsn: u64::MAX,
+                sealed: false,
+                blake3_root: None,
+                version: format::FORMAT_VERSION,
+            },
+            index: Arc::new(SegmentIndex {
+                entries: Arc::new(Vec::new()),
+            }),
+        })
+    } else {
+        *active = Active {
+            file,
+            segment_id: target_container.meta.id,
+            bytes_written: valid_len,
+            record_hashes: hashes,
             base_lsn: target_container.meta.base_lsn,
-            max_lsn: u64::MAX,
-            sealed: false,
-            blake3_root: None,
-            version: target_container.meta.version,
-        },
-        index: Arc::new(SegmentIndex {
-            entries: Arc::new(new_entries),
-        }),
-    });
+            max_lsn,
+            last_sync: Instant::now(),
+        };
 
-    if !is_in_active {
-        new_sealed.pop();
-    }
+        if !is_in_active {
+            new_sealed.pop();
+        }
+
+        Arc::new(SegmentContainer {
+            meta: SegmentMeta {
+                id: target_container.meta.id,
+                path: path.clone(),
+                base_lsn: target_container.meta.base_lsn,
+                max_lsn: u64::MAX,
+                sealed: false,
+                blake3_root: None,
+                version: target_container.meta.version,
+            },
+            index: Arc::new(SegmentIndex {
+                entries: Arc::new(new_entries),
+            }),
+        })
+    };
 
     catalog_swap.store(Arc::new(LogCatalog {
         sealed: Arc::new(new_sealed),
@@ -1701,6 +1820,24 @@ fn check_and_recover_truncate_intent(dir: &Path) -> Result<(), HeraclitusError> 
                 let target_f = OpenOptions::new().write(true).open(&seg_p)?;
                 target_f.set_len(valid_len)?;
                 target_f.sync_all()?;
+            }
+            // R5: o intent (formato novo) lista também os segmentos seguintes a
+            // remover — completa a remoção que um crash interrompeu, para que os
+            // LSNs truncados não ressuscitem. Um intent antigo de 16 bytes não
+            // tem lista e cai fora do read_exact (best-effort, idempotente).
+            let mut cnt = [0u8; 4];
+            if f.read_exact(&mut cnt).is_ok() {
+                let n = u32::from_le_bytes(cnt);
+                for _ in 0..n {
+                    let mut idb = [0u8; 8];
+                    if f.read_exact(&mut idb).is_err() {
+                        break;
+                    }
+                    let victim = u64::from_le_bytes(idb);
+                    if victim != seg_id {
+                        let _ = std::fs::remove_file(segment_path(dir, victim));
+                    }
+                }
             }
         }
         let _ = std::fs::remove_file(&intent_path);

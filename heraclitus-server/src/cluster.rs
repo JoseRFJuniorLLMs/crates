@@ -14,11 +14,12 @@
 //! do tokio sob escrita concorrente (ver `grpc::Service::append`).
 
 use crate::engine::{Engine, ReplRouter};
-use heraclitus_core::{Episode, HeraclitusError, Lsn, ReplicationConfig};
+use heraclitus_core::{Episode, HeraclitusError, Lsn, RaftTransport, ReplicationConfig};
 use heraclitus_raft::consensus::{
     self, episode_bytes, ApplyHook, EpisodeStateMachine, HeraclitusRaft, NodeId, SubmitOutcome,
 };
 use heraclitus_raft::durable::FileRaftLog;
+use heraclitus_raft::grpc::spawn_node_grpc_on;
 use heraclitus_raft::net::spawn_node_tcp_on;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -95,21 +96,41 @@ pub async fn spawn(
         .map_err(|e| HeraclitusError::StorageEngine(format!("raft sm durável: {e}")))?
         .with_apply_hook(hook);
 
-    let tcp = spawn_node_tcp_on(
-        cfg.node_id,
-        engine.log.clone(),
-        consensus::production_config(),
-        &cfg.raft_addr,
-        store,
-        sm,
-    )
-    .await
-    .map_err(|e| HeraclitusError::Config(format!("nó raft TCP em {}: {e}", cfg.raft_addr)))?;
+    // Transporte: TCP (referência) ou gRPC/tonic (superfície unificada do
+    // servidor). Ambos correm os mesmos RPCs de raft sobre os mesmos tipos serde.
+    let (node, server_handle) = match cfg.transport {
+        RaftTransport::Tcp => {
+            let t = spawn_node_tcp_on(
+                cfg.node_id,
+                engine.log.clone(),
+                consensus::production_config(),
+                &cfg.raft_addr,
+                store,
+                sm,
+            )
+            .await
+            .map_err(|e| HeraclitusError::Config(format!("nó raft TCP em {}: {e}", cfg.raft_addr)))?;
+            (t.node, t.server)
+        }
+        RaftTransport::Grpc => {
+            let g = spawn_node_grpc_on(
+                cfg.node_id,
+                engine.log.clone(),
+                consensus::production_config(),
+                &cfg.raft_addr,
+                store,
+                sm,
+            )
+            .await
+            .map_err(|e| HeraclitusError::Config(format!("nó raft gRPC em {}: {e}", cfg.raft_addr)))?;
+            (g.node, g.server)
+        }
+    };
 
     // Bootstrap: a semente inicializa o cluster, com retry (os pares podem ainda
     // estar a subir). Exatamente UM nó deve ter `bootstrap = true`.
     if cfg.bootstrap {
-        let raft = tcp.node.raft.clone();
+        let raft = node.raft.clone();
         let peers = cfg.peers.clone();
         tokio::spawn(async move {
             for _ in 0..40 {
@@ -126,7 +147,7 @@ pub async fn spawn(
     // raft (assíncrono), respondendo pelo canal std. Uma task por escrita ⇒
     // submissões concorrentes não se serializam entre si.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Submit>();
-    let raft_for_loop = tcp.node.raft.clone();
+    let raft_for_loop = node.raft.clone();
     let submit = tokio::spawn(async move {
         while let Some((ep, reply)) = rx.recv().await {
             let raft = raft_for_loop.clone();
@@ -145,13 +166,13 @@ pub async fn spawn(
 
     let handle = Arc::new(ReplicationHandle {
         submit: tx,
-        raft: tcp.node.raft.clone(),
+        raft: node.raft.clone(),
         node_id: cfg.node_id,
     });
     Ok((
         handle,
         ClusterTasks {
-            server: tcp.server,
+            server: server_handle,
             submit,
         },
     ))
@@ -227,6 +248,7 @@ mod tests {
                     bootstrap: id == 0,
                     raft_dir: dir.path().join("raft"),
                     sm_dir: dir.path().join("raft-sm"),
+                    transport: RaftTransport::Tcp,
                 }),
                 ..Default::default()
             };
@@ -292,6 +314,66 @@ mod tests {
             format!("{err}").contains("líder"),
             "um seguidor recusa a escrita com hint do líder: {err}"
         );
+
+        for t in tasks {
+            t.abort();
+        }
+    }
+
+    /// Como o milestone acima, mas com **transporte gRPC** (`RaftTransport::Grpc`):
+    /// 3 servidores formam o cluster pela superfície gRPC, replicam o log e
+    /// indexam (query GQL devolve os dados em TODOS) — prova o wiring do toggle
+    /// de transporte ponta-a-ponta pelo servidor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn three_server_cluster_over_grpc_replicates_and_indexes() {
+        let addrs: Vec<String> = (0..3).map(|_| free_addr()).collect();
+        let peers: BTreeMap<u64, String> =
+            (0..3).map(|i| (i as u64, addrs[i].clone())).collect();
+
+        let mut engines: Vec<Arc<Engine>> = Vec::new();
+        let mut tasks: Vec<ClusterTasks> = Vec::new();
+        let mut dirs = Vec::new();
+        for id in 0..3u64 {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = HeraclitusConfig {
+                data_dir: dir.path().to_path_buf(),
+                fsync: FsyncPolicy::Always,
+                replication: Some(ReplicationConfig {
+                    node_id: id,
+                    raft_addr: addrs[id as usize].clone(),
+                    peers: peers.clone(),
+                    bootstrap: id == 0,
+                    raft_dir: dir.path().join("raft"),
+                    sm_dir: dir.path().join("raft-sm"),
+                    transport: RaftTransport::Grpc,
+                }),
+                ..Default::default()
+            };
+            let engine = Arc::new(Engine::open(&cfg).unwrap());
+            let (handle, t) = spawn(&engine, cfg.replication.as_ref().unwrap(), &cfg.data_dir)
+                .await
+                .unwrap();
+            engine.set_replication(handle);
+            engines.push(engine);
+            tasks.push(t);
+            dirs.push(dir);
+        }
+
+        for i in 0..6 {
+            write_via_cluster(&engines, obs("alice", &format!("grpc {i}"))).await;
+        }
+
+        for _ in 0..50 {
+            if engines.iter().all(|e| e.log.head() == 6) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        for (i, e) in engines.iter().enumerate() {
+            assert_eq!(e.log.head(), 6, "nó {i} replicou por gRPC");
+            let v = heraclitus_query::execute("MATCH (n) RETURN n", e.as_ref()).unwrap();
+            assert_eq!(v.as_array().unwrap().len(), 6, "nó {i} indexou (gRPC)");
+        }
 
         for t in tasks {
             t.abort();

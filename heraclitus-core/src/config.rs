@@ -92,6 +92,19 @@ pub struct HeraclitusConfig {
     pub replication: Option<ReplicationConfig>,
 }
 
+/// Transporte de rede do consenso raft (SPEC-015/021). Ambos correm os mesmos
+/// RPCs sobre os mesmos tipos serde; muda só o wire-format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RaftTransport {
+    /// Enquadramento TCP + bincode (transporte de referência, default).
+    #[default]
+    Tcp,
+    /// gRPC/tonic sobre os mesmos tipos serde — a superfície unificada do
+    /// servidor (requer a feature `replication`).
+    Grpc,
+}
+
 /// Configuração de um nó no cluster de consenso (SPEC-015/021).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -110,6 +123,10 @@ pub struct ReplicationConfig {
     pub raft_dir: PathBuf,
     /// Diretório do meta durável da máquina de estados. Vazio ⇒ `<data_dir>/raft-sm`.
     pub sm_dir: PathBuf,
+    /// Transporte de rede do consenso (default `tcp`). `grpc` corre os mesmos
+    /// RPCs de raft sobre tonic/gRPC — a superfície unificada do servidor.
+    #[serde(default)]
+    pub transport: RaftTransport,
 }
 
 impl Default for ReplicationConfig {
@@ -121,6 +138,7 @@ impl Default for ReplicationConfig {
             bootstrap: false,
             raft_dir: PathBuf::new(),
             sm_dir: PathBuf::new(),
+            transport: RaftTransport::Tcp,
         }
     }
 }

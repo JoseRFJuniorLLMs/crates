@@ -19,8 +19,9 @@
 //! runs over a **real TCP network transport** ([`net`]) — election,
 //! replication and failover proven over sockets; the in-process
 //! [`consensus::Router`] remains for deterministic partition/failover tests.
-//! (A gRPC/tonic wrapper over the same serde types is the only cosmetic step
-//! left, if a specific wire protocol is required.) Default build stays on v0.
+//! A **gRPC/tonic wrapper** over the same serde types is also available
+//! ([`grpc`], SPEC-015/021) — the server selects TCP or gRPC via
+//! `ReplicationConfig.transport`. Default build stays on v0.
 
 use heraclitus_core::{Episode, HeraclitusError, Lsn};
 use heraclitus_log::Log;
@@ -37,6 +38,11 @@ pub mod durable;
 /// SPEC-015/021 — transporte de rede real (TCP) para o consenso, opt-in.
 #[cfg(feature = "replication")]
 pub mod net;
+
+/// SPEC-015/021 — transporte gRPC/tonic para o consenso, opt-in. Mesma
+/// serialização serde que [`net`], sobre a superfície gRPC do servidor.
+#[cfg(feature = "replication")]
+pub mod grpc;
 
 /// Transport boundary: how a follower fetches batches from a leader.
 /// Implementations: in-process (tests), TCP (sim/turmoil), gRPC Subscribe.

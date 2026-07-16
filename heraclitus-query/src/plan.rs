@@ -500,27 +500,132 @@ fn valid_at_matches(e: &Episode, t: u64) -> bool {
     from_ok && to_ok
 }
 
-fn matches(conditions: &[(BoolOp, Condition)], lsn: Lsn, e: &Episode) -> bool {
-    let mut acc = true;
+/// Avalia a lista `(op, cond)` com precedência SQL: **AND liga mais forte que
+/// OR** — `A OR B AND C` = `A OR (B AND C)`. (Correção R19: a avaliação
+/// anterior era estritamente esquerda→direita, o que dava `(A OR B) AND C`.)
+/// Lista vazia = sem filtro = `true`.
+fn eval_bool(conditions: &[(BoolOp, Condition)], mut hit: impl FnMut(&Condition) -> bool) -> bool {
+    if conditions.is_empty() {
+        return true;
+    }
+    let mut any = false; // OR dos grupos AND já fechados
+    let mut cur = true; // grupo AND corrente
     for (op, c) in conditions {
+        let h = hit(c);
+        match op {
+            BoolOp::First => cur = h,
+            BoolOp::And => cur = cur && h,
+            BoolOp::Or => {
+                any = any || cur;
+                cur = h;
+            }
+        }
+    }
+    any || cur
+}
+
+fn matches(conditions: &[(BoolOp, Condition)], lsn: Lsn, e: &Episode) -> bool {
+    eval_bool(conditions, |c| {
         let lhs = eval_operand(&c.lhs, lsn, e);
         let rhs = eval_operand(&c.rhs, lsn, e);
-        let hit = match (lhs, rhs) {
+        match (lhs, rhs) {
             (Some(a), Some(b)) => cmp_json(&a, &b, c.cmp),
             _ => false,
-        };
-        acc = match op {
-            BoolOp::First => hit,
-            BoolOp::And => acc && hit,
-            BoolOp::Or => acc || hit,
-        };
+        }
+    })
+}
+
+/// Avalia um operando no CONTEXTO de uma aresta do GraphMatch (correção R1):
+/// as variáveis do padrão resolvem para from/to/edge_id, e `r.type`/`r.belief`/
+/// `r.id` para os campos da aresta. Campo desconhecido ⇒ `None` — a condição
+/// não casa (a mesma regra do ScanFilter para attrs inexistentes).
+fn eval_edge_operand(
+    op: &Operand,
+    r: &EdgeRow,
+    from_var: &str,
+    to_var: &str,
+    rel_var: &str,
+) -> Option<Json> {
+    match op {
+        Operand::Num(n) => Some(json!(n)),
+        Operand::Str(s) => Some(json!(s)),
+        Operand::Dist(..) => None, // sem embedding num contexto de aresta
+        Operand::Ident(v) => {
+            if v == from_var {
+                Some(json!(r.from))
+            } else if v == to_var {
+                Some(json!(r.to))
+            } else if v == rel_var {
+                Some(json!(r.edge_id))
+            } else {
+                None
+            }
+        }
+        Operand::Prop(v, f) => {
+            if v == rel_var {
+                match f.as_str() {
+                    "type" => Some(json!(r.etype)),
+                    "belief" => Some(json!(r.belief)),
+                    "id" => Some(json!(r.edge_id)),
+                    _ => None,
+                }
+            } else if v == from_var && f == "id" {
+                Some(json!(r.from))
+            } else if v == to_var && f == "id" {
+                Some(json!(r.to))
+            } else {
+                None
+            }
+        }
     }
-    acc
+}
+
+/// Pós-filtro do GraphMatch (correção R1): TODAS as condições do WHERE são
+/// revalidadas contra cada aresta — antes, só as igualdades src/dst/etype eram
+/// empurradas e o resto era silenciosamente ignorado (resultados errados).
+fn edge_matches(
+    conditions: &[(BoolOp, Condition)],
+    r: &EdgeRow,
+    from_var: &str,
+    to_var: &str,
+    rel_var: &str,
+) -> bool {
+    eval_bool(conditions, |c| {
+        let lhs = eval_edge_operand(&c.lhs, r, from_var, to_var, rel_var);
+        let rhs = eval_edge_operand(&c.rhs, r, from_var, to_var, rel_var);
+        match (lhs, rhs) {
+            (Some(a), Some(b)) => cmp_json(&a, &b, c.cmp),
+            _ => false,
+        }
+    })
+}
+
+/// Ordem total para ORDER BY (correção R3): números (com coerção de strings
+/// numéricas, a mesma do `cmp_json`) comparam numericamente e vêm primeiro;
+/// o resto compara lexicograficamente. Antes tudo era comparado como string
+/// JSON — `ORDER BY n.lsn ASC` dava [0,1,10,11,2,...].
+fn cmp_order(a: &Json, b: &Json) -> std::cmp::Ordering {
+    let coerce = |j: &Json| {
+        j.as_f64()
+            .or_else(|| j.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+    };
+    match (coerce(a), coerce(b)) {
+        (Some(x), Some(y)) => x.total_cmp(&y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.to_string().cmp(&b.to_string()),
+    }
 }
 
 /// Push a pattern-variable equality (`var = "x"` or `var.field = "x"`) from the
 /// WHERE clause down into the graph query. Returns the literal if found.
+/// Um `OR` desqualifica o pushdown (correção R1): a igualdade pode valer só
+/// num ramo — empurrá-la restringiria o match antes do pós-filtro e perderia
+/// linhas dos outros ramos. O `edge_matches` revalida tudo na mesma.
 fn eq_filter(conditions: &[(BoolOp, Condition)], var: &str, field: &str) -> Option<String> {
+    if conditions.iter().any(|(op, _)| matches!(op, BoolOp::Or)) {
+        return None;
+    }
     fn var_lit(a: &Operand, b: &Operand, var: &str, field: &str) -> Option<String> {
         let is_var = match a {
             Operand::Ident(v) => v == var,
@@ -819,13 +924,16 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                 .collect();
             if let Some((key, asc)) = order_by {
                 match key {
+                    // Correção R3: comparação numérica (com coerção) em vez de
+                    // comparar as representações string dos valores JSON.
                     OrderKey::Field(field) => rows.sort_by(|(la, ea), (lb, eb)| {
-                        let a = field_of(*la, ea, field).unwrap_or(Json::Null).to_string();
-                        let b = field_of(*lb, eb, field).unwrap_or(Json::Null).to_string();
+                        let a = field_of(*la, ea, field).unwrap_or(Json::Null);
+                        let b = field_of(*lb, eb, field).unwrap_or(Json::Null);
+                        let ord = cmp_order(&a, &b);
                         if *asc {
-                            a.cmp(&b)
+                            ord
                         } else {
-                            b.cmp(&a)
+                            ord.reverse()
                         }
                     }),
                     // Ordenação numérica por distância; sem embedding vai para o fim.
@@ -906,6 +1014,10 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                             && r.world_valid_to.is_none_or(|to| t < to)
                     })
                 })
+                // Correção R1: pós-filtro que revalida TODAS as condições do
+                // WHERE contra a aresta (o pushdown src/dst/etype é só um hint;
+                // antes, condições não-empurráveis eram ignoradas em silêncio).
+                .filter(|r| edge_matches(conditions, r, from_var, to_var, rel_var))
                 .map(|r| project_edge(r, returns, from_var, to_var, rel_var))
                 .collect();
             if let Some(l) = limit {

@@ -1047,6 +1047,12 @@ pub struct BEpsilonTree {
     current_cache_bytes: AtomicUsize,
     allocated_this_epoch: std::sync::Mutex<HashSet<u64>>,
     dirty_page_table: std::sync::Mutex<HashSet<u64>>,
+    /// R8: páginas do último estado DURÁVEL substituídas por CoW neste epoch.
+    /// Só podem ser tombstonadas/reutilizadas DEPOIS de o próximo `commit`
+    /// apontar o superbloco para longe delas — sobrescrevê-las já (como antes)
+    /// violava o shadow paging: um crash pré-commit deixava o superbloco
+    /// durável a apontar para uma página FreeList (árvore ilegível).
+    pending_recycle: std::sync::Mutex<Vec<u64>>,
     pub metrics: Arc<TreeMetrics>,
 }
 
@@ -1109,6 +1115,7 @@ impl BEpsilonTree {
                 current_cache_bytes: AtomicUsize::new(0),
                 allocated_this_epoch: std::sync::Mutex::new(HashSet::new()),
                 dirty_page_table: std::sync::Mutex::new(HashSet::new()),
+                pending_recycle: std::sync::Mutex::new(Vec::new()),
                 metrics,
             };
             let size = root.estimate_memory_footprint();
@@ -1164,6 +1171,7 @@ impl BEpsilonTree {
             current_cache_bytes: AtomicUsize::new(0),
             allocated_this_epoch: std::sync::Mutex::new(HashSet::new()),
             dirty_page_table: std::sync::Mutex::new(HashSet::new()),
+            pending_recycle: std::sync::Mutex::new(Vec::new()),
             metrics,
         })
     }
@@ -1249,28 +1257,35 @@ impl BEpsilonTree {
 
     fn acquire_node_guard(&self, id: u64) -> io::Result<PageGuard> {
         let shard_idx = ((id ^ (id >> 16)) % NUM_SHARDS as u64) as usize;
-        let mut c = self.cache_shards[shard_idx].lock().unwrap();
         let tick = self.global_ticker.fetch_add(1, Ordering::Relaxed);
         let root_id = self.superblock.read().unwrap().root_id;
 
-        if let Some(frame) = c.get(&id) {
-            frame.pin_count.fetch_add(1, Ordering::Acquire);
-            frame.last_access.store(tick, Ordering::Release);
-            self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(PageGuard {
-                id,
-                node: Arc::clone(&frame.node),
-                pin_count_ref: Arc::clone(&frame.pin_count),
-            });
+        // Fast path: hit no cache, só o lock do shard alvo.
+        {
+            let c = self.cache_shards[shard_idx].lock().unwrap();
+            if let Some(frame) = c.get(&id) {
+                frame.pin_count.fetch_add(1, Ordering::Acquire);
+                frame.last_access.store(tick, Ordering::Release);
+                self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(PageGuard {
+                    id,
+                    node: Arc::clone(&frame.node),
+                    pin_count_ref: Arc::clone(&frame.pin_count),
+                });
+            }
         }
-
+        // R18: a evicção corre SEM o lock do shard alvo. A versão anterior
+        // segurava-o e iterava TODOS os shards — auto-deadlock garantido ao
+        // chegar ao próprio shard (Mutex std não é reentrante) e lock-ordering
+        // cruzado entre threads. Aqui cada shard é trancado transitoriamente,
+        // um de cada vez.
         self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
         while self.current_cache_bytes.load(Ordering::Acquire) >= CACHE_MEMORY_BUDGET_BYTES {
             let mut lru_id = None;
             let mut min_tick = u64::MAX;
             let mut target_shard_idx = 0;
-            for s_idx in 0..NUM_SHARDS {
-                let shard = self.cache_shards[s_idx].lock().unwrap();
+            for (s_idx, shard_lock) in self.cache_shards.iter().enumerate() {
+                let shard = shard_lock.lock().unwrap();
                 for (&cid, frame) in shard.iter() {
                     if frame.pin_count.load(Ordering::Acquire) == 0 && cid != root_id {
                         let acc = frame.last_access.load(Ordering::Acquire);
@@ -1284,15 +1299,24 @@ impl BEpsilonTree {
             }
             if let Some(lid) = lru_id {
                 let mut shard = self.cache_shards[target_shard_idx].lock().unwrap();
-                if let Some(removed) = shard.remove(&lid) {
-                    self.current_cache_bytes
-                        .fetch_sub(removed.byte_size, Ordering::Release);
+                // Revalida sob o lock (outra thread pode ter pinado entretanto).
+                let evictable = shard
+                    .get(&lid)
+                    .is_some_and(|f| f.pin_count.load(Ordering::Acquire) == 0);
+                if evictable {
+                    if let Some(removed) = shard.remove(&lid) {
+                        self.current_cache_bytes
+                            .fetch_sub(removed.byte_size, Ordering::Release);
+                    }
+                } else {
+                    break; // candidato desapareceu/foi pinado — evita loop
                 }
             } else {
                 break;
             }
         }
 
+        // Leitura + decode fora de qualquer lock.
         let mut buf = vec![0u8; PAGE_SIZE];
         self.store.read_page(id, &mut buf)?;
         self.metrics
@@ -1300,9 +1324,21 @@ impl BEpsilonTree {
             .fetch_add(1, Ordering::Relaxed);
         let node = DiskNode::deserialize(id, &buf)?;
         let footprint = node.estimate_memory_footprint();
+
+        let mut c = self.cache_shards[shard_idx].lock().unwrap();
+        // Double-check: outra thread pode ter carregado a página entretanto —
+        // usa o frame dela (a nossa cópia é descartada) para não duplicar.
+        if let Some(frame) = c.get(&id) {
+            frame.pin_count.fetch_add(1, Ordering::Acquire);
+            frame.last_access.store(tick, Ordering::Release);
+            return Ok(PageGuard {
+                id,
+                node: Arc::clone(&frame.node),
+                pin_count_ref: Arc::clone(&frame.pin_count),
+            });
+        }
         let node_arc = Arc::new(std::sync::RwLock::new(node));
         let pin_counter = Arc::new(AtomicUsize::new(1));
-
         c.insert(
             id,
             CacheFrame {
@@ -1377,8 +1413,20 @@ impl BEpsilonTree {
         // recicla o id da geração anterior a cada upsert — errar aqui, como
         // o código fazia, rebentava qualquer sequência de 2+ upserts).
         // Removê-la do epoch mantém o guard de alocação dupla coerente.
-        self.allocated_this_epoch.lock().unwrap().remove(&id);
+        let was_this_epoch = self.allocated_this_epoch.lock().unwrap().remove(&id);
+        if !was_this_epoch {
+            // R8: página referenciada pelo último superbloco DURÁVEL — o
+            // tombstone fica adiado para depois do próximo commit (shadow
+            // paging: nunca sobrescrever o que o estado durável ainda aponta).
+            self.pending_recycle.lock().unwrap().push(id);
+            return Ok(());
+        }
+        self.add_to_free_list(id)
+    }
 
+    /// Tombstona a página e devolve-a à free list (superbloco em memória).
+    /// Chamar SÓ quando a página já não é alcançável pelo estado durável.
+    fn add_to_free_list(&self, id: u64) -> io::Result<()> {
         let mut sb = self.superblock.write().unwrap();
         if (sb.free_list_len as usize) < MAX_SB_FREE_LIST {
             let mut clean_tombstone = vec![0u8; PAGE_SIZE];
@@ -1410,6 +1458,52 @@ impl BEpsilonTree {
             sb.free_list_len = 0;
         }
         Ok(())
+    }
+
+    /// R2: escreve a cadeia overflow de um valor grande (> OVERFLOW_THRESHOLD)
+    /// em duas passagens — aloca todos os ids primeiro e grava cada página JÁ
+    /// com o `next` definitivo. Devolve `(primeira página, hash da cadeia)`;
+    /// valores inline devolvem `(0, hash-vazio)`. Partilhado pelo caminho
+    /// raiz-folha (`push_msg`) e pelo cascade (`partial_flush_cascade`) — antes
+    /// só o primeiro criava cadeias e um valor >~4KB rebentava a página da
+    /// folha com "Estouro físico da Página" assim que a árvore ganhava
+    /// profundidade (confirmado por sonda).
+    fn write_value_chain(&self, v: &[u8]) -> io::Result<(u64, [u8; HASH_LEN])> {
+        let mut chain_hash = blake3::Hasher::new();
+        let mut target_ov_id = 0u64;
+        if v.len() > OVERFLOW_THRESHOLD {
+            let chunk_cap = PAGE_SIZE - 48;
+            let n_chunks = v.len().div_ceil(chunk_cap);
+            let mut ids = Vec::with_capacity(n_chunks);
+            for _ in 0..n_chunks {
+                ids.push(self.allocate_id()?);
+            }
+            target_ov_id = ids[0];
+            for (ci, chunk) in v.chunks(chunk_cap).enumerate() {
+                let next = ids.get(ci + 1).copied().unwrap_or(0);
+                let mut ov_buf = vec![0u8; PAGE_SIZE];
+                ov_buf[0] = PageType::Overflow as u8;
+                ov_buf[1..9].copy_from_slice(&next.to_le_bytes());
+                ov_buf[9..11].copy_from_slice(&(chunk.len() as u16).to_le_bytes());
+                ov_buf[11..11 + chunk.len()].copy_from_slice(chunk);
+
+                let (data, sig) = ov_buf.split_at_mut(PAGE_SIZE - 32);
+                let crc = crc32fast::hash(data);
+                let hash = blake3::hash(data);
+                chain_hash.update(hash.as_bytes());
+                sig[0..4].copy_from_slice(&crc.to_le_bytes());
+                sig[4..32].copy_from_slice(&hash.as_bytes()[..28]);
+
+                self.store.write_page(ids[ci], &ov_buf)?;
+                self.metrics
+                    .write_amplification_count
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let fin_hash = chain_hash.finalize();
+        let mut trunc_hash = [0u8; HASH_LEN];
+        trunc_hash.copy_from_slice(&fin_hash.as_bytes()[..HASH_LEN]);
+        Ok((target_ov_id, trunc_hash))
     }
 
     fn recycle_overflow_chain(&self, first_page_id: u64) -> io::Result<()> {
@@ -1505,46 +1599,8 @@ impl BEpsilonTree {
             root.bloom.insert(&key);
             match &msg {
                 Msg::Upsert(v, _lsn) => {
-                    let mut target_ov_id = 0u64;
-                    let mut chain_hash = blake3::Hasher::new();
-                    if v.len() > OVERFLOW_THRESHOLD {
-                        // V2.2 — DUAS passagens: aloca todos os ids primeiro e
-                        // grava cada página JÁ com o `next` definitivo. A versão
-                        // anterior acumulava o hash da página ANTES de patchar o
-                        // ponteiro (e re-gravar mudava o blake3): a validação da
-                        // cadeia na releitura falhava para QUALQUER valor com 2+
-                        // chunks (~4 KB) — o get() devolvia None silenciosamente.
-                        let chunk_cap = PAGE_SIZE - 48;
-                        let n_chunks = v.len().div_ceil(chunk_cap);
-                        let mut ids = Vec::with_capacity(n_chunks);
-                        for _ in 0..n_chunks {
-                            ids.push(self.allocate_id()?);
-                        }
-                        target_ov_id = ids[0];
-                        for (ci, chunk) in v.chunks(chunk_cap).enumerate() {
-                            let next = ids.get(ci + 1).copied().unwrap_or(0);
-                            let mut ov_buf = vec![0u8; PAGE_SIZE];
-                            ov_buf[0] = PageType::Overflow as u8;
-                            ov_buf[1..9].copy_from_slice(&next.to_le_bytes());
-                            ov_buf[9..11].copy_from_slice(&(chunk.len() as u16).to_le_bytes());
-                            ov_buf[11..11 + chunk.len()].copy_from_slice(chunk);
-
-                            let (data, sig) = ov_buf.split_at_mut(PAGE_SIZE - 32);
-                            let crc = crc32fast::hash(data);
-                            let hash = blake3::hash(data);
-                            chain_hash.update(hash.as_bytes());
-                            sig[0..4].copy_from_slice(&crc.to_le_bytes());
-                            sig[4..32].copy_from_slice(&hash.as_bytes()[..28]);
-
-                            self.store.write_page(ids[ci], &ov_buf)?;
-                            self.metrics
-                                .write_amplification_count
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    let fin_hash = chain_hash.finalize();
-                    let mut trunc_hash = [0u8; HASH_LEN];
-                    trunc_hash.copy_from_slice(&fin_hash.as_bytes()[..HASH_LEN]);
+                    // V2.2 — duas passagens (ver write_value_chain, R2).
+                    let (target_ov_id, trunc_hash) = self.write_value_chain(v)?;
 
                     match root.keys.binary_search(&key) {
                         Ok(i) => {
@@ -1791,29 +1847,41 @@ impl BEpsilonTree {
                     if child.is_leaf() {
                         child.bloom.insert(&k);
                         match msg {
-                            Msg::Upsert(v, _) => match child.keys.binary_search(&k) {
-                                Ok(i) => {
-                                    if (child.slots[i].flags & FLAG_OVERFLOW) != 0 {
-                                        self.recycle_overflow_chain(child.slots[i].overflow_page)?;
+                            Msg::Upsert(v, _) => {
+                                // R2: o cascade cria cadeia overflow para valores
+                                // grandes, exatamente como o caminho raiz-folha —
+                                // antes inseria SEMPRE inline e um valor >~4KB
+                                // rebentava o serialize da folha.
+                                let (ov_id, chain_hash) = self.write_value_chain(&v)?;
+                                let flags = if ov_id > 0 {
+                                    FLAG_ACTIVE | FLAG_OVERFLOW
+                                } else {
+                                    FLAG_ACTIVE
+                                };
+                                let slot = Slot {
+                                    offset: 0,
+                                    length: v.len() as u32,
+                                    flags,
+                                    overflow_page: ov_id,
+                                    cumulative_hash: chain_hash,
+                                };
+                                match child.keys.binary_search(&k) {
+                                    Ok(i) => {
+                                        if (child.slots[i].flags & FLAG_OVERFLOW) != 0 {
+                                            self.recycle_overflow_chain(
+                                                child.slots[i].overflow_page,
+                                            )?;
+                                        }
+                                        child.vals[i] = v;
+                                        child.slots[i] = slot;
                                     }
-                                    child.vals[i] = v;
-                                    child.slots[i].flags = FLAG_ACTIVE;
+                                    Err(i) => {
+                                        child.keys.insert(i, k.clone());
+                                        child.vals.insert(i, v);
+                                        child.slots.insert(i, slot);
+                                    }
                                 }
-                                Err(i) => {
-                                    child.keys.insert(i, k.clone());
-                                    child.vals.insert(i, v);
-                                    child.slots.insert(
-                                        i,
-                                        Slot {
-                                            offset: 0,
-                                            length: 0,
-                                            flags: FLAG_ACTIVE,
-                                            overflow_page: 0,
-                                            cumulative_hash: [0; HASH_LEN],
-                                        },
-                                    );
-                                }
-                            },
+                            }
                             Msg::Delete(_) => {
                                 if let Ok(i) = child.keys.binary_search(&k) {
                                     if (child.slots[i].flags & FLAG_OVERFLOW) != 0 {
@@ -1834,6 +1902,21 @@ impl BEpsilonTree {
             }
         }
         node.buffer = rem_buf;
+
+        // R2: um filho INTERNO que recebeu mensagens pode ele próprio exceder o
+        // orçamento físico (o buffer serializa inline na página de 4KB) — drena
+        // recursivamente ANTES do serialize, senão um valor grande em árvores de
+        // 3+ níveis rebentava aqui. Mesmo loop limitado do push_msg.
+        if !child.is_leaf() {
+            let mut cascades = 0usize;
+            while !child.buffer.is_empty()
+                && child.estimate_serialized_size() > PAGE_SOFT_BUDGET
+                && cascades <= child.children.len()
+            {
+                self.partial_flush_cascade(&mut child)?;
+                cascades += 1;
+            }
+        }
 
         if child.keys.len() >= 2
             && (child.keys.len() > self.node_cap
@@ -2211,6 +2294,14 @@ impl BEpsilonTree {
         self.store.sync()?;
 
         self.active_sb_offset.store(next_offset, Ordering::Release);
+        // R8: o superbloco novo já está durável e não referencia as páginas CoW
+        // substituídas neste epoch — agora (e só agora) é seguro tombstoná-las
+        // e devolvê-las à free list. Num crash antes daqui elas ficam órfãs
+        // (fuga de espaço segura), nunca corrompidas.
+        let pending: Vec<u64> = std::mem::take(&mut *self.pending_recycle.lock().unwrap());
+        for id in pending {
+            self.add_to_free_list(id)?;
+        }
         self.allocated_this_epoch.lock().unwrap().clear();
         Ok(())
     }
@@ -2327,6 +2418,13 @@ impl BEpsilonTree {
             free_id = read_u64(&buf, 1)?;
         }
         for &id in &sb.free_list {
+            if id > 0 {
+                visited_freelist.insert(id);
+            }
+        }
+        // R8: páginas CoW à espera do próximo commit (pending_recycle) não estão
+        // na árvore nem na free list — contam como "em trânsito" na contabilidade.
+        for &id in self.pending_recycle.lock().unwrap().iter() {
             if id > 0 {
                 visited_freelist.insert(id);
             }

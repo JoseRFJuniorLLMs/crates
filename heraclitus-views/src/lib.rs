@@ -204,14 +204,25 @@ impl ViewRegistry {
                 self.watermarks.remove(v.name());
             }
         }
-        let events = log.scan(0, u64::MAX)?;
-        for (lsn, ep) in &events {
-            for v in self.views.iter_mut() {
-                if view_name.map(|n| n == v.name()).unwrap_or(true) {
-                    v.apply(*lsn, ep);
-                    self.watermarks.insert(v.name().to_string(), *lsn);
+        // R10: paginado como o `catch_up` — o scan sem teto materializava o log
+        // INTEIRO num único Vec (o alloc gigante que estourava em logs grandes),
+        // e o rebuild é justamente o fluxo oficial pós bulk-ingest.
+        let head = log.head();
+        let mut cur = 0u64;
+        while cur < head {
+            let batch = log.scan_capped(cur, head, 100_000)?;
+            let Some(&(last, _)) = batch.last() else {
+                break;
+            };
+            for (lsn, ep) in &batch {
+                for v in self.views.iter_mut() {
+                    if view_name.map(|n| n == v.name()).unwrap_or(true) {
+                        v.apply(*lsn, ep);
+                        self.watermarks.insert(v.name().to_string(), *lsn);
+                    }
                 }
             }
+            cur = last + 1;
         }
         self.persist_watermarks()?;
         Ok(())

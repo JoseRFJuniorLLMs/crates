@@ -104,11 +104,12 @@ pub async fn serve_with(
         match &expected_auth {
             None => Ok(req),
             Some(exp) => {
+                // R17: comparação constant-time (sem side-channel de timing).
                 let ok = req
                     .metadata()
                     .get("authorization")
                     .and_then(|v| v.to_str().ok())
-                    .map(|v| v == exp)
+                    .map(|v| rest::ct_eq(v.as_bytes(), exp.as_bytes()))
                     .unwrap_or(false);
                 if ok {
                     Ok(req)

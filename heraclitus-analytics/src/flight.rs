@@ -13,7 +13,7 @@
 //! exige o crate `arrow-flight` version-locked ao arrow do DataFusion — é o
 //! passo seguinte natural; a superfície REST do server já serve estes bytes.
 
-use crate::vectorized::episodes_to_batches;
+use crate::vectorized::{episodes_to_batches_sized, BATCH_ROWS};
 use crate::AnalyticsError;
 use datafusion::arrow::array::{RecordBatch, StringArray};
 use datafusion::arrow::ipc::reader::StreamReader;
@@ -49,7 +49,9 @@ pub fn ipc_to_batches(bytes: &[u8]) -> Result<Vec<RecordBatch>, AnalyticsError> 
 pub fn events_as_single_ipc(log: &Log, as_of: Option<u64>) -> Result<Vec<u8>, AnalyticsError> {
     let to = as_of.unwrap_or(u64::MAX).min(log.head());
     let events = log.scan(0, to)?;
-    let batches = episodes_to_batches(&events)?;
+    // Flight faz streaming incremental: lotes fixos de BATCH_ROWS, não o morsel
+    // adaptativo (que agregaria tudo num só batch grande no fio).
+    let batches = episodes_to_batches_sized(&events, BATCH_ROWS)?;
     let mut buf = Vec::new();
     {
         let schema = batches
@@ -95,7 +97,8 @@ impl FlightService for IpcFlightService {
         let as_of = Self::parse_ticket(ticket)?;
         let to = as_of.unwrap_or(u64::MAX).min(self.log.head());
         let events = self.log.scan(0, to).map_err(|e| e.to_string())?;
-        let batches = episodes_to_batches(&events).map_err(|e| e.to_string())?;
+        // Streaming incremental: lotes fixos de BATCH_ROWS (contrato do fio).
+        let batches = episodes_to_batches_sized(&events, BATCH_ROWS).map_err(|e| e.to_string())?;
         batches
             .iter()
             .map(|b| batch_to_ipc(b).map_err(|e| e.to_string()))

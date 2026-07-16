@@ -98,11 +98,24 @@ pub struct Edge {
     /// aresta. Distinto de `valid_*_lsn` (transaction time do log).
     pub world_valid_from: Option<u64>,
     pub world_valid_to: Option<u64>,
+    /// R12: intervalos de vida ANTERIORES `[from, to)`. Um re-assert de uma
+    /// aresta retratada fecha um capítulo e abre outro — a história dos
+    /// períodos fechados fica preservada (o `AS OF` continua a vê-los), em vez
+    /// de a aresta ficar morta para sempre (comportamento antigo) ou de a
+    /// história ser reescrita. Nota: mudar o layout invalida checkpoints
+    /// bincode antigos do tgraph — o restore degrada para replay (correto por
+    /// construção, estado derivado).
+    #[serde(default)]
+    pub closed_intervals: Vec<(Lsn, Lsn)>,
 }
 
 impl Edge {
     pub fn alive_at(&self, at: Lsn) -> bool {
-        self.valid_from_lsn <= at && self.valid_to_lsn.is_none_or(|to| at < to)
+        (self.valid_from_lsn <= at && self.valid_to_lsn.is_none_or(|to| at < to))
+            || self
+                .closed_intervals
+                .iter()
+                .any(|(from, to)| *from <= at && at < *to)
     }
 
     /// O facto que a aresta representa é válido NO MUNDO em `t`?
@@ -276,7 +289,21 @@ impl TemporalGraph {
 
         // A topologia (adjacência + Edge) regista-se uma única vez; o `edge_id`
         // é determinístico (from→to#etype), logo estável entre replays.
-        if self.edges.contains_key(&edge.id) {
+        // R12: um assert sobre uma aresta FECHADA reabre-a num novo intervalo,
+        // arquivando o anterior em `closed_intervals` — antes era no-op
+        // silencioso e a relação ficava morta para sempre. Idempotente: um
+        // assert sobre aresta ABERTA continua a ser no-op topológico.
+        if let Some(existing) = self.edges.get_mut(&edge.id) {
+            if let Some(closed_at) = existing.valid_to_lsn {
+                existing
+                    .closed_intervals
+                    .push((existing.valid_from_lsn, closed_at));
+                existing.valid_from_lsn = edge.valid_from_lsn;
+                existing.valid_to_lsn = None;
+                existing.world_valid_from = edge.world_valid_from;
+                existing.world_valid_to = edge.world_valid_to;
+                self.built_until_lsn = self.built_until_lsn.max(edge.valid_from_lsn);
+            }
             return;
         }
         self.out
@@ -756,6 +783,7 @@ impl TemporalGraph {
                             valid_to_lsn: None,
                             world_valid_from: e.valid_from.or_else(|| wnum("valid_from")),
                             world_valid_to: e.valid_to.or_else(|| wnum("valid_to")),
+                            closed_intervals: Vec::new(),
                         },
                         vec![version],
                     );
@@ -785,6 +813,7 @@ impl TemporalGraph {
                             valid_to_lsn: None,
                             world_valid_from: e.valid_from,
                             world_valid_to: e.valid_to,
+                            closed_intervals: Vec::new(),
                         },
                         vec![version],
                     );
@@ -809,6 +838,11 @@ impl TemporalGraph {
             h.update(e.etype.key().as_bytes());
             h.update(&e.valid_from_lsn.to_le_bytes());
             h.update(&e.valid_to_lsn.unwrap_or(u64::MAX).to_le_bytes());
+            // R12: os intervalos fechados fazem parte do estado determinístico.
+            for (from, to) in &e.closed_intervals {
+                h.update(&from.to_le_bytes());
+                h.update(&to.to_le_bytes());
+            }
         }
         for (id, vs) in &self.versions {
             h.update(id.as_bytes());
@@ -886,6 +920,7 @@ mod tests {
             valid_to_lsn: None,
             world_valid_from: None,
             world_valid_to: None,
+            closed_intervals: Vec::new(),
         }
     }
 

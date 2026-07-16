@@ -108,9 +108,11 @@ impl pb::heraclitus_server::Heraclitus for Service {
         req: Request<pb::RecallRequest>,
     ) -> Result<Response<pb::QueryResponse>, Status> {
         let r = req.into_inner();
-        let v = self
-            .engine
-            .recall(&r.text, r.k.max(1) as usize)
+        // R11: hidratação lê do disco (log.read por hit) — fora do reactor.
+        let engine = self.engine.clone();
+        let v = tokio::task::spawn_blocking(move || engine.recall(&r.text, r.k.max(1) as usize))
+            .await
+            .map_err(internal)?
             .map_err(internal)?;
         Ok(Response::new(pb::QueryResponse {
             json: v.to_string(),
@@ -192,36 +194,44 @@ impl pb::heraclitus_server::Heraclitus for Service {
         req: Request<pb::AdminRequest>,
     ) -> Result<Response<pb::AdminResponse>, Status> {
         let r = req.into_inner();
-        let (ok, message) = match r.op.as_str() {
-            "stats" => (true, self.engine.stats().to_string()),
-            "verify" => match self.engine.verify() {
-                Ok(v) => (true, v.to_string()),
-                Err(e) => (false, e.to_string()),
-            },
-            "rebuild" => {
-                let view = if r.arg.is_empty() {
-                    None
-                } else {
-                    Some(r.arg.as_str())
-                };
-                match self.engine.rebuild(view) {
-                    Ok(()) => (true, "rebuilt".to_string()),
+        // R11: `verify` re-varre o log inteiro e `rebuild` replaya-o — minutos
+        // em logs grandes. Correr isso no worker async estagnava o reactor do
+        // tokio (o mesmo padrão já corrigido no `append`/`query`).
+        let engine = self.engine.clone();
+        let (ok, message) = tokio::task::spawn_blocking(move || {
+            match r.op.as_str() {
+                "stats" => (true, engine.stats().to_string()),
+                "verify" => match engine.verify() {
+                    Ok(v) => (true, v.to_string()),
                     Err(e) => (false, e.to_string()),
+                },
+                "rebuild" => {
+                    let view = if r.arg.is_empty() {
+                        None
+                    } else {
+                        Some(r.arg.as_str())
+                    };
+                    match engine.rebuild(view) {
+                        Ok(()) => (true, "rebuilt".to_string()),
+                        Err(e) => (false, e.to_string()),
+                    }
                 }
-            }
-            op if op.starts_with("shred:") => {
-                let agent = op.strip_prefix("shred:").unwrap_or("");
-                match self.engine.shred(agent) {
-                    Ok(true) => (
-                        true,
-                        format!("crypto-shred: key destroyed for agent '{agent}'"),
-                    ),
-                    Ok(false) => (true, format!("crypto-shred: no key for agent '{agent}'")),
-                    Err(e) => (false, e.to_string()),
+                op if op.starts_with("shred:") => {
+                    let agent = op.strip_prefix("shred:").unwrap_or("");
+                    match engine.shred(agent) {
+                        Ok(true) => (
+                            true,
+                            format!("crypto-shred: key destroyed for agent '{agent}'"),
+                        ),
+                        Ok(false) => (true, format!("crypto-shred: no key for agent '{agent}'")),
+                        Err(e) => (false, e.to_string()),
+                    }
                 }
+                other => (false, format!("unknown admin op: {other}")),
             }
-            other => (false, format!("unknown admin op: {other}")),
-        };
+        })
+        .await
+        .map_err(internal)?;
         Ok(Response::new(pb::AdminResponse { ok, message }))
     }
 }

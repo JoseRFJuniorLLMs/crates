@@ -1,5 +1,14 @@
 //! SPEC-019 — temporal read consistency levels.
 //!
+//! > **Nota de wiring (P3, 2026-07-16):** este enum é um tipo de **referência**.
+//! > A capacidade real que ele descreve — leitura `AS OF` / snapshot histórico —
+//! > está ligada ao caminho vivo pelo `as_of: Option<Lsn>` que o
+//! > `heraclitus-query::QueryBackend` recebe (resolvido do GQL `AS OF`), não por
+//! > este `IsolationLevel` (cujo único consumidor é o crate órfão
+//! > `heraclitus-txn`). `HistoricalSnapshot(l)` ≡ GQL `AS OF LSN l`; os restantes
+//! > níveis são degenerados no log single-writer append-only. Ver
+//! > `docs/md/DECISAO-P3-isolation-txn.md`.
+//!
 //! Every analytical query runs under one of these snapshot isolation levels.
 //! All are lock-free: readers pin an LSN and never see partial background
 //! Optimize/Freeze work (that isolation is enforced by the view layer's

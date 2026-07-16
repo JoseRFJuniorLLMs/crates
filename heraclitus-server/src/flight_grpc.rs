@@ -18,7 +18,7 @@ use arrow_flight::{
 };
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
-use heraclitus_analytics::vectorized::episodes_to_batches;
+use heraclitus_analytics::vectorized::{episodes_to_batches_sized, BATCH_ROWS};
 use heraclitus_log::Log;
 use std::sync::Arc;
 use tonic_flight::{Request, Response, Status, Streaming};
@@ -67,7 +67,8 @@ impl FlightService for HeraclitusFlight {
         let batches = tokio::task::spawn_blocking(move || {
             let to = as_of.unwrap_or(u64::MAX).min(log.head());
             let events = log.scan(0, to).map_err(|e| e.to_string())?;
-            episodes_to_batches(&events).map_err(|e| e.to_string())
+            // Streaming Flight: lotes fixos de BATCH_ROWS (contrato do fio).
+            episodes_to_batches_sized(&events, BATCH_ROWS).map_err(|e| e.to_string())
         })
         .await
         .map_err(|e| Status::internal(format!("join: {e}")))?

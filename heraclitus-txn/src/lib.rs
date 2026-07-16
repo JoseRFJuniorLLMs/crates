@@ -1,5 +1,16 @@
 //! heraclitus-txn — MVCC snapshots over log offsets (§3.11).
 //!
+//! > **ESTADO: REFERÊNCIA DE I&D — NÃO LIGADO AO CAMINHO VIVO** (decisão P3,
+//! > 2026-07-16 — `docs/md/DECISAO-P3-isolation-txn.md`). Nenhum crate depende
+//! > deste. A capacidade que a SPEC-019 descreve (leitura `AS OF` / snapshot
+//! > histórico) **já está ligada** — pelo `as_of: Option<Lsn>` que o
+//! > `heraclitus-query::QueryBackend` recebe em todos os métodos de leitura,
+//! > resolvido do GQL `AS OF LSN|SNAPSHOT`. Como o log é single-writer
+//! > append-only (committed = fsync-acked = `head()`) e o GQL é single-shot por
+//! > `execute`, os níveis Repeatable/ReadCommitted/Streaming são degenerados e
+//! > não há transação de escrita multi-statement a que os prender. Este crate
+//! > fica como implementação de referência; não o promover sem reabrir a P3.
+//!
 //! A snapshot *is* an LSN. All reads carry it; views answer "as of ≤ LSN"
 //! via their watermark + memtable merge. Writes are single-writer appends;
 //! `compare_and_append` provides optimistic CAS workflows. There are NO
@@ -43,8 +54,9 @@ impl TxnManager {
         Snapshot(self.log.head())
     }
 
-    /// SPEC-019 wired — open a snapshot under an explicit isolation level.
-    /// All levels resolve to a pinned LSN (reads never see past it):
+    /// SPEC-019 (reference — NOT on the live path; the live `AS OF` runs through
+    /// GQL's `as_of: Option<Lsn>`, not this). Open a snapshot under an explicit
+    /// isolation level. All levels resolve to a pinned LSN (reads never see past it):
     /// - `HistoricalSnapshot(l)` — anchored at `l` (`AS OF`), ignoring newer data;
     /// - `RepeatableSnapshot` / `ReadCommittedSnapshot` — pinned at the current
     ///   committed head (the log only exposes fsync-acked events, so "committed"

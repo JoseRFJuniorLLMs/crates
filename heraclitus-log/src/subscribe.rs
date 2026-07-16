@@ -22,11 +22,14 @@ pub fn attach_subscriber(
 ) -> std::thread::JoinHandle<()> {
     let mut rx = log.tail_subscribe();
     std::thread::spawn(move || {
-        let mut last_seen: u64 = 0;
+        // R15: `Option` em vez de `0` — um overflow ANTES do primeiro evento
+        // recebido tem de mandar o catch-up começar no LSN 0 (com `0` inicial,
+        // `last_seen + 1 = 1` perdia o LSN 0 para sempre).
+        let mut last_seen: Option<u64> = None;
         loop {
             match rx.blocking_recv() {
                 Ok((lsn, ep)) => {
-                    last_seen = lsn;
+                    last_seen = Some(lsn);
                     sub.on_append(&NotificationEvent {
                         lsn,
                         event_id: ep.id,
@@ -36,7 +39,7 @@ pub fn attach_subscriber(
                 Err(RecvError::Lagged(_missed)) => {
                     // O subscritor ficou para trás e o buffer rodou: manda-o
                     // fazer catch-up do histórico a partir do próximo LSN.
-                    sub.on_buffer_overflow(last_seen + 1);
+                    sub.on_buffer_overflow(last_seen.map_or(0, |l| l + 1));
                 }
                 Err(RecvError::Closed) => break,
             }

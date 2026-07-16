@@ -1,4 +1,9 @@
-//! SPEC-024 `Planner` — the sixth subsystem contract, wired to the real engine.
+//! SPEC-024 `Planner` — the sixth subsystem contract (reference implementation).
+//!
+//! > **ESTADO: REFERÊNCIA DE I&D — NÃO LIGADO** (decisão P1, 2026-07-16 —
+//! > `docs/md/DECISAO-P1-motor-analitico.md`). `AnalyticalPlanner`/`run_analytical`
+//! > não têm caller de produção; a via de agregação ligada é o `LogAnalytics`
+//! > (DataFusion) em `POST /sql`. Mantém-se como referência do contrato Planner.
 //!
 //! This closes the **Compiler-1 front-end**: a query *string* → `LogicalPlan`.
 //! Together with [`SelectivityOptimizer`] (SPEC-012 `Optimizer`) and
@@ -152,13 +157,14 @@ pub fn run_analytical(
     let (plan, predicates) = AnalyticalPlanner::new()
         .compile(query)
         .map_err(AnalyticsError::Arrow)?;
-    let dag = SelectivityOptimizer { selectivities }
+    let dag = SelectivityOptimizer { selectivities: selectivities.clone() }
         .optimize(plan)
         .map_err(AnalyticsError::Arrow)?;
     let batches = episodes_to_batches(events)?;
-    VecExecutor::new(batches, predicates)
-        .execute(dag)
-        .map_err(AnalyticsError::Arrow)
+    // As mesmas estimativas alimentam a decisão adaptativa de fusão do executor.
+    let mut exec = VecExecutor::new(batches, predicates);
+    exec.selectivities = selectivities;
+    exec.execute(dag).map_err(AnalyticsError::Arrow)
 }
 
 // ── tokenizer + cursor ──────────────────────────────────────────────────────

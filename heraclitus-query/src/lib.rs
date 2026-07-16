@@ -155,7 +155,7 @@ mod tests {
         // pruned, yet the result is exactly session "s-A".
         let dir = tempfile::tempdir().unwrap();
         let log = Arc::new(Log::open(dir.path(), 2048, FsyncPolicy::Always).unwrap());
-        let mut push = |session: &str, i: usize| {
+        let push = |session: &str, i: usize| {
             let mut e = Episode::new(
                 "agent",
                 EventKind::Observation,

@@ -13,10 +13,11 @@
 //! não a ligação TCP); o **servidor** aceita vários pedidos enquadrados por
 //! ligação. Um pool/keep-alive de ligações é uma otimização por fazer.
 //!
-//! Honestidade: é TCP puro, **não gRPC literal** — o valor do milestone é o
-//! consenso sobre a rede, não o wire-format. Um wrapper gRPC/tonic seria uma
-//! camada fina por cima destes mesmos tipos serde (é o passo cosmético que
-//! resta, se um protocolo específico for exigido).
+//! Honestidade: este módulo é TCP puro, **não gRPC literal** — o valor do
+//! milestone é o consenso sobre a rede, não o wire-format. O wrapper gRPC/tonic
+//! (camada fina por cima destes mesmos tipos serde) **existe** em
+//! [`crate::grpc`]; o servidor escolhe TCP ou gRPC via
+//! `ReplicationConfig.transport`.
 #![allow(clippy::result_large_err)]
 
 use crate::consensus::{

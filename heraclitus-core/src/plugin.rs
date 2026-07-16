@@ -9,6 +9,12 @@
 //! That is a heavy, feature-gated follow-up (and sits in tension with the
 //! "intelligence lives in the agent, not the DB" thesis); this module defines
 //! the in-process contract that a WASM host would later implement.
+//!
+//! Wiring status (P4, 2026-07-16): **reference contract, not wired**. The
+//! `PluginHost` only *catalogs* capability names — nothing in the query path
+//! invokes a registered operator, and the only implementor
+//! (`heraclitus-wasm`) is an orphan crate. See
+//! `docs/md/DECISAO-P4-plugins-wasm.md`.
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ExtensionCapabilities {

@@ -56,6 +56,9 @@ pub struct Engine {
     /// aqui (o líder do raft) em vez de irem direto ao log. Vazio = nó autónomo
     /// (o caminho normal). Preenchido uma vez por `set_replication`.
     replication: std::sync::OnceLock<Arc<dyn ReplRouter>>,
+    /// R16: serializa o par (ler head → append) das escritas H-VM, para que
+    /// dois upserts concorrentes nunca carimbem o mesmo lsn na VmInstruction.
+    hvm_lock: Mutex<()>,
 }
 
 /// Contrato de encaminhamento de escritas pelo consenso. Implementado pelo
@@ -309,6 +312,7 @@ impl Engine {
             log_only,
             audit_queries: config.audit_queries,
             replication: std::sync::OnceLock::new(),
+            hvm_lock: Mutex::new(()),
         })
     }
 
@@ -400,6 +404,9 @@ impl Engine {
 
     /// Append an H-VM upsert to the durable log.
     pub fn hvm_upsert(&self, key: Vec<u8>, val: Vec<u8>) -> Result<Lsn, HeraclitusError> {
+        // R16: head+append atómicos face a outras escritas H-VM — sem o lock,
+        // dois upserts concorrentes carimbavam o MESMO lsn na instrução.
+        let _g = self.hvm_lock.lock().unwrap();
         let lsn = self.log.head();
         let instr = VmInstruction::Upsert {
             key,
@@ -412,6 +419,7 @@ impl Engine {
 
     /// Append an H-VM delete to the durable log.
     pub fn hvm_delete(&self, key: Vec<u8>) -> Result<Lsn, HeraclitusError> {
+        let _g = self.hvm_lock.lock().unwrap();
         let lsn = self.log.head();
         let instr = VmInstruction::Delete {
             key,
@@ -435,6 +443,25 @@ impl Engine {
         // `path` (from_map opens+upsert+commit); o save separado ficou redundante.
         let _tree = vm_bridge::replay_vm_to_btree(&self.log, &vm, path)?;
         Ok(())
+    }
+
+    /// Checkpoint the H-VM ledger to the **server-owned** default path
+    /// (`<data_dir>/hvm.hbt`), returning the path written. The REST endpoint uses
+    /// this so a caller can never supply a filesystem path (no path traversal).
+    pub fn hvm_checkpoint_default(&self) -> Result<std::path::PathBuf, HeraclitusError> {
+        // `attr_dir` is `<data_dir>/views`; its parent is the data dir.
+        let base = self.attr_dir.parent().unwrap_or(self.attr_dir.as_path());
+        let path = base.join("hvm.hbt");
+        self.hvm_checkpoint(&path)?;
+        Ok(path)
+    }
+
+    /// True when the consensus replication router is installed (cluster mode).
+    /// H-VM writes bypass that router today (they append VM bytecode straight to
+    /// the local log), so the endpoint refuses them under replication rather than
+    /// letting a node's ledger silently diverge.
+    pub fn is_replicated(&self) -> bool {
+        self.replication.get().is_some()
     }
 
     /// Crypto-shred (§3.10): destroy an agent's encryption key so all of its
@@ -625,7 +652,13 @@ impl Engine {
 /// NEAREST, two-stage for RECALL, graph index for PROVENANCE.
 impl QueryBackend for Engine {
     fn scan(&self, as_of: Option<Lsn>) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
-        self.log.scan(0, as_of.unwrap_or(u64::MAX))
+        // R9: capado como o LogBackend de referência — um scan sem teto
+        // materializava o log inteiro num Vec (OOM em logs grandes).
+        self.log.scan_capped(
+            0,
+            as_of.unwrap_or(u64::MAX),
+            heraclitus_query::backend::QUERY_SCAN_CAP,
+        )
     }
 
     /// Snapshot do grafo temporal materializado (a view incremental, sem replay).
@@ -793,12 +826,36 @@ impl QueryBackend for Engine {
     }
 
     fn lsn_for_timestamp(&self, ts_ms: u64) -> Result<Lsn, HeraclitusError> {
-        for (lsn, e) in self.log.scan(0, u64::MAX)? {
-            if (e.ts_hlc >> 16) > ts_ms {
-                return Ok(lsn);
+        // R9: busca binária sobre o ts monotónico por LSN (o mesmo algoritmo do
+        // LogBackend de referência) — a versão anterior fazia scan(0, MAX) e
+        // materializava o log INTEIRO em RAM a cada AS OF TIMESTAMP.
+        let head = self.log.head();
+        let mut low = 0;
+        let mut high = head;
+        let mut ans = head;
+        while low <= high {
+            let mid = low + (high - low) / 2;
+            match self.log.read(mid)? {
+                Some((_, e)) => {
+                    if (e.ts_hlc >> 16) > ts_ms {
+                        ans = mid;
+                        if mid == 0 {
+                            break;
+                        }
+                        high = mid - 1;
+                    } else {
+                        low = mid + 1;
+                    }
+                }
+                None => {
+                    if mid == 0 {
+                        break;
+                    }
+                    high = mid - 1;
+                }
             }
         }
-        Ok(u64::MAX)
+        Ok(ans)
     }
 
     fn neighbors(
@@ -1028,6 +1085,21 @@ mod tests {
             Some(&b"bob".to_vec())
         );
         assert!(!state2.memory_layers.contains_key(b"user:1".as_slice()));
+    }
+
+    #[test]
+    fn hvm_checkpoint_default_writes_under_data_dir_and_is_not_replicated() {
+        // P5: o endpoint usa estes dois — o checkpoint vai para um caminho do
+        // servidor (nunca do cliente) e as escritas são recusadas sob replicação.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path());
+        assert!(!engine.is_replicated(), "nó autónomo por default");
+        engine.hvm_upsert(b"k".to_vec(), b"v".to_vec()).unwrap();
+        let path = engine.hvm_checkpoint_default().unwrap();
+        assert!(path.ends_with("hvm.hbt"));
+        assert!(path.starts_with(dir.path()), "checkpoint sob o data_dir: {path:?}");
+        let tree = heraclitus_btree::BEpsilonTree::load(&path).unwrap();
+        assert_eq!(tree.get(b"k"), Some(b"v".to_vec()));
     }
 
     #[test]

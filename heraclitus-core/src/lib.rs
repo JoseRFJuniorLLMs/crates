@@ -30,7 +30,7 @@ pub mod vm;
 
 pub use canonical::CanonicalKeyCodec;
 pub use capability::CapabilityCatalog;
-pub use config::{FsyncPolicy, HeraclitusConfig, ReplicationConfig};
+pub use config::{FsyncPolicy, HeraclitusConfig, RaftTransport, ReplicationConfig};
 pub use consistency::IsolationLevel;
 pub use runtime::{
     ArtifactType, DatabaseManifest, DerivedExecutionArtifact, ExecutionContext, QueryFingerprint,
