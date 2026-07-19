@@ -125,6 +125,13 @@ impl ViewRegistry {
 
     /// Apply one live tail event to every view.
     pub fn apply(&mut self, lsn: Lsn, event: &Episode) {
+        // Frames H-VM (`hvm_isa`) são bytecode do ledger soberano — vivem no
+        // replay determinístico do VM, NÃO nas views derivadas. Excluí-los aqui
+        // e nos replays de boot (`catch_up`/`rebuild`) mantém as views (e o
+        // `state_hash`) idênticas quer sejam construídas ao vivo quer por replay.
+        if heraclitus_log::vm_bridge::is_hvm(event) {
+            return;
+        }
         for v in self.views.iter_mut() {
             v.apply(lsn, event);
             self.watermarks.insert(v.name().to_string(), lsn);
@@ -181,6 +188,9 @@ impl ViewRegistry {
             }
             let last = batch.last().unwrap().0;
             for (lsn, ep) in &batch {
+                if heraclitus_log::vm_bridge::is_hvm(ep) {
+                    continue; // H-VM frame — não indexar nas views (ver `apply`).
+                }
                 for v in self.views.iter_mut() {
                     let wm = self.watermarks.get(v.name()).copied();
                     if wm.is_none() || *lsn > wm.unwrap() {
@@ -215,6 +225,9 @@ impl ViewRegistry {
                 break;
             };
             for (lsn, ep) in &batch {
+                if heraclitus_log::vm_bridge::is_hvm(ep) {
+                    continue; // H-VM frame — não indexar nas views (ver `apply`).
+                }
                 for v in self.views.iter_mut() {
                     if view_name.map(|n| n == v.name()).unwrap_or(true) {
                         v.apply(*lsn, ep);

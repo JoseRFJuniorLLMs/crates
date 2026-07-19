@@ -3,7 +3,9 @@
 
 use heraclitus_activation::ActivationStore;
 use heraclitus_core::vm::{ConsistencyVirtualMachine, VmInstruction, VmState, VmVersion};
-use heraclitus_core::{Episode, EventKind, HeraclitusConfig, HeraclitusError, Lsn, ProductPoint};
+use heraclitus_core::{
+    Episode, EventKind, HeraclitusConfig, HeraclitusError, Lsn, ProductPoint, SegmentId,
+};
 use heraclitus_crypto::KeyStore;
 use heraclitus_index_attr::AttrIndex;
 use heraclitus_index_graph::entity::EntityResolver;
@@ -41,6 +43,14 @@ pub struct Engine {
     /// para controlar o checkpoint/replay e o arranque rápido.
     attr: Arc<Mutex<AttrIndex>>,
     attr_dir: std::path::PathBuf,
+    /// Raiz do cold tier (object store local); `demote` materializa segmentos aqui.
+    #[cfg(feature = "tier")]
+    cold_tier_path: std::path::PathBuf,
+    /// §3.9 (distill) — cursor do último LSN já consolidado (+1). Persistido em
+    /// `<attr_dir>/distill.cursor`; garante que a task periódica não re-agrupa
+    /// (e re-emite Facts d)os episódios já processados.
+    #[cfg(feature = "distill")]
+    distill_cursor: std::sync::atomic::AtomicU64,
     metric: ProductMetric,
     /// Per-agent key store when encryption at rest is enabled (§3.10).
     keystore: Option<Arc<KeyStore>>,
@@ -273,6 +283,9 @@ impl Engine {
                         }
                         let last = batch.last().unwrap().0;
                         for (lsn, ep) in &batch {
+                            if vm_bridge::is_hvm(ep) {
+                                continue; // H-VM frame — fora do índice attr.
+                            }
                             idx.apply(*lsn, ep);
                         }
                         built = true;
@@ -295,6 +308,17 @@ impl Engine {
             attr
         };
 
+        // §3.9: recupera o cursor do distill persistido (0 se ausente/ilegível).
+        // Antes do struct literal porque `attr_dir` é movido para o campo.
+        #[cfg(feature = "distill")]
+        let distill_cursor = std::sync::atomic::AtomicU64::new(
+            std::fs::read(attr_dir.join("distill.cursor"))
+                .ok()
+                .filter(|b| b.len() == 8)
+                .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                .unwrap_or(0),
+        );
+
         Ok(Self {
             log,
             memtable: Arc::new(Memtable::new(config.memtable_cap)),
@@ -313,6 +337,10 @@ impl Engine {
             audit_queries: config.audit_queries,
             replication: std::sync::OnceLock::new(),
             hvm_lock: Mutex::new(()),
+            #[cfg(feature = "tier")]
+            cold_tier_path: config.cold_tier_path.clone(),
+            #[cfg(feature = "distill")]
+            distill_cursor,
         })
     }
 
@@ -327,6 +355,12 @@ impl Engine {
     /// replicar, cada nó indexa localmente o que aplica (read-your-writes).
     pub fn index_applied(&self, lsn: Lsn, episode: &Episode) {
         if self.log_only {
+            return;
+        }
+        // Frames H-VM (`hvm_isa`) não entram nas views/attr/memtable — vivem no
+        // replay do VM. Excluí-los aqui e nos replays de boot mantém os índices
+        // (e o `state_hash`) idênticos ao vivo vs. reconstruídos.
+        if vm_bridge::is_hvm(episode) {
             return;
         }
         self.memtable.apply(lsn, episode.clone());
@@ -414,7 +448,7 @@ impl Engine {
             lsn,
             ev_id: heraclitus_core::EventId::new(),
         };
-        vm_bridge::append_instruction(&self.log, VmVersion(1), &instr)
+        self.hvm_append(&instr)
     }
 
     /// Append an H-VM delete to the durable log.
@@ -426,7 +460,22 @@ impl Engine {
             lsn,
             ev_id: heraclitus_core::EventId::new(),
         };
-        vm_bridge::append_instruction(&self.log, VmVersion(1), &instr)
+        self.hvm_append(&instr)
+    }
+
+    /// Encode an H-VM instruction as an ISA-frame `Episode` (`Custom("hvm_isa")`)
+    /// and route it through [`Engine::append`] — assim as escritas H-VM passam
+    /// pelo **consenso** quando a replicação está ativa (líder aplica, quórum
+    /// acka, cada nó replica o frame e reconstrói o `VmState` por replay). O frame
+    /// é excluído dos índices derivados (`index_applied`/views saltam `is_hvm`),
+    /// por isso não polui o grafo nem diverge o `state_hash`.
+    fn hvm_append(&self, instr: &VmInstruction) -> Result<Lsn, HeraclitusError> {
+        let frame = heraclitus_core::vm::encode(VmVersion(1), instr);
+        self.append(Episode::new(
+            "hvm",
+            EventKind::Custom(vm_bridge::HVM_KIND.to_string()),
+            frame,
+        ))
     }
 
     /// Replay the H-VM ledger from the log into a deterministic [`VmState`].
@@ -457,11 +506,237 @@ impl Engine {
     }
 
     /// True when the consensus replication router is installed (cluster mode).
-    /// H-VM writes bypass that router today (they append VM bytecode straight to
-    /// the local log), so the endpoint refuses them under replication rather than
-    /// letting a node's ledger silently diverge.
+    /// Usado por endpoints cuja escrita ainda **não** passa pelo consenso (o
+    /// `tier` demote appenda o recibo direto ao log) para os recusar sob
+    /// replicação em vez de deixar um nó divergir. O H-VM já passa por
+    /// `Engine::append` (logo pelo consenso), por isso deixou de precisar disto.
     pub fn is_replicated(&self) -> bool {
         self.replication.get().is_some()
+    }
+
+    /// O `state_hash` do índice de grafo — usado em testes de equivalência de
+    /// consenso (deve ser idêntico entre nós que replicaram o mesmo log).
+    pub fn graph_state_hash(&self) -> [u8; 32] {
+        self.graph.lock().unwrap().state_hash()
+    }
+
+    /// Abre o backend do cold tier a partir de `cold_tier_path` — um URL de
+    /// nuvem (`gs://…`/`s3://…`, features `gcp`/`aws` do tier) ou um caminho
+    /// local (default). As credenciais de nuvem vêm do ambiente.
+    #[cfg(feature = "tier")]
+    fn open_cold_tier(&self) -> Result<heraclitus_tier::ColdTier, HeraclitusError> {
+        heraclitus_tier::ColdTier::open_location(&self.cold_tier_path.to_string_lossy())
+    }
+
+    /// Ids dos segmentos selados — candidatos a demote para o cold tier.
+    pub fn sealed_segment_ids(&self) -> Vec<SegmentId> {
+        self.log.sealed_segments().into_iter().map(|s| s.id).collect()
+    }
+
+    /// Demote um segmento selado para o cold tier (object store local em
+    /// `cold_tier_path`): upload do `.hrkl` + espelho Parquet + recibo Merkle
+    /// (`DemotionReceipt`) apenso ao log. Feature `tier`.
+    ///
+    /// §2.6 (caminho unificado de evento derivado): o upload é preparado pelo
+    /// crate tier SEM append; o recibo entra pelo `Engine::append` — logo é
+    /// indexado ao vivo (≡ boot-replay, sem divergência de state_hash) E passa
+    /// pelo consenso quando a replicação está ativa. NOTA: o OBJETO cold só
+    /// existe no store local DESTE nó — por isso o endpoint continua a recusar
+    /// demote sob replicação até o object store ser partilhado (nuvem).
+    #[cfg(feature = "tier")]
+    pub async fn demote_segment(
+        &self,
+        segment_id: SegmentId,
+    ) -> Result<heraclitus_tier::DemotionReceipt, HeraclitusError> {
+        let cold = self.open_cold_tier()?;
+        let receipt = cold.demote_prepared(&self.log, segment_id).await?;
+        self.append(heraclitus_tier::ColdTier::receipt_episode(&receipt)?)?;
+        Ok(receipt)
+    }
+
+    /// C2.6 — um tick de compaction do cold tier, disparado pela
+    /// [`heraclitus_tier::CompactionPolicy`]: para cada segmento demotado
+    /// (recibo mais recente da cadeia), conta os eventos LOGICAMENTE apagados
+    /// ainda presentes no objeto (tombstones semânticos `attrs.tombstone_of`
+    /// cujo alvo cai no range LSN do segmento, menos os já removidos pela
+    /// cadeia de compactions) e, se a política disparar, reescreve o objeto
+    /// sem eles e appenda o novo recibo pelo caminho unificado §2.6.
+    /// Devolve os recibos novos (vazio = nada a compactar).
+    #[cfg(feature = "tier")]
+    pub async fn tier_compaction_tick(
+        &self,
+        policy: &heraclitus_tier::CompactionPolicy,
+    ) -> Result<Vec<heraclitus_tier::DemotionReceipt>, HeraclitusError> {
+        use std::collections::{HashMap, HashSet};
+        // 1. Tombstones semânticos: alvo → LSN do alvo (via o índice de grafo).
+        //    Scan janelado do log à procura de `tombstone_of` (a mesma regra do
+        //    VectorIndex); o LSN do alvo resolve o segmento a que pertence.
+        let mut tombstoned: HashSet<heraclitus_core::EventId> = HashSet::new();
+        let head = self.log.head();
+        let mut cur = 0u64;
+        while cur < head {
+            let batch = self.log.scan_capped(cur, head, 100_000)?;
+            let Some(&(last, _)) = batch.last() else {
+                break;
+            };
+            for (_, ep) in &batch {
+                if let Some(t) = ep.attrs.get("tombstone_of") {
+                    if let Ok(id) = t.parse::<heraclitus_core::EventId>() {
+                        tombstoned.insert(id);
+                    }
+                }
+            }
+            cur = last + 1;
+        }
+        if tombstoned.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tomb_lsns: Vec<Lsn> = {
+            let g = self.graph.lock().unwrap();
+            tombstoned.iter().filter_map(|id| g.lsn_of(id)).collect()
+        };
+
+        // 2. Recibo MAIS RECENTE por segmento + total já removido pela cadeia.
+        let mut latest: HashMap<SegmentId, heraclitus_tier::DemotionReceipt> = HashMap::new();
+        let mut dropped_so_far: HashMap<SegmentId, u64> = HashMap::new();
+        for r in self.demotion_receipts()? {
+            *dropped_so_far.entry(r.segment_id).or_default() += r.dropped;
+            latest.insert(r.segment_id, r); // ordem do log ⇒ o último é o mais novo
+        }
+
+        // 3. Trigger + rewrite por segmento.
+        let cold = self.open_cold_tier()?;
+        let mut out = Vec::new();
+        for (seg, receipt) in latest {
+            let in_range = tomb_lsns
+                .iter()
+                .filter(|l| **l >= receipt.min_lsn && **l <= receipt.max_lsn)
+                .count() as u64;
+            let still_present =
+                in_range.saturating_sub(dropped_so_far.get(&seg).copied().unwrap_or(0));
+            if !policy.should_compact(still_present, receipt.record_count) {
+                continue;
+            }
+            let new_receipt = cold
+                .compact_cold_prepared(&receipt, |_lsn, ep| tombstoned.contains(&ep.id))
+                .await?;
+            // §2.6: o recibo novo entra pelo caminho unificado (indexa + consenso).
+            self.append(heraclitus_tier::ColdTier::receipt_episode(&new_receipt)?)?;
+            out.push(new_receipt);
+        }
+        Ok(out)
+    }
+
+    /// Verifica um recibo de demote: re-computa o Merkle do objeto cold e confere.
+    #[cfg(feature = "tier")]
+    pub async fn verify_demotion(
+        &self,
+        receipt: &heraclitus_tier::DemotionReceipt,
+    ) -> Result<bool, HeraclitusError> {
+        let cold = self.open_cold_tier()?;
+        cold.verify_receipt(receipt).await
+    }
+
+    /// Os recibos de demote no log (o que já foi materializado no cold tier).
+    /// Scan JANELADO do log (R20: o scan sem teto materializava o log inteiro
+    /// num Vec — a mesma classe do R9/R10; op de manutenção não é desculpa
+    /// para um alloc proporcional ao log).
+    #[cfg(feature = "tier")]
+    pub fn demotion_receipts(&self) -> Result<Vec<heraclitus_tier::DemotionReceipt>, HeraclitusError> {
+        let head = self.log.head();
+        let mut out = Vec::new();
+        let mut cur = 0u64;
+        while cur < head {
+            let batch = self.log.scan_capped(cur, head, 100_000)?;
+            let Some(&(last, _)) = batch.last() else {
+                break;
+            };
+            for (_lsn, ep) in &batch {
+                if ep.kind == EventKind::DemotionReceipt {
+                    if let Ok(r) =
+                        serde_json::from_slice::<heraclitus_tier::DemotionReceipt>(&ep.content)
+                    {
+                        out.push(r);
+                    }
+                }
+            }
+            cur = last + 1;
+        }
+        Ok(out)
+    }
+
+    /// Recall-on-demand: busca do cold tier os episódios de um segmento demotado
+    /// (o recibo mais recente para esse segmento). Feature `tier`. NÃO reinsere
+    /// nos índices quentes — devolve os episódios frios ao chamador.
+    #[cfg(feature = "tier")]
+    pub async fn fetch_cold_segment(
+        &self,
+        segment_id: SegmentId,
+    ) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
+        let receipt = self
+            .demotion_receipts()?
+            .into_iter()
+            .rev()
+            .find(|r| r.segment_id == segment_id)
+            .ok_or_else(|| {
+                HeraclitusError::Query(format!("sem recibo de demote para o segmento {segment_id}"))
+            })?;
+        let cold = self.open_cold_tier()?;
+        cold.fetch_cold(&receipt).await
+    }
+
+    /// §3.9 — um tick de consolidação (distill): agrupa os episódios de
+    /// Observação NOVOS (desde o cursor) na variedade e emite um `Fact`
+    /// (`FactDerived`) por cluster estável, via `Engine::append` (caminho
+    /// unificado §2.6 — indexado ao vivo ≡ boot-replay + consenso quando ativo).
+    /// Avança e persiste o cursor. Devolve os LSNs dos Facts appendados.
+    ///
+    /// v0 honesto: o clustering vê a janela `[cursor, head)` capada por
+    /// `QUERY_SCAN_CAP` de uma vez (agglomerativo precisa dos pontos juntos) —
+    /// clusters que atravessam a fronteira de um tick/cap ficam partidos, e um
+    /// erro de `append` a meio pode deixar Facts emitidos sem o cursor avançar
+    /// (re-emissão no próximo tick). Ambos aceitáveis para consolidação
+    /// aproximada; documentados. NÃO correr sob replicação (cursor local ao nó).
+    #[cfg(feature = "distill")]
+    pub fn distill_tick(
+        &self,
+        cfg: &heraclitus_distill::DistillConfig,
+    ) -> Result<Vec<Lsn>, HeraclitusError> {
+        use std::sync::atomic::Ordering;
+        let from = self.distill_cursor.load(Ordering::Acquire);
+        let head = self.log.head();
+        if from >= head {
+            return Ok(Vec::new());
+        }
+        let episodes = self.log.scan_capped(
+            from,
+            head,
+            heraclitus_query::backend::QUERY_SCAN_CAP,
+        )?;
+        // Fronteira coberta: o próximo tick continua daqui (não do head, para o
+        // caso de o cap ter truncado a janela).
+        let next_cursor = episodes
+            .last()
+            .map(|(l, _)| l + 1)
+            .unwrap_or(head);
+
+        let distiller =
+            heraclitus_distill::Distiller::new(self.metric.clone(), cfg.clone());
+        let facts = distiller.distill_episodes(&episodes, head)?;
+        let mut out = Vec::with_capacity(facts.len());
+        for ev in facts {
+            out.push(self.append(ev)?); // §2.6
+        }
+
+        self.distill_cursor.store(next_cursor, Ordering::Release);
+        // Persistência best-effort do cursor (tmp + rename atómico). Falhar aqui
+        // só arrisca re-agrupar uma janela num restart — nunca perde dados.
+        let path = self.attr_dir.join("distill.cursor");
+        let tmp = self.attr_dir.join("distill.cursor.tmp");
+        if std::fs::write(&tmp, next_cursor.to_le_bytes()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+        Ok(out)
     }
 
     /// Crypto-shred (§3.10): destroy an agent's encryption key so all of its
@@ -587,7 +862,18 @@ impl Engine {
 
     /// Two-stage recall (§3.8) over the real indexes + memtable merge.
     pub fn recall(&self, text: &str, k: usize) -> Result<serde_json::Value, HeraclitusError> {
-        let now = self.log.head(); // deterministic clock surrogate for scoring
+        // Recência ACT-R: `now` TEM de estar na mesma unidade que os tempos de
+        // acesso gravados pelo `ActivationStore` (`ts_hlc >> 16`, ms físicos) —
+        // NÃO o LSN, senão todas as idades colapsavam a 1 e o decay de recência
+        // morria (activation degenerava em frequência pura). Usa-se o ts do
+        // evento mais recente como relógio (mesma codificação, determinístico).
+        let now = self
+            .log
+            .read(self.log.head().saturating_sub(1))
+            .ok()
+            .flatten()
+            .map(|(_, e)| e.ts_hlc >> 16)
+            .unwrap_or(0);
         let txt_hits: Vec<_> = {
             let idx = self.text.lock().unwrap();
             idx.search(text, heraclitus_retrieval::RECALL_N)
@@ -1022,6 +1308,65 @@ mod tests {
         Engine::open(&cfg).unwrap()
     }
 
+    /// §3.9/§2.6 — a task de distill consolida clusters em Facts pelo caminho
+    /// unificado (Engine::append): os Facts ficam indexados AO VIVO (state_hash
+    /// do grafo idêntico vivo vs reopen), o cursor evita re-emissão, e episódios
+    /// novos num tick seguinte geram Facts novos.
+    #[cfg(feature = "distill")]
+    #[test]
+    fn distill_tick_consolidates_via_unified_append_with_cursor() {
+        use heraclitus_core::ProductPoint;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            ..Default::default()
+        };
+        let obs = |text: &str, x: f32| {
+            let mut e = Episode::new("agent", EventKind::Observation, text.as_bytes().to_vec());
+            e.embedding = Some(ProductPoint { hyp: vec![x, 0.0], sph: vec![], euc: vec![] });
+            e
+        };
+
+        let dcfg = heraclitus_distill::DistillConfig::default();
+        let live_hash = {
+            let engine = Engine::open(&cfg).unwrap();
+            // Cluster apertado de "gato" + um outlier longe.
+            for i in 0..4 {
+                engine.append(obs(&format!("gato {i}"), 0.60 + i as f32 * 0.01)).unwrap();
+            }
+            engine.append(obs("galaxia distante", -0.7)).unwrap();
+
+            let facts = engine.distill_tick(&dcfg).unwrap();
+            assert_eq!(facts.len(), 1, "exatamente um cluster estável vira Fact");
+            let (_, ev) = engine.log.read(facts[0]).unwrap().unwrap();
+            assert_eq!(ev.kind, EventKind::FactDerived);
+            assert_eq!(ev.parents.len(), 4, "proveniência = os 4 episódios do cluster");
+
+            // Cursor: sem episódios novos, o 2º tick não re-emite nada.
+            assert!(engine.distill_tick(&dcfg).unwrap().is_empty(), "cursor evita re-emissão");
+
+            // Episódios novos ⇒ o 3º tick consolida um Fact novo.
+            for i in 0..3 {
+                engine.append(obs(&format!("chuva {i}"), -0.2 + i as f32 * 0.01)).unwrap();
+            }
+            assert_eq!(engine.distill_tick(&dcfg).unwrap().len(), 1, "cluster novo vira Fact");
+
+            engine.graph_state_hash()
+        };
+
+        // §2.6: os Facts foram indexados AO VIVO — o boot-replay produz o MESMO
+        // state_hash do grafo (não divergem vivo vs reopen).
+        let engine2 = Engine::open(&cfg).unwrap();
+        assert_eq!(
+            live_hash,
+            engine2.graph_state_hash(),
+            "Facts do distill indexados ao vivo ≡ boot-replay"
+        );
+        // E o cursor persistiu: reabrir e um tick sem episódios novos é no-op.
+        assert!(engine2.distill_tick(&dcfg).unwrap().is_empty(), "cursor sobrevive ao restart");
+    }
+
     #[test]
     fn spec027_telemetry_lands_in_log_and_is_gql_queryable() {
         // SPEC-027 wired: emit_telemetry appends SystemMetric episodes to the
@@ -1100,6 +1445,42 @@ mod tests {
         assert!(path.starts_with(dir.path()), "checkpoint sob o data_dir: {path:?}");
         let tree = heraclitus_btree::BEpsilonTree::load(&path).unwrap();
         assert_eq!(tree.get(b"k"), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn hvm_frames_keep_graph_state_hash_consistent_live_vs_reopen() {
+        // Correção arquitetural: os frames H-VM (hvm_isa) NÃO entram no ÍNDICE de
+        // grafo — nem ao vivo (bypass do index_applied) nem no boot-replay. Antes,
+        // o replay de boot indexava-os (grafo passava de 3 para 5 nós) enquanto o
+        // caminho vivo os saltava ⇒ o `state_hash` do grafo DIVERGIA entre um nó
+        // recém-escrito e um nó reaberto — veneno para a equivalência do consenso.
+        // (`MATCH (n)` lê o LOG, por isso não reflete o índice; o state_hash sim.)
+        let dir = tempfile::tempdir().unwrap();
+        let live_hash = {
+            let engine = engine_in(dir.path());
+            for i in 0..3 {
+                engine
+                    .append(Episode::new(
+                        "alice",
+                        EventKind::Observation,
+                        format!("evento {i}").into_bytes(),
+                    ))
+                    .unwrap();
+            }
+            engine.hvm_upsert(b"k1".to_vec(), b"v1".to_vec()).unwrap();
+            engine.hvm_upsert(b"k2".to_vec(), b"v2".to_vec()).unwrap();
+            // `let` para o guard cair ANTES do `engine` no fim do bloco.
+            let h = engine.graph.lock().unwrap().state_hash();
+            h
+        };
+        // Reopen: o boot-replay tem de produzir o MESMO state_hash do grafo.
+        let engine2 = engine_in(dir.path());
+        let reopened_hash = engine2.graph.lock().unwrap().state_hash();
+        assert_eq!(
+            live_hash, reopened_hash,
+            "escritas H-VM não devem divergir o state_hash do grafo (vivo vs replay)"
+        );
+        assert_eq!(engine2.hvm_state().unwrap().memory_layers.len(), 2, "ledger intacto");
     }
 
     #[test]

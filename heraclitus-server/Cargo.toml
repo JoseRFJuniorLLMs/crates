@@ -34,6 +34,8 @@ heraclitus-query = { workspace = true }
 heraclitus-proto = { workspace = true }
 heraclitus-raft = { workspace = true, optional = true }
 heraclitus-analytics = { workspace = true, optional = true }
+heraclitus-tier = { workspace = true, optional = true }
+heraclitus-distill = { workspace = true, optional = true }
 arrow-flight = { version = "58", optional = true }
 tonic-flight = { package = "tonic", version = "0.14", optional = true }
 futures = { version = "0.3", optional = true }
@@ -55,6 +57,19 @@ gpu = ["heraclitus-index-vector/gpu"]
 # heavy dependency and the default server/service stays lean. Enables
 # `Embedded::analytics()` and the REST `POST /sql` route.
 analytics = ["dep:heraclitus-analytics", "dep:arrow-flight", "dep:futures", "dep:tonic-flight"]
+# Cold tier (§3.10): demote de segmentos selados para object store (Parquet +
+# recibo Merkle). Off por default — puxa parquet/arrow/object_store (pesado),
+# como o analytics. Liga a superficie REST `/tier/*`.
+tier = ["dep:heraclitus-tier"]
+# Cold tier na NUVEM: forwardam os backends GCS/S3 do tier. Ligam `tier`.
+# Credenciais vêm do ambiente (GOOGLE_APPLICATION_CREDENTIALS / AWS_*).
+tier-gcp = ["tier", "heraclitus-tier/gcp"]
+tier-aws = ["tier", "heraclitus-tier/aws"]
+# Consolidação §3.9 (distill): task periódica que agrupa embeddings episódicos
+# na variedade e emite Facts (FactDerived) com proveniência no log, via
+# Engine::append (indexados ao vivo + consenso). Off por default (opt-in por
+# distill_interval_secs). Puxa heraclitus-distill (manifold clustering).
+distill = ["dep:heraclitus-distill"]
 # SPEC-015/021 — replicação por consenso Raft (openraft). Off por default: o
 # servidor de nó único é o caminho normal; ligar forma um cluster e faz as
 # escritas passarem pelo líder. Puxa heraclitus-raft com a sua feature própria.

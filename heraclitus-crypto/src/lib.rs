@@ -73,11 +73,34 @@ pub struct KeyStore {
     cache: DashMap<String, [u8; 32]>,
 }
 
+/// Restringe o diretório de chaves a owner-only (0700) no Unix. No Windows os
+/// ficheiros herdam a ACL do perfil do utilizador e não há API std para endurecer
+/// mais sem uma dependência de ACLs — no-op documentado, best-effort no Unix.
+#[cfg(unix)]
+fn restrict_dir_perms(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+}
+#[cfg(not(unix))]
+fn restrict_dir_perms(_dir: &Path) {}
+
+/// Restringe um ficheiro de chave a owner-only (0600) no Unix. Aplica-se ao tmp
+/// ANTES do rename atómico, para o ficheiro final nunca existir com permissões
+/// largas (a chave em claro nunca fica world-readable, nem por um instante).
+#[cfg(unix)]
+fn restrict_file_perms(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+#[cfg(not(unix))]
+fn restrict_file_perms(_path: &Path) {}
+
 impl KeyStore {
     /// Open (or create) the key directory.
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Arc<Self>> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
+        restrict_dir_perms(&dir);
         Ok(Arc::new(Self {
             dir,
             cache: DashMap::new(),
@@ -113,6 +136,7 @@ impl KeyStore {
                 rand::thread_rng().fill_bytes(&mut k);
                 let tmp = path.with_extension("tmp");
                 std::fs::write(&tmp, k)?;
+                restrict_file_perms(&tmp); // 0600 antes do rename atómico
                 std::fs::rename(&tmp, &path)?;
                 k
             }
@@ -201,5 +225,20 @@ mod tests {
                                             // a fresh key for the same agent cannot decrypt the old blob
         let k2 = ks.get_or_create("eva").unwrap();
         assert!(open(&k2, &blob, b"eva").is_none());
+    }
+
+    // No Unix (VM/produção Linux), a chave em claro no disco fica owner-only.
+    // No Windows compila-se fora (ACLs herdam do perfil; sem API std).
+    #[test]
+    #[cfg(unix)]
+    fn key_file_and_dir_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ks = KeyStore::open(dir.path()).unwrap();
+        ks.get_or_create("eva").unwrap();
+        let kmode = std::fs::metadata(ks.key_path("eva")).unwrap().permissions().mode();
+        assert_eq!(kmode & 0o777, 0o600, "ficheiro .key deve ser 0600");
+        let dmode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+        assert_eq!(dmode & 0o777, 0o700, "dir de chaves deve ser 0700");
     }
 }

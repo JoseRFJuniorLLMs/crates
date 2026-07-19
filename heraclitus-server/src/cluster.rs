@@ -223,6 +223,97 @@ mod tests {
         panic!("nenhum líder aceitou a escrita");
     }
 
+    /// Escreve H-VM pelo cluster: tenta cada nó até o líder aceitar (num
+    /// não-líder, `hvm_upsert` → `Engine::append` → erro com hint do líder).
+    async fn hvm_write_via_cluster(engines: &[Arc<Engine>], key: Vec<u8>, val: Vec<u8>) {
+        for _ in 0..80 {
+            for e in engines {
+                let (e, k, v) = (e.clone(), key.clone(), val.clone());
+                if tokio::task::spawn_blocking(move || e.hvm_upsert(k, v)).await.unwrap().is_ok() {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("nenhum líder aceitou a escrita H-VM");
+    }
+
+    /// Follow-on do routing do H-VM pelo consenso: as escritas H-VM passam agora
+    /// pelo `Engine::append` do líder e **replicam** — o `hvm_state` fica idêntico
+    /// nos 3 nós (ledger soberano replicado). E os frames `hvm_isa`, excluídos dos
+    /// índices, NÃO divergem o `state_hash` do grafo (idêntico em todos os nós).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn three_server_cluster_replicates_hvm_writes() {
+        let addrs: Vec<String> = (0..3).map(|_| free_addr()).collect();
+        let peers: BTreeMap<u64, String> =
+            (0..3).map(|i| (i as u64, addrs[i].clone())).collect();
+
+        let mut engines: Vec<Arc<Engine>> = Vec::new();
+        let mut tasks: Vec<ClusterTasks> = Vec::new();
+        let mut dirs = Vec::new();
+        for id in 0..3u64 {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = HeraclitusConfig {
+                data_dir: dir.path().to_path_buf(),
+                fsync: FsyncPolicy::Always,
+                replication: Some(ReplicationConfig {
+                    node_id: id,
+                    raft_addr: addrs[id as usize].clone(),
+                    peers: peers.clone(),
+                    bootstrap: id == 0,
+                    raft_dir: dir.path().join("raft"),
+                    sm_dir: dir.path().join("raft-sm"),
+                    transport: RaftTransport::Tcp,
+                }),
+                ..Default::default()
+            };
+            let engine = Arc::new(Engine::open(&cfg).unwrap());
+            let (handle, t) = spawn(&engine, cfg.replication.as_ref().unwrap(), &cfg.data_dir)
+                .await
+                .unwrap();
+            engine.set_replication(handle);
+            engines.push(engine);
+            tasks.push(t);
+            dirs.push(dir);
+        }
+
+        // 1 escrita normal (vai para o grafo) + 5 upserts H-VM (ficam fora do grafo).
+        write_via_cluster(&engines, obs("alice", "facto")).await;
+        for i in 0..5 {
+            hvm_write_via_cluster(&engines, format!("k{i}").into_bytes(), format!("v{i}").into_bytes())
+                .await;
+        }
+
+        // Convergência: log head = 6 e ledger H-VM = 5 em TODOS os nós.
+        for _ in 0..60 {
+            if engines.iter().all(|e| {
+                e.log.head() == 6 && e.hvm_state().map(|s| s.memory_layers.len()).unwrap_or(0) == 5
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        for (i, e) in engines.iter().enumerate() {
+            let st = e.hvm_state().unwrap();
+            assert_eq!(st.memory_layers.len(), 5, "nó {i} replicou o ledger H-VM");
+            assert_eq!(
+                st.memory_layers.get(b"k4".as_slice()),
+                Some(&b"v4".to_vec()),
+                "nó {i} tem k4=v4"
+            );
+        }
+        // Consenso: o `state_hash` do grafo é IDÊNTICO nos 3 nós — os frames
+        // hvm_isa excluídos consistentemente ⇒ só o episódio normal conta.
+        let h0 = engines[0].graph_state_hash();
+        for (i, e) in engines.iter().enumerate() {
+            assert_eq!(e.graph_state_hash(), h0, "nó {i}: state_hash do grafo diverge");
+        }
+
+        for t in tasks {
+            t.abort();
+        }
+    }
+
     /// **O milestone**: 3 servidores in-process formam um cluster Raft real
     /// (transporte TCP), as escritas passam pelo `Engine::append` do líder, e os
     /// três nós **replicam o log E indexam** (uma query GQL devolve os dados em

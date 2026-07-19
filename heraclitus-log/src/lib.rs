@@ -6,12 +6,14 @@
 //! Durabilidade: crc32 por registro, raiz Merkle blake3 por segmento selado,
 //! recuperação de torn-writes ao abrir via engine de validação e reparo isolados.
 //!
-//! ESPECIFICAÇÃO DE PRODUÇÃO ULTRA-ESTÁVEL (10/10 PRODUCTION CORE):
-//! - Catálogo Isento de Churn O(1): Estruturação baseada em `Arc` compartilhado remove cópias globais de vetores em commits.
-//! - Alocação Zero no Hot-Path: Uso sistemático de buffers reutilizáveis e eliminação de alocações dinâmicas no laço de escrita.
-//! - Sincronização e Barreira de LSN: Incrementos lógicos ocorrem estritamente após a confirmação física do hardware.
-//! - Cursor de Varredura de Passada Única: Scanner sequencial reestruturado sob `BufReader` elimina o custo assintótico O(N²) de I/O de disco.
-//! - Padronização Concorrente Crossbeam: Eliminação de canais mistos mitigando riscos ocultos de starvation do Worker thread.
+//! Propriedades do núcleo (honestas — ver revisão 2026-07-16):
+//! - Catálogo com structural sharing (`Arc`): commits não copiam vetores globais.
+//! - Buffers de serialização/cifra reutilizados no laço de escrita. NOTA: o
+//!   hot-path NÃO é zero-alloc — cada append clona o episódio para o
+//!   `StoragePayload` e a cifra (`seal`) aloca o ciphertext; é o custo real.
+//! - Barreira de LSN: o `committed_lsn` só avança após o fsync confirmar.
+//! - Varredura de passada única sob `BufReader` (recovery O(N) em I/O).
+//! - Canais crossbeam uniformes no worker (sem mistura de runtimes).
 
 pub mod cpm;
 pub mod format;
@@ -1922,11 +1924,15 @@ fn scan_segment_file(path: &Path, _id: SegmentId) -> Result<SegmentScan, Heracli
                 sealed = true;
                 root = Some(f.blake3_root);
                 offset += format::FOOTER_LEN as u64;
-                if offset != file_len
-                    || hashes.len() as u64 != f.record_count
-                    || min_lsn != Some(f.min_lsn)
-                    || max_lsn != Some(f.max_lsn)
-                {
+                // Segmento selado VAZIO (roll disparado com o 1º registo maior
+                // que o segmento): o footer carrega min=max=base_lsn mas o scan
+                // não viu registo nenhum (min/max = None) — não é corrupção.
+                let bounds_ok = if f.record_count == 0 {
+                    min_lsn.is_none() && max_lsn.is_none()
+                } else {
+                    min_lsn == Some(f.min_lsn) && max_lsn == Some(f.max_lsn)
+                };
+                if offset != file_len || hashes.len() as u64 != f.record_count || !bounds_ok {
                     corruption = true;
                 }
                 break;
@@ -2059,6 +2065,14 @@ fn segment_id_from_path(path: &Path) -> Result<SegmentId, HeraclitusError> {
         })
 }
 
+/// Raiz Merkle (blake3) sobre os leaf hashes de um segmento.
+///
+/// NOTA (revisão 2026-07-16): níveis ímpares duplicam o último nó — o padrão
+/// com a ambiguidade clássica CVE-2012-2459 ([A,B] vs [A,B,B] partilham raiz).
+/// Aqui está MITIGADA porque o `record_count` viaja no footer e nas provas
+/// (`DemotionReceipt`), e a verificação compara contagem E raiz. Mudar a regra
+/// (p.ex. domain separation por nível) invalidaria todas as raízes já seladas
+/// — só com bump de FORMAT_VERSION; deliberadamente adiado.
 pub fn merkle_root(hashes: &[[u8; 32]]) -> [u8; 32] {
     if hashes.is_empty() {
         return [0u8; 32];

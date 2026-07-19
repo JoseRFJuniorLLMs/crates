@@ -417,7 +417,15 @@ impl VectorIndex {
         let bytes = bincode::serde::encode_to_vec(&snap, bincode::config::standard())
             .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
         let tmp = dir.join("vector.ckpt.tmp");
-        std::fs::write(&tmp, &bytes)?;
+        // fsync ANTES do rename (alinhado com views::ckpt::save): sem ele, um
+        // crash pós-rename podia deixar um ficheiro vazio/parcial — degradava
+        // com segurança para rebuild, mas custava o boot inteiro.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, dir.join(VECTOR_CKPT_FILE))?;
         Ok(())
     }

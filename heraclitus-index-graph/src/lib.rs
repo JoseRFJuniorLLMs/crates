@@ -48,13 +48,16 @@ impl GraphIndex {
 
     /// Walk provenance ancestors up to `depth` hops (PROVENANCE(fact), §3.12).
     pub fn ancestors(&self, id: &EventId, depth: usize) -> Vec<EventId> {
+        // Membership em HashSet (o Vec::contains antigo era O(n²) em DAGs
+        // profundos); o Vec preserva a ordem de descoberta para o chamador.
         let mut frontier = vec![*id];
-        let mut seen = vec![];
+        let mut seen: Vec<EventId> = Vec::new();
+        let mut member: std::collections::HashSet<EventId> = std::collections::HashSet::new();
         for _ in 0..depth {
             let mut next = Vec::new();
             for f in &frontier {
                 for p in self.parents(f) {
-                    if !seen.contains(&p) {
+                    if member.insert(p) {
                         seen.push(p);
                         next.push(p);
                     }

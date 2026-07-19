@@ -57,13 +57,13 @@ fn receipts_dir_for(dir: &std::path::Path, receipts: Option<PathBuf>) -> PathBuf
 
 fn main() {
     let cli = Cli::parse();
-    let out = match cli.cmd {
-        Cmd::LogInspect { dir } => {
-            heraclitus_cli::log_inspect(&dir).unwrap_or_else(|e| e.to_string())
-        }
-        Cmd::Verify { dir } => heraclitus_cli::verify(&dir).unwrap_or_else(|e| e.to_string()),
+    // Uma falha de integridade (verify/verify-receipts) ou qualquer erro TEM de
+    // devolver código de saída 1 — scripts forenses gateiam com `&&`/`||`.
+    let result: Result<String, String> = match cli.cmd {
+        Cmd::LogInspect { dir } => heraclitus_cli::log_inspect(&dir).map_err(|e| e.to_string()),
+        Cmd::Verify { dir } => heraclitus_cli::verify(&dir).map_err(|e| e.to_string()),
         Cmd::Bench { n, dim, queries } => {
-            heraclitus_cli::bench_recall(n, dim, queries).to_markdown()
+            Ok(heraclitus_cli::bench_recall(n, dim, queries).to_markdown())
         }
         Cmd::Anchor {
             dir,
@@ -72,12 +72,18 @@ fn main() {
             policy,
         } => {
             let rdir = receipts_dir_for(&dir, receipts);
-            heraclitus_cli::anchor(&dir, &rdir, tsa_url, policy).unwrap_or_else(|e| e)
+            heraclitus_cli::anchor(&dir, &rdir, tsa_url, policy)
         }
         Cmd::VerifyReceipts { dir, receipts } => {
             let rdir = receipts_dir_for(&dir, receipts);
-            heraclitus_cli::verify_receipts(&dir, &rdir).unwrap_or_else(|e| e)
+            heraclitus_cli::verify_receipts(&dir, &rdir)
         }
     };
-    println!("{out}");
+    match result {
+        Ok(out) => println!("{out}"),
+        Err(out) => {
+            eprintln!("{out}");
+            std::process::exit(1);
+        }
+    }
 }

@@ -75,6 +75,13 @@ pub fn router(engine: Arc<Engine>, basic_auth: Option<String>) -> Router {
     let routes = routes
         .route("/flight/events", get(flight_events))
         .route("/sql", axum::routing::post(sql));
+    // Cold tier (feature `tier`): lista de segmentos selados + demote.
+    #[cfg(feature = "tier")]
+    let routes = routes
+        .route("/tier/sealed", get(tier_sealed))
+        .route("/tier/demote", axum::routing::post(tier_demote))
+        .route("/tier/receipts", get(tier_receipts))
+        .route("/tier/fetch/:segment", get(tier_fetch));
     let routes = routes.with_state(engine);
 
     match basic_auth {
@@ -217,13 +224,10 @@ async fn hvm_state(State(engine): State<Arc<Engine>>) -> Response {
 }
 
 /// `POST /hvm/upsert` — corpo `{"key":"…","val":"…"}` (UTF-8) → `{"lsn":n}`.
-/// Escrita no ledger (append ao log). Recusada com 409 sob replicação: o H-VM
-/// ainda não passa pelo consenso e não pode divergir entre nós.
+/// Escrita no ledger via `Engine::append` — logo pelo **consenso** quando a
+/// replicação está ativa (num não-líder devolve erro com o hint do líder).
 async fn hvm_upsert(State(engine): State<Arc<Engine>>, Json(body): Json<serde_json::Value>) -> Response {
     use axum::response::IntoResponse;
-    if engine.is_replicated() {
-        return (StatusCode::CONFLICT, "escrita H-VM não passa pelo consenso (ver P5)").into_response();
-    }
     let (Some(key), Some(val)) = (
         body.get("key").and_then(|v| v.as_str()),
         body.get("val").and_then(|v| v.as_str()),
@@ -241,9 +245,6 @@ async fn hvm_upsert(State(engine): State<Arc<Engine>>, Json(body): Json<serde_js
 /// `POST /hvm/delete` — corpo `{"key":"…"}` → `{"lsn":n}`.
 async fn hvm_delete(State(engine): State<Arc<Engine>>, Json(body): Json<serde_json::Value>) -> Response {
     use axum::response::IntoResponse;
-    if engine.is_replicated() {
-        return (StatusCode::CONFLICT, "escrita H-VM não passa pelo consenso (ver P5)").into_response();
-    }
     let Some(key) = body.get("key").and_then(|v| v.as_str()) else {
         return (StatusCode::BAD_REQUEST, "corpo requer o campo string `key`").into_response();
     };
@@ -260,14 +261,124 @@ async fn hvm_delete(State(engine): State<Arc<Engine>>, Json(body): Json<serde_js
 /// `{"ok":true,"path":"…"}`. É o que traz o `heraclitus-btree` ao caminho vivo.
 async fn hvm_checkpoint(State(engine): State<Arc<Engine>>) -> Response {
     use axum::response::IntoResponse;
-    if engine.is_replicated() {
-        return (StatusCode::CONFLICT, "checkpoint H-VM indisponível sob replicação (ver P5)").into_response();
-    }
     match tokio::task::spawn_blocking(move || engine.hvm_checkpoint_default()).await {
         Ok(Ok(path)) => {
             Json(serde_json::json!({ "ok": true, "path": path.to_string_lossy() })).into_response()
         }
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("hvm: {e}")).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")).into_response(),
+    }
+}
+
+// ── Cold tier (feature `tier`) ───────────────────────────────────────────────
+
+/// `GET /tier/sealed` → ids dos segmentos selados (candidatos a demote).
+#[cfg(feature = "tier")]
+async fn tier_sealed(State(engine): State<Arc<Engine>>) -> Response {
+    use axum::response::IntoResponse;
+    Json(serde_json::json!({ "sealed": engine.sealed_segment_ids() })).into_response()
+}
+
+/// `POST /tier/demote` — corpo `{"segment": <id>}` → o `DemotionReceipt` (JSON).
+/// Materializa o segmento selado no cold tier (object store local): `.hrkl` +
+/// espelho Parquet + recibo Merkle apenso ao log. Recusado com 409 sob
+/// replicação (o recibo appenda fora do consenso). Op de manutenção: o replay/
+/// upload corre inline (aceitável para admin; não é hot-path).
+#[cfg(feature = "tier")]
+async fn tier_demote(
+    State(engine): State<Arc<Engine>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    use axum::response::IntoResponse;
+    // §2.6: o RECIBO já passa pelo consenso (Engine::append), mas o OBJETO cold
+    // só é materializado no object store LOCAL deste nó — num cluster, os
+    // seguidores teriam o recibo sem o objeto. O guard cai quando o store for
+    // partilhado (nuvem via config).
+    if engine.is_replicated() {
+        return (StatusCode::CONFLICT, "demote requer object store partilhado sob replicacao").into_response();
+    }
+    let Some(seg) = body.get("segment").and_then(|v| v.as_u64()) else {
+        return (StatusCode::BAD_REQUEST, "corpo requer o campo inteiro `segment`").into_response();
+    };
+    // demote faz fs::read + blake3 + encode Parquet + fsync — fora do reactor.
+    let res = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current().block_on(engine.demote_segment(seg))
+    })
+    .await;
+    match res {
+        Ok(Ok(r)) => Json(serde_json::json!({
+            "segment_id": r.segment_id,
+            "object_path": r.object_path,
+            "parquet_path": r.parquet_path,
+            "record_count": r.record_count,
+            "min_lsn": r.min_lsn,
+            "max_lsn": r.max_lsn,
+            "blake3_root": r.blake3_root,
+        }))
+        .into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("tier: {e}")).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")).into_response(),
+    }
+}
+
+/// `GET /tier/receipts` → recibos de demote no log (o que já foi para o cold tier).
+#[cfg(feature = "tier")]
+async fn tier_receipts(State(engine): State<Arc<Engine>>) -> Response {
+    use axum::response::IntoResponse;
+    // Scan do log em spawn_blocking (nunca no reactor).
+    match tokio::task::spawn_blocking(move || engine.demotion_receipts()).await {
+        Ok(Ok(rs)) => {
+            let arr: Vec<_> = rs
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "segment_id": r.segment_id,
+                        "object_path": r.object_path,
+                        "parquet_path": r.parquet_path,
+                        "record_count": r.record_count,
+                        "min_lsn": r.min_lsn,
+                        "max_lsn": r.max_lsn,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({ "receipts": arr })).into_response()
+        }
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("tier: {e}")).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")).into_response(),
+    }
+}
+
+/// `GET /tier/fetch/:segment` — recall: busca o segmento demotado do cold tier e
+/// devolve os episódios (lsn/agent/kind/content). NÃO reinsere nos índices
+/// quentes (recall-on-demand puro; a re-hidratação é follow-up).
+#[cfg(feature = "tier")]
+async fn tier_fetch(
+    State(engine): State<Arc<Engine>>,
+    Path(segment): Path<u64>,
+) -> Response {
+    use axum::response::IntoResponse;
+    // fetch_cold_segment faz scan do log + decode do objeto — fora do reactor.
+    let res = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current().block_on(engine.fetch_cold_segment(segment))
+    })
+    .await;
+    match res {
+        Ok(Ok(eps)) => {
+            let arr: Vec<_> = eps
+                .iter()
+                .map(|(lsn, e)| {
+                    serde_json::json!({
+                        "lsn": lsn,
+                        "agent_id": e.agent_id,
+                        "kind": format!("{:?}", e.kind),
+                        "content": String::from_utf8_lossy(&e.content),
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({ "segment": segment, "count": arr.len(), "episodes": arr }))
+                .into_response()
+        }
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("tier: {e}")).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")).into_response(),
     }
 }
@@ -285,25 +396,28 @@ async fn state(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
     Json(engine.state())
 }
 
-/// Verificação Merkle do log inteiro.
+/// Verificação Merkle do log inteiro. `Log::verify` re-lê+re-hasha todos os
+/// segmentos → `spawn_blocking` (nunca bloquear o reactor / os probes de saúde).
 async fn verify(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
-    Json(
-        engine
-            .verify()
-            .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() })),
-    )
+    let out = match tokio::task::spawn_blocking(move || engine.verify()).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => serde_json::json!({ "error": e.to_string() }),
+        Err(e) => serde_json::json!({ "error": format!("join: {e}") }),
+    };
+    Json(out)
 }
 
-/// Verificação Merkle pontual de um segmento.
+/// Verificação Merkle pontual de um segmento (idem: em `spawn_blocking`).
 async fn verify_segment(
     State(engine): State<Arc<Engine>>,
     Path(segment): Path<u64>,
 ) -> Json<serde_json::Value> {
-    Json(
-        engine
-            .verify_segment(segment)
-            .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() })),
-    )
+    let out = match tokio::task::spawn_blocking(move || engine.verify_segment(segment)).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => serde_json::json!({ "error": e.to_string() }),
+        Err(e) => serde_json::json!({ "error": format!("join: {e}") }),
+    };
+    Json(out)
 }
 
 #[cfg(all(test, feature = "analytics"))]
@@ -394,5 +508,129 @@ mod hvm_tests {
         assert!(v["entries"].get("user:1").is_none(), "chave apagada não aparece");
         // 3 instruções escritas (upsert/upsert/delete), LSNs 0-indexados ⇒ 2.
         assert!(v["max_lsn_applied"].as_u64().unwrap() >= 2);
+    }
+}
+
+#[cfg(all(test, feature = "tier"))]
+mod tier_tests {
+    use super::*;
+    use heraclitus_core::{Episode, EventKind, FsyncPolicy, HeraclitusConfig};
+
+    /// Demote de um segmento selado produz um recibo verificável e materializa
+    /// o objeto cold (.hrkl + Parquet) — prova o wiring do `tier` ponta-a-ponta.
+    #[tokio::test]
+    async fn demote_sealed_segment_produces_verifiable_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            segment_max_bytes: 8192, // força sealing rápido
+            cold_tier_path: dir.path().join("cold"),
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+        for i in 0..500 {
+            engine
+                .append(Episode::new(
+                    "a",
+                    EventKind::Observation,
+                    format!("evento de enchimento numero {i} para selar o segmento").into_bytes(),
+                ))
+                .unwrap();
+        }
+        let sealed = engine.sealed_segment_ids();
+        assert!(!sealed.is_empty(), "deve haver >=1 segmento selado");
+        let seg = sealed[0];
+
+        let receipt = engine.demote_segment(seg).await.unwrap();
+        assert_eq!(receipt.segment_id, seg);
+        assert!(receipt.record_count > 0, "recibo conta registos");
+        assert!(receipt.parquet_path.is_some(), "espelho Parquet criado");
+
+        // O recibo verifica: re-computa o Merkle do objeto cold e confere.
+        assert!(engine.verify_demotion(&receipt).await.unwrap(), "recibo verifica");
+
+        // Recall round-trip: o recibo está listado e o segmento busca-se de volta
+        // do cold tier (object store) com todos os episódios.
+        let receipts = engine.demotion_receipts().unwrap();
+        assert!(receipts.iter().any(|r| r.segment_id == seg), "recibo listado");
+        let back = engine.fetch_cold_segment(seg).await.unwrap();
+        assert_eq!(back.len() as u64, receipt.record_count, "recall devolve todos os episódios");
+
+        // GUARDA R21 (padrão §2.6, o mesmo do H-VM): o episódio DemotionReceipt
+        // — agora appendado pelo Engine::append (caminho unificado) — tem de
+        // ficar indexado AO VIVO igual ao que o boot-replay produz, senão o
+        // state_hash do grafo diverge entre um nó recém-escrito e um reaberto.
+        let live_hash = engine.graph_state_hash();
+        drop(engine);
+        let engine2 = Engine::open(&cfg).unwrap();
+        assert_eq!(
+            live_hash,
+            engine2.graph_state_hash(),
+            "recibo de demote indexado ao vivo ≡ boot-replay (state_hash idêntico)"
+        );
+    }
+
+    /// C2.6 — o tick de compaction reescreve um segmento cold quando a fração
+    /// de tombstones semânticos cruza a política, appenda o recibo novo pelo
+    /// caminho unificado (§2.6) e é idempotente (2º tick não re-compacta).
+    #[tokio::test]
+    async fn tier_compaction_tick_rewrites_when_policy_fires() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            segment_max_bytes: 8192,
+            cold_tier_path: dir.path().join("cold"),
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+        for i in 0..500 {
+            engine
+                .append(Episode::new(
+                    "a",
+                    EventKind::Observation,
+                    format!("evento de enchimento numero {i} para selar o segmento").into_bytes(),
+                ))
+                .unwrap();
+        }
+        let seg = engine.sealed_segment_ids()[0];
+        let receipt = engine.demote_segment(seg).await.unwrap();
+
+        // Tombstona ~metade dos eventos do segmento demotado.
+        let cold_events = engine.fetch_cold_segment(seg).await.unwrap();
+        let mut tombstoned = 0u64;
+        for (i, (_lsn, ep)) in cold_events.iter().enumerate() {
+            if i % 2 == 0 {
+                let mut t = Episode::new("gc", EventKind::Observation, vec![]);
+                t.attrs.insert("tombstone_of".into(), ep.id.to_string());
+                engine.append(t).unwrap();
+                tombstoned += 1;
+            }
+        }
+        assert!(tombstoned > 0);
+
+        // Política de teste (min_records=1) — a default exige 1024 registos.
+        let policy = heraclitus_tier::CompactionPolicy {
+            delta_ratio_threshold: 0.3,
+            min_records: 1,
+        };
+        let new = engine.tier_compaction_tick(&policy).await.unwrap();
+        assert_eq!(new.len(), 1, "um segmento compactado");
+        assert_eq!(new[0].dropped, tombstoned, "removeu exatamente os tombstonados");
+        assert_eq!(
+            new[0].record_count + new[0].dropped,
+            receipt.record_count,
+            "kept + dropped == original"
+        );
+        assert!(engine.verify_demotion(&new[0]).await.unwrap(), "recibo novo verifica");
+
+        // O recall do segmento passa a devolver só os sobreviventes.
+        let survivors = engine.fetch_cold_segment(seg).await.unwrap();
+        assert_eq!(survivors.len() as u64, new[0].record_count);
+
+        // Idempotência: os tombstonados já foram removidos ⇒ 2º tick é no-op.
+        let again = engine.tier_compaction_tick(&policy).await.unwrap();
+        assert!(again.is_empty(), "sem lixo novo, nada a compactar: {again:?}");
     }
 }

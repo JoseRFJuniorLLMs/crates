@@ -85,17 +85,24 @@ impl Distiller {
         clusters
     }
 
-    /// One compaction run over `[from, to)`: emit facts back into the log.
-    /// Returns the LSNs of the FactDerived events appended.
-    pub fn run(&self, log: &Log, from: Lsn, to: Lsn) -> Result<Vec<Lsn>, HeraclitusError> {
-        let episodes: Vec<(Lsn, Episode)> = log
-            .scan(from, to)?
-            .into_iter()
+    /// Computa os episódios `FactDerived` de um conjunto de episódios já lido —
+    /// SEM appendar (caminho unificado §2.6: quem appenda é o HOST, via
+    /// `Engine::append`, para os Facts serem indexados ao vivo ≡ boot-replay e
+    /// passarem pelo consenso). Só considera Observações com embedding.
+    /// `derived_at_head` é o head do log no momento (carimbo aproximado).
+    pub fn distill_episodes(
+        &self,
+        episodes: &[(Lsn, Episode)],
+        derived_at_head: Lsn,
+    ) -> Result<Vec<Episode>, HeraclitusError> {
+        let obs: Vec<(Lsn, Episode)> = episodes
+            .iter()
             .filter(|(_, e)| e.kind == EventKind::Observation && e.embedding.is_some())
+            .cloned()
             .collect();
 
         let mut out = Vec::new();
-        for cluster in self.cluster(&episodes) {
+        for cluster in self.cluster(&obs) {
             if cluster.members.len() < self.config.min_cluster {
                 continue;
             }
@@ -127,13 +134,30 @@ impl Distiller {
                 embedding: Some(embedding.clone()),
                 confidence: cluster.members.len() as f32 / (cluster.members.len() as f32 + 2.0),
                 provenance: provenance.clone(),
-                derived_at_lsn: log.head(),
+                derived_at_lsn: derived_at_head,
             };
             let payload = serde_json::to_vec(&fact)
                 .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
             let mut ev = Episode::new("distill", EventKind::FactDerived, payload);
             ev.embedding = Some(embedding);
             ev.parents = provenance; // provenance pointers double as graph edges
+            out.push(ev);
+        }
+        Ok(out)
+    }
+
+    /// One compaction run over `[from, to)`: emit facts back into the log.
+    /// Returns the LSNs of the FactDerived events appended.
+    ///
+    /// Conveniência standalone (appenda direto ao log). Um host com `Engine`
+    /// deve usar [`Self::distill_episodes`] + `Engine::append` (§2.6) e um
+    /// scan JANELADO — este método faz `log.scan(from,to)` sem teto, o que
+    /// materializa a janela inteira em RAM.
+    pub fn run(&self, log: &Log, from: Lsn, to: Lsn) -> Result<Vec<Lsn>, HeraclitusError> {
+        let episodes = log.scan(from, to)?;
+        let facts = self.distill_episodes(&episodes, log.head())?;
+        let mut out = Vec::with_capacity(facts.len());
+        for ev in facts {
             out.push(log.append(ev)?);
         }
         Ok(out)

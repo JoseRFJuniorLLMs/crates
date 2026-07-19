@@ -78,15 +78,59 @@ pub(crate) fn fsync_dir(dir: &Path) {
 }
 
 impl Inner {
-    fn append_record(&mut self, rec: &LogRecord) -> Result<(), StorageError<NodeId>> {
+    /// Serializa um registo no formato do WAL (`u32` LE de comprimento + bincode).
+    fn encode_record(rec: &LogRecord) -> Result<Vec<u8>, StorageError<NodeId>> {
         let bytes = bincode::serde::encode_to_vec(rec, BINCODE_CFG)
             .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
-        let len = (bytes.len() as u32).to_le_bytes();
+        let mut out = Vec::with_capacity(4 + bytes.len());
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&bytes);
+        Ok(out)
+    }
+
+    fn append_record(&mut self, rec: &LogRecord) -> Result<(), StorageError<NodeId>> {
+        let framed = Self::encode_record(rec)?;
         self.wal
-            .write_all(&len)
-            .and_then(|_| self.wal.write_all(&bytes))
+            .write_all(&framed)
             .and_then(|_| self.wal.sync_all()) // fsync ANTES do ack — durabilidade real
             .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
+        Ok(())
+    }
+
+    /// R23: reescreve o WAL COMPACTADO (um `Purge(last_purged)` + os Inserts
+    /// vivos), atomicamente (tmp + fsync + rename + fsync do diretório). Sem
+    /// isto o `entries.wal` crescia PARA SEMPRE — Insert/Truncate/Purge são
+    /// todos appends e nada nunca removia os bytes mortos (fuga de disco sem
+    /// bound num cluster de vida longa). Chamado no `purge` (pós-snapshot, os
+    /// vivos são poucos) e no `open` quando o replay consumiu compactações.
+    fn rewrite_wal(&mut self) -> Result<(), StorageError<NodeId>> {
+        let wal_path = self.dir.join("entries.wal");
+        let tmp = self.dir.join("entries.wal.tmp");
+        {
+            let mut f = File::create(&tmp)
+                .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
+            if let Some(p) = self.last_purged {
+                f.write_all(&Self::encode_record(&LogRecord::Purge(p))?)
+                    .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
+            }
+            for e in self.entries.values() {
+                f.write_all(&Self::encode_record(&LogRecord::Insert(e.clone()))?)
+                    .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
+            }
+            f.sync_all()
+                .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
+        }
+        std::fs::rename(&tmp, &wal_path)
+            .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
+        fsync_dir(&self.dir);
+        let mut wal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&wal_path)
+            .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
+        wal.seek(SeekFrom::End(0))
+            .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
+        self.wal = wal;
         Ok(())
     }
 
@@ -135,7 +179,7 @@ impl FileRaftLog {
             .map_err(|e| StorageError::from(StorageIOError::read_logs(io_err(e))))?;
 
         let wal_path = dir.join("entries.wal");
-        let (entries, last_purged, valid_len) = Self::replay(&wal_path)?;
+        let (entries, last_purged, valid_len, saw_compaction) = Self::replay(&wal_path)?;
 
         // Trunca a cauda meia-escrita (o último registo incompleto após crash).
         let wal = OpenOptions::new()
@@ -155,31 +199,41 @@ impl FileRaftLog {
 
         let meta = Self::load_meta(&dir.join("meta.bin"))?;
 
+        let mut inner = Inner {
+            dir,
+            wal,
+            entries,
+            last_purged,
+            meta,
+        };
+        // R23: se o replay consumiu Truncate/Purge, o ficheiro tem lixo morto —
+        // compacta já, para que reaberturas sucessivas não acumulem para sempre.
+        if saw_compaction {
+            inner.rewrite_wal()?;
+        }
         Ok(Self {
-            inner: Arc::new(Mutex::new(Inner {
-                dir,
-                wal,
-                entries,
-                last_purged,
-                meta,
-            })),
+            inner: Arc::new(Mutex::new(inner)),
         })
     }
 
     /// Replaya o WAL registo a registo. Devolve (entradas, last_purged, offset
-    /// do último registo COMPLETO) — o offset serve para truncar a cauda torn.
+    /// do último registo COMPLETO, viu-compactações) — o offset serve para
+    /// truncar a cauda torn; a flag dispara o rewrite compactado (R23).
     #[allow(clippy::type_complexity)]
     fn replay(
         wal_path: &Path,
-    ) -> Result<(BTreeMap<u64, Entry<TypeConfig>>, Option<LogId<NodeId>>, u64), StorageError<NodeId>>
-    {
+    ) -> Result<
+        (BTreeMap<u64, Entry<TypeConfig>>, Option<LogId<NodeId>>, u64, bool),
+        StorageError<NodeId>,
+    > {
         let mut entries: BTreeMap<u64, Entry<TypeConfig>> = BTreeMap::new();
         let mut last_purged: Option<LogId<NodeId>> = None;
         let mut valid_len: u64 = 0;
+        let mut saw_compaction = false;
 
         let file = match File::open(wal_path) {
             Ok(f) => f,
-            Err(_) => return Ok((entries, last_purged, 0)), // WAL ainda não existe
+            Err(_) => return Ok((entries, last_purged, 0, false)), // WAL ainda não existe
         };
         let mut reader = BufReader::new(file);
         loop {
@@ -199,19 +253,33 @@ impl FileRaftLog {
             };
             match rec {
                 LogRecord::Insert(e) => {
-                    entries.insert(e.log_id.index, e);
+                    // Um Insert que SUBSTITUI um índice existente também é lixo
+                    // morto no ficheiro (entrada antiga sobrescrita).
+                    if entries.insert(e.log_id.index, e).is_some() {
+                        saw_compaction = true;
+                    }
                 }
                 LogRecord::Truncate(idx) => {
+                    let before = entries.len();
                     entries.split_off(&idx);
+                    // Só conta como lixo se descartou algo — um WAL já compactado
+                    // (que abre com um marcador Purge) não dispara rewrite eterno.
+                    if entries.len() != before {
+                        saw_compaction = true;
+                    }
                 }
                 LogRecord::Purge(log_id) => {
+                    let before = entries.len();
                     entries = entries.split_off(&(log_id.index + 1));
+                    if entries.len() != before {
+                        saw_compaction = true;
+                    }
                     last_purged = Some(log_id);
                 }
             }
             valid_len += 4 + len as u64;
         }
-        Ok((entries, last_purged, valid_len))
+        Ok((entries, last_purged, valid_len, saw_compaction))
     }
 
     /// Escreve entradas de forma durável (WAL + fsync) e atualiza o espelho em
@@ -326,6 +394,9 @@ impl RaftLogStorage<TypeConfig> for FileRaftLog {
         inner.append_record(&LogRecord::Purge(log_id))?;
         inner.entries = inner.entries.split_off(&(log_id.index + 1));
         inner.last_purged = Some(log_id);
+        // R23: o purge (pós-snapshot) deixa poucas entradas vivas — o momento
+        // certo para compactar o ficheiro em vez de o deixar crescer para sempre.
+        inner.rewrite_wal()?;
         Ok(())
     }
 }

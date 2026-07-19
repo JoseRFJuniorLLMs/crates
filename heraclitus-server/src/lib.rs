@@ -122,6 +122,15 @@ pub async fn serve_with(
     let svc = HeraclitusServer::with_interceptor(grpc::Service::new(engine.clone()), auth);
     if config.rest_basic_auth.is_some() {
         boot.warn_line("Auth REST", "HTTP Basic EXIGIDO em cada chamada");
+    } else if !rest_addr.ip().is_loopback() {
+        // A superfície REST inclui ESCRITAS duráveis (/hvm/*, /tier/demote, /sql).
+        // Recusar expô-las sem autenticação num endereço não-loopback.
+        return Err(HeraclitusError::Config(format!(
+            "rest_addr {rest_addr} não é loopback mas rest_basic_auth não está definido — \
+             as rotas de escrita ficariam abertas. Defina rest_basic_auth ou use 127.0.0.1."
+        )));
+    } else {
+        boot.warn_line("Auth REST", "sem auth (loopback) — escritas locais /hvm//tier/sql abertas");
     }
     let rest = rest::router(engine.clone(), config.rest_basic_auth.clone());
 
@@ -177,6 +186,89 @@ pub async fn serve_with(
                     if let Err(err) = e.emit_telemetry() {
                         tracing::warn!(error = %err, "telemetria endógena falhou neste tick");
                     }
+                })
+                .await;
+            }
+        }))
+    } else {
+        None
+    };
+
+    // C2.6 — task de compaction do cold tier (feature `tier`, opt-in via
+    // tier_compaction_interval_secs > 0). A cada tick, segmentos demotados com
+    // fração de tombstones acima da CompactionPolicy são reescritos sem eles.
+    // Nunca sob replicação (o object store é local ao nó) e nunca no caminho
+    // de escrita do cliente.
+    #[cfg(feature = "tier")]
+    let tier_compaction_task = if config.tier_compaction_interval_secs > 0 {
+        let engine_tc = engine.clone();
+        let every = std::time::Duration::from_secs(config.tier_compaction_interval_secs);
+        boot.warn_line(
+            "Compaction do cold tier",
+            &format!("tick a cada {}s", config.tier_compaction_interval_secs),
+        );
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // primeiro tick dispara já; salta-o
+            let policy = heraclitus_tier::CompactionPolicy::default();
+            loop {
+                tick.tick().await;
+                if engine_tc.is_replicated() {
+                    continue; // objetos cold são locais ao nó — não compactar em cluster
+                }
+                match engine_tc.tier_compaction_tick(&policy).await {
+                    Ok(rs) if !rs.is_empty() => {
+                        for r in rs {
+                            tracing::info!(
+                                segment = r.segment_id,
+                                dropped = r.dropped,
+                                kept = r.record_count,
+                                "tier: segmento cold compactado (novo recibo Merkle)"
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "tier: tick de compaction falhou")
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    // §3.9 — task de consolidação (distill, feature `distill`, opt-in via
+    // distill_interval_secs > 0). A cada tick agrupa os episódios novos e
+    // emite Facts no log via Engine::append. Nunca sob replicação (cursor
+    // local ao nó, v0) e nunca no caminho de escrita do cliente.
+    #[cfg(feature = "distill")]
+    let distill_task = if config.distill_interval_secs > 0 {
+        let engine_ds = engine.clone();
+        let every = std::time::Duration::from_secs(config.distill_interval_secs);
+        boot.warn_line(
+            "Consolidação (distill)",
+            &format!("tick a cada {}s", config.distill_interval_secs),
+        );
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // primeiro tick dispara já; salta-o
+            let cfg = heraclitus_distill::DistillConfig::default();
+            loop {
+                tick.tick().await;
+                if engine_ds.is_replicated() {
+                    continue; // v0: cursor local ao nó — não consolidar em cluster
+                }
+                let e = engine_ds.clone();
+                let cfg = cfg.clone();
+                let _ = tokio::task::spawn_blocking(move || match e.distill_tick(&cfg) {
+                    Ok(lsns) if !lsns.is_empty() => {
+                        tracing::info!(facts = lsns.len(), "distill: novos Facts consolidados")
+                    }
+                    Ok(_) => {}
+                    Err(err) => tracing::warn!(error = %err, "distill: tick falhou"),
                 })
                 .await;
             }
@@ -259,6 +351,14 @@ pub async fn serve_with(
     }
     #[cfg(feature = "analytics")]
     if let Some(t) = flight_task {
+        t.abort();
+    }
+    #[cfg(feature = "tier")]
+    if let Some(t) = tier_compaction_task {
+        t.abort();
+    }
+    #[cfg(feature = "distill")]
+    if let Some(t) = distill_task {
         t.abort();
     }
     #[cfg(feature = "replication")]

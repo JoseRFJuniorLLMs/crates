@@ -44,13 +44,20 @@ pub mod net;
 #[cfg(feature = "replication")]
 pub mod grpc;
 
-/// Transport boundary: how a follower fetches batches from a leader.
-/// Implementations: in-process (tests), TCP (sim/turmoil), gRPC Subscribe.
+// ─────────────────────────────────────────────────────────────────────────
+// LEGADO v0 (§2.3, marcado 2026-07-16): tudo abaixo desta linha é a camada de
+// log-shipping RFC-003 SUBSTITUÍDA pelo consenso openraft (feature
+// `replication`). Fica como referência/testes de convergência pull-based —
+// NENHUM caminho vivo a usa. Não estender; promover exige reabrir a decisão.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// LEGADO v0 — transport boundary: how a follower fetches batches from a
+/// leader. Implementations: in-process (tests), TCP (sim/turmoil).
 pub trait LogTransport {
     fn fetch(&mut self, from: Lsn, max: usize) -> Result<Vec<(Lsn, Episode)>, HeraclitusError>;
 }
 
-/// In-process transport over a shared leader log (reference + tests).
+/// LEGADO v0 — in-process transport over a shared leader log (reference + tests).
 pub struct LocalTransport {
     pub leader: Arc<Log>,
 }
@@ -63,8 +70,8 @@ impl LogTransport for LocalTransport {
     }
 }
 
-/// A pull-based follower. `sync_once` is idempotent and safe to call in a
-/// loop; contiguity is enforced by `append_replicated`.
+/// LEGADO v0 — a pull-based follower. `sync_once` is idempotent and safe to
+/// call in a loop; contiguity is enforced by `append_replicated`.
 pub struct Follower {
     pub log: Arc<Log>,
     pub batch: usize,

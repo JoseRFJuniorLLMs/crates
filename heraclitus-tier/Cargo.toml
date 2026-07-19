@@ -19,5 +19,12 @@ parquet = "59.0.0"
 arrow-array = "59.0.0"
 arrow-schema = "59.0.0"
 
+[features]
+# Cold tier na NUVEM (opt-in): ligam os backends GCS/S3 do object_store.
+# Sem elas, o tier só faz object store local (o default). As credenciais
+# vêm do ambiente (GOOGLE_APPLICATION_CREDENTIALS / AWS_*), nunca do TOML.
+gcp = ["object_store/gcp"]
+aws = ["object_store/aws"]
+
 [dev-dependencies]
 tempfile = { workspace = true }

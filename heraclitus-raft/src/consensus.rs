@@ -251,7 +251,21 @@ impl EpisodeStateMachine {
         let meta = Self::load_sm_meta(&sm_dir)?;
         // Os episódios já em disco além do que o meta registou = aplicados num
         // crash sem meta gravado; o openraft vai re-enviá-los e nós saltamos.
-        let skip_normals = log.head().saturating_sub(meta.normals);
+        let head = log.head();
+        // INVARIANTE DE DURABILIDADE: o meta NUNCA pode estar à frente do log.
+        // Sob `FsyncPolicy::GroupCommit` (o DEFAULT) um crash na janela pode
+        // deixar `sm_meta` (fsynced) à frente de um episódio ainda não
+        // group-committed. Antes isto era escondido por `saturating_sub` ⇒ os
+        // episódios em falta nunca eram re-aplicados (divergência SILENCIOSA).
+        // Falhar ALTO (como o caminho de meta-corrompido) é a postura segura.
+        if head < meta.normals {
+            return Err(StorageError::from(StorageIOError::read(Self::io_err(format!(
+                "state-machine à frente do log (normals={} > head={}): crash na janela de fsync. \
+                 Recupere de um snapshot, ou use FsyncPolicy::Always sob replicação.",
+                meta.normals, head
+            )))));
+        }
+        let skip_normals = head - meta.normals;
         Ok(Self {
             log,
             on_apply: None,
@@ -331,15 +345,31 @@ impl RaftSnapshotBuilder<TypeConfig> for EpisodeStateMachine {
         // N episódios mas meta a apontar N±1). Nenhum `.await` é retido sob o
         // guard, logo não há await-holding-lock nem deadlock.
         let mut st = self.state.lock().unwrap();
-        let episodes = self
-            .log
-            .scan(0, u64::MAX)
-            .map_err(|e| StorageError::from(StorageIOError::read(Self::io_err(e))))?;
-        let payload: Vec<Vec<u8>> = episodes
-            .iter()
-            .map(|(_, ep)| bincode::serde::encode_to_vec(ep, BINCODE_CFG))
-            .collect::<Result<_, _>>()
-            .map_err(|e| StorageError::from(StorageIOError::read(Self::io_err(e))))?;
+        // R22: scan JANELADO direto para o vec de payloads — o scan(0, MAX)
+        // antigo materializava o log inteiro num Vec de Episodes ALÉM do vec de
+        // payloads e dos bytes finais (~3× o log em RAM, sob o mutex). O
+        // snapshot continua a ser todos os episódios por design; isto corta o
+        // pico para ~2× sem mudar um byte do formato.
+        let head = self.log.head();
+        let mut payload: Vec<Vec<u8>> = Vec::new();
+        let mut cur = 0u64;
+        while cur < head {
+            let batch = self
+                .log
+                .scan_capped(cur, head, 100_000)
+                .map_err(|e| StorageError::from(StorageIOError::read(Self::io_err(e))))?;
+            let Some(&(last, _)) = batch.last() else {
+                break;
+            };
+            for (_, ep) in &batch {
+                payload.push(
+                    bincode::serde::encode_to_vec(ep, BINCODE_CFG).map_err(|e| {
+                        StorageError::from(StorageIOError::read(Self::io_err(e)))
+                    })?,
+                );
+            }
+            cur = last + 1;
+        }
         let bytes = bincode::serde::encode_to_vec(&payload, BINCODE_CFG)
             .map_err(|e| StorageError::from(StorageIOError::read(Self::io_err(e))))?;
 

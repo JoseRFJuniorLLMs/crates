@@ -114,11 +114,18 @@ pub struct GrpcConnection {
     addr: String,
 }
 
+/// Snapshots/lotes de raft podem exceder o default de 4MB do tonic; o transporte
+/// TCP permite 256MiB — igualar nos dois sentidos, senão um seguidor atrasado com
+/// snapshot grande NUNCA recuperaria por gRPC (mensagem rejeitada para sempre).
+const MAX_RAFT_MSG: usize = 256 * 1024 * 1024;
+
 impl GrpcConnection {
     async fn client(&self) -> Result<RaftTransportClient<tonic::transport::Channel>, Unreachable> {
-        RaftTransportClient::connect(format!("http://{}", self.addr))
+        let c = RaftTransportClient::connect(format!("http://{}", self.addr))
             .await
-            .map_err(|e| Unreachable::new(&e))
+            .map_err(|e| Unreachable::new(&e))?;
+        Ok(c.max_decoding_message_size(MAX_RAFT_MSG)
+            .max_encoding_message_size(MAX_RAFT_MSG))
     }
 }
 
@@ -209,7 +216,11 @@ where
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let server = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
-            .add_service(RaftTransportServer::new(svc))
+            .add_service(
+                RaftTransportServer::new(svc)
+                    .max_decoding_message_size(MAX_RAFT_MSG)
+                    .max_encoding_message_size(MAX_RAFT_MSG),
+            )
             .serve_with_incoming(incoming)
             .await;
     });

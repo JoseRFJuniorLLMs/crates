@@ -72,7 +72,11 @@ impl CompactionPolicy {
 }
 
 pub struct ColdTier {
-    store: LocalFileSystem,
+    /// Backend genérico: local (default), ou nuvem (GCS/S3) atrás das features
+    /// `gcp`/`aws`. Os métodos usam só a trait `ObjectStore`, por isso trocar
+    /// de backend é configuração — os paths `cold/{id}.hrkl` são relativos ao
+    /// prefixo/bucket configurado.
+    store: Arc<dyn ObjectStore>,
 }
 
 impl ColdTier {
@@ -82,16 +86,72 @@ impl ColdTier {
         std::fs::create_dir_all(root.as_ref())?;
         let store = LocalFileSystem::new_with_prefix(root.as_ref())
             .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?;
-        Ok(Self { store })
+        Ok(Self { store: Arc::new(store) })
     }
 
-    /// Demote one sealed segment: upload bytes + append the receipt event.
-    /// Returns the receipt and the LSN of the receipt event.
-    pub async fn demote(
+    /// Abre o backend a partir de um `location`: um URL de nuvem
+    /// (`gs://bucket/prefixo`, `s3://bucket/prefixo`) ou um caminho local
+    /// (qualquer coisa sem scheme de nuvem). As credenciais vêm do AMBIENTE
+    /// (o `object_store` lê `GOOGLE_APPLICATION_CREDENTIALS`/
+    /// `GOOGLE_SERVICE_ACCOUNT` para GCS; `AWS_*` para S3), nunca da config —
+    /// o segredo não passa pelo TOML. Os prefixos GCS/S3 exigem as features
+    /// `gcp`/`aws`; sem elas um URL de nuvem é um erro claro.
+    ///
+    /// NOTA: só o object store é partilhado; o recibo continua a entrar pelo
+    /// consenso via `Engine::append`. Um object store de nuvem é o que
+    /// desbloqueia o demote em cluster (o objeto deixa de ser local ao nó).
+    pub fn open_location(location: &str) -> Result<Self, HeraclitusError> {
+        let lower = location.to_ascii_lowercase();
+        if lower.starts_with("gs://") {
+            #[cfg(feature = "gcp")]
+            {
+                let store = object_store::gcp::GoogleCloudStorageBuilder::from_env()
+                    .with_url(location)
+                    .build()
+                    .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?;
+                return Ok(Self { store: Arc::new(store) });
+            }
+            #[cfg(not(feature = "gcp"))]
+            return Err(HeraclitusError::Config(
+                "cold_tier gs:// requer a feature `gcp` do heraclitus-tier".into(),
+            ));
+        }
+        if lower.starts_with("s3://") {
+            #[cfg(feature = "aws")]
+            {
+                let store = object_store::aws::AmazonS3Builder::from_env()
+                    .with_url(location)
+                    .build()
+                    .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?;
+                return Ok(Self { store: Arc::new(store) });
+            }
+            #[cfg(not(feature = "aws"))]
+            return Err(HeraclitusError::Config(
+                "cold_tier s3:// requer a feature `aws` do heraclitus-tier".into(),
+            ));
+        }
+        // Sem scheme de nuvem ⇒ caminho local (o default).
+        Self::open_local(location)
+    }
+
+    /// O episódio-recibo canónico (kind = `DemotionReceipt`, payload JSON).
+    /// Exposto para o caminho unificado §2.6: quem appenda é o HOST (via
+    /// `Engine::append` — indexação viva + consenso), não este crate.
+    pub fn receipt_episode(receipt: &DemotionReceipt) -> Result<Episode, HeraclitusError> {
+        let payload = serde_json::to_vec(receipt)
+            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+        Ok(Episode::new("tier", EventKind::DemotionReceipt, payload))
+    }
+
+    /// §2.6 (caminho unificado de evento derivado): materializa o segmento no
+    /// object store (`.hrkl` + espelho Parquet) e devolve o recibo SEM o
+    /// appendar — o chamador appenda `receipt_episode(..)` pelo seu caminho
+    /// (o `Engine::append`, que indexa ao vivo e passa pelo consenso).
+    pub async fn demote_prepared(
         &self,
         log: &Log,
         segment_id: SegmentId,
-    ) -> Result<(DemotionReceipt, Lsn), HeraclitusError> {
+    ) -> Result<DemotionReceipt, HeraclitusError> {
         let meta = log
             .sealed_segments()
             .into_iter()
@@ -117,7 +177,7 @@ impl ColdTier {
             .await
             .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?;
 
-        let receipt = DemotionReceipt {
+        Ok(DemotionReceipt {
             segment_id,
             object_path: obj_path.to_string(),
             record_count: count,
@@ -127,10 +187,20 @@ impl ColdTier {
             parquet_path: Some(parquet_path.to_string()),
             compacted_from: None,
             dropped: 0,
-        };
-        let payload = serde_json::to_vec(&receipt)
-            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-        let lsn = log.append(Episode::new("tier", EventKind::DemotionReceipt, payload))?;
+        })
+    }
+
+    /// Demote one sealed segment: upload bytes + append the receipt event.
+    /// Returns the receipt and the LSN of the receipt event. (Conveniência
+    /// standalone; um host com Engine deve usar [`Self::demote_prepared`] e
+    /// appendar pelo caminho unificado §2.6.)
+    pub async fn demote(
+        &self,
+        log: &Log,
+        segment_id: SegmentId,
+    ) -> Result<(DemotionReceipt, Lsn), HeraclitusError> {
+        let receipt = self.demote_prepared(log, segment_id).await?;
+        let lsn = log.append(Self::receipt_episode(&receipt)?)?;
         Ok((receipt, lsn))
     }
 
@@ -164,6 +234,18 @@ impl ColdTier {
         receipt: &DemotionReceipt,
         is_deleted: impl Fn(Lsn, &Episode) -> bool,
     ) -> Result<(DemotionReceipt, Lsn), HeraclitusError> {
+        let new_receipt = self.compact_cold_prepared(receipt, is_deleted).await?;
+        let lsn = log.append(Self::receipt_episode(&new_receipt)?)?;
+        Ok((new_receipt, lsn))
+    }
+
+    /// §2.6: a compaction física SEM o append do recibo — o chamador appenda
+    /// `receipt_episode(..)` pelo caminho unificado (ver `demote_prepared`).
+    pub async fn compact_cold_prepared(
+        &self,
+        receipt: &DemotionReceipt,
+        is_deleted: impl Fn(Lsn, &Episode) -> bool,
+    ) -> Result<DemotionReceipt, HeraclitusError> {
         let obj = self
             .store
             .get(&ObjPath::from(receipt.object_path.clone()))
@@ -232,7 +314,7 @@ impl ColdTier {
             .await
             .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?;
 
-        let new_receipt = DemotionReceipt {
+        Ok(DemotionReceipt {
             segment_id: receipt.segment_id,
             object_path: new_path.to_string(),
             record_count: kept,
@@ -242,11 +324,7 @@ impl ColdTier {
             parquet_path: Some(parquet_path.to_string()),
             compacted_from: Some(receipt.object_path.clone()),
             dropped,
-        };
-        let payload = serde_json::to_vec(&new_receipt)
-            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-        let lsn = log.append(Episode::new("tier", EventKind::DemotionReceipt, payload))?;
-        Ok((new_receipt, lsn))
+        })
     }
 
     /// Recall-on-demand (`INCLUDE COLD`): fetch and decode a cold segment's
@@ -409,6 +487,25 @@ fn scan_and_root(bytes: &[u8]) -> Result<(u64, [u8; 32]), HeraclitusError> {
 mod tests {
     use super::*;
     use heraclitus_core::FsyncPolicy;
+
+    #[tokio::test]
+    async fn open_location_resolves_local_and_gates_cloud() {
+        // Um caminho sem scheme de nuvem abre como object store local (default)
+        // e faz o round-trip demote→verify — a mesma superfície do open_local.
+        let dir = tempfile::tempdir().unwrap();
+        let log = seeded_log(&dir.path().join("log"));
+        let tier = ColdTier::open_location(&dir.path().join("cold").to_string_lossy()).unwrap();
+        let seg = log.sealed_segments()[0].id;
+        let (receipt, _) = tier.demote(&log, seg).await.unwrap();
+        assert!(tier.verify_receipt(&receipt).await.unwrap());
+
+        // Um URL de nuvem sem a feature respetiva é um erro CLARO (não um
+        // pânico nem um fallback silencioso para local).
+        #[cfg(not(feature = "gcp"))]
+        assert!(ColdTier::open_location("gs://bucket/prefixo").is_err());
+        #[cfg(not(feature = "aws"))]
+        assert!(ColdTier::open_location("s3://bucket/prefixo").is_err());
+    }
 
     fn seeded_log(dir: &std::path::Path) -> Log {
         // Tiny segments force at least one sealed segment.

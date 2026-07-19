@@ -2164,6 +2164,13 @@ impl BEpsilonTree {
         Ok(out)
     }
 
+    /// Leitura com corte de visibilidade por `snapshot_lsn`.
+    ///
+    /// HONESTIDADE SEMÂNTICA (revisão 2026-07-16): o "lsn" comparado aqui é o
+    /// que `upsert`/`delete_key` carimbam nas mensagens — a **GENERATION do
+    /// superbloco**, não um LSN do log do Heraclitus. Serve para snapshots
+    /// relativos a commits desta árvore; NÃO passar LSNs do log (usar
+    /// `get`, que lê o head, para o caso comum).
     pub fn get_snapshot(&self, key: &[u8], snapshot_lsn: u64) -> io::Result<Option<Val>> {
         let root_id = self.superblock.read().unwrap().root_id;
         let mut curr_id = root_id;

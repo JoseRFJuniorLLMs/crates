@@ -48,10 +48,13 @@ pub fn ipc_to_batches(bytes: &[u8]) -> Result<Vec<RecordBatch>, AnalyticsError> 
 /// HTTP que a rota `/flight/events` do server serve a clientes Arrow.
 pub fn events_as_single_ipc(log: &Log, as_of: Option<u64>) -> Result<Vec<u8>, AnalyticsError> {
     let to = as_of.unwrap_or(u64::MAX).min(log.head());
-    let events = log.scan(0, to)?;
     // Flight faz streaming incremental: lotes fixos de BATCH_ROWS, não o morsel
     // adaptativo (que agregaria tudo num só batch grande no fio).
-    let batches = episodes_to_batches_sized(&events, BATCH_ROWS)?;
+    // R25: scan JANELADO (múltiplo de BATCH_ROWS) — o scan(0, to) antigo
+    // materializava o log inteiro num Vec de Episodes ALÉM dos batches Arrow e
+    // dos bytes IPC (~3× o log em RAM por pedido). Janela = 50×BATCH_ROWS
+    // mantém os lotes cheios no fio, exceto o último de cada janela final.
+    let batches = scan_to_batches_windowed(log, to)?;
     let mut buf = Vec::new();
     {
         let schema = batches
@@ -66,6 +69,23 @@ pub fn events_as_single_ipc(log: &Log, as_of: Option<u64>) -> Result<Vec<u8>, An
         w.finish().map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
     }
     Ok(buf)
+}
+
+/// R25: varre `[0, to)` em janelas (múltiplas de BATCH_ROWS) e converte cada
+/// janela em RecordBatches — nunca materializa o log inteiro como `Episode`s.
+fn scan_to_batches_windowed(log: &Log, to: u64) -> Result<Vec<RecordBatch>, AnalyticsError> {
+    const WINDOW: usize = 50 * BATCH_ROWS;
+    let mut batches = Vec::new();
+    let mut cur = 0u64;
+    while cur < to {
+        let window = log.scan_capped(cur, to, WINDOW)?;
+        let Some(&(last, _)) = window.last() else {
+            break;
+        };
+        batches.extend(episodes_to_batches_sized(&window, BATCH_ROWS)?);
+        cur = last + 1;
+    }
+    Ok(batches)
 }
 
 /// Serviço Flight sobre o log real.
@@ -96,9 +116,9 @@ impl FlightService for IpcFlightService {
     fn do_get(&self, ticket: &Ticket) -> Result<Vec<BatchBytes>, String> {
         let as_of = Self::parse_ticket(ticket)?;
         let to = as_of.unwrap_or(u64::MAX).min(self.log.head());
-        let events = self.log.scan(0, to).map_err(|e| e.to_string())?;
         // Streaming incremental: lotes fixos de BATCH_ROWS (contrato do fio).
-        let batches = episodes_to_batches_sized(&events, BATCH_ROWS).map_err(|e| e.to_string())?;
+        // R25: janelado — sem materializar o log inteiro como Episodes.
+        let batches = scan_to_batches_windowed(&self.log, to).map_err(|e| e.to_string())?;
         batches
             .iter()
             .map(|b| batch_to_ipc(b).map_err(|e| e.to_string()))

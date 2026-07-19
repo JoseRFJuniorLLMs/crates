@@ -39,6 +39,18 @@ pub struct HeraclitusConfig {
     pub rest_addr: String,
     /// Cold tier root (object_store URL or local path).
     pub cold_tier_path: PathBuf,
+    /// C2.6 — intervalo (segundos) da task de compaction do cold tier: a cada
+    /// tick, segmentos demotados cuja fração de eventos logicamente apagados
+    /// (tombstones semânticos) cruze a `CompactionPolicy` são reescritos sem
+    /// eles, com novo recibo Merkle. `0` = desligado (default; requer a
+    /// feature `tier`). Ignorada sob replicação (o object store é local ao nó).
+    pub tier_compaction_interval_secs: u64,
+    /// §3.9 (distill) — intervalo (segundos) da task de consolidação: a cada
+    /// tick, os episódios de Observação novos (desde o cursor) são agrupados
+    /// na variedade e cada cluster estável vira um `Fact` (`FactDerived`) no
+    /// log via `Engine::append`. `0` = desligado (default; requer a feature
+    /// `distill`). Ignorada sob replicação (v0: cursor é local ao nó).
+    pub distill_interval_secs: u64,
     /// Optional bearer token required on every gRPC call. `None` = no auth
     /// (default; the server is reachable by anyone who can reach the port).
     pub auth_token: Option<String>,
@@ -112,6 +124,12 @@ pub struct ReplicationConfig {
     /// Id deste nó (único no cluster).
     pub node_id: u64,
     /// Endereço TCP onde este nó serve os RPCs de raft (ex.: `127.0.0.1:8474`).
+    ///
+    /// **SEGURANÇA (R24):** a superfície de raft (TCP e gRPC) NÃO tem
+    /// autenticação nem TLS — qualquer par que alcance a porta pode enviar
+    /// AppendEntries/Vote/InstallSnapshot (injeção de entradas / hijack do
+    /// cluster). Ligar SEMPRE a uma rede privada/localhost, nunca a uma
+    /// interface pública. Auth mútua no transporte é trabalho futuro.
     pub raft_addr: String,
     /// Todos os membros do cluster (incluindo este): `node_id -> raft_addr`.
     pub peers: std::collections::BTreeMap<u64, String>,
@@ -155,6 +173,8 @@ impl Default for HeraclitusConfig {
             grpc_addr: "127.0.0.1:7474".to_string(),
             rest_addr: "127.0.0.1:7475".to_string(),
             cold_tier_path: PathBuf::from("./data/cold"),
+            tier_compaction_interval_secs: 0,
+            distill_interval_secs: 0,
             auth_token: None,
             rest_basic_auth: None,
             checkpoint_interval_secs: 300,
@@ -247,6 +267,21 @@ impl HeraclitusConfig {
         if let Ok(v) = std::env::var("HERACLITUS_TELEMETRY_INTERVAL") {
             if let Ok(s) = v.parse() {
                 self.telemetry_interval_secs = s;
+            }
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_TIER_COMPACTION_INTERVAL") {
+            if let Ok(s) = v.parse() {
+                self.tier_compaction_interval_secs = s;
+            }
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_DISTILL_INTERVAL") {
+            if let Ok(s) = v.parse() {
+                self.distill_interval_secs = s;
+            }
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_COLD_TIER_PATH") {
+            if !v.is_empty() {
+                self.cold_tier_path = PathBuf::from(v);
             }
         }
         if let Ok(v) = std::env::var("HERACLITUS_COMPLIANCE_TSA_URL") {

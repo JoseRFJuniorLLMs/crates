@@ -30,6 +30,8 @@ pub fn log_inspect(dir: &std::path::Path) -> Result<String, heraclitus_core::Her
 
 pub fn verify(dir: &std::path::Path) -> Result<String, heraclitus_core::HeraclitusError> {
     let log = Log::open(dir, 256 * 1024 * 1024, FsyncPolicy::Always)?;
+    // `log.verify()` já devolve `Err(Corruption)` numa raiz Merkle divergente
+    // (o `?` propaga) — e `main` agora sai com código 1 em qualquer `Err`.
     let r = log.verify()?;
     Ok(format!(
         "segments: {}  records: {}  merkle ok: {}\nall crc checks passed",
@@ -87,14 +89,16 @@ pub fn verify_receipts(
     // Forensic step 1: recompute every sealed-segment Merkle root from the
     // actual records (the M0 guarantee). This catches record-level tampering
     // that a stale footer root would otherwise hide.
+    // `log.verify()` devolve `Err` numa raiz Merkle divergente (adulteração de
+    // registos) — nesse caso os recibos não são confiáveis; falhar o processo.
     let mut out = match log.verify() {
         Ok(r) => format!(
             "integridade do log: OK (segmentos {} · registos {} · merkle recalculado {})\n",
             r.segments, r.records, r.merkle_ok
         ),
         Err(e) => {
-            return Ok(format!(
-                "*** INTEGRIDADE DO LOG FALHOU: {e}\n*** O log foi adulterado — recibos não confiáveis. ***"
+            return Err(format!(
+                "*** INTEGRIDADE DO LOG FALHOU: {e} — o log foi adulterado; recibos não confiáveis. ***"
             ))
         }
     };
@@ -114,12 +118,13 @@ pub fn verify_receipts(
             }
         }
     }
-    out += if all_ok {
-        "\nTODOS os recibos conferem — log íntegro e não adulterado retroativamente."
+    if all_ok {
+        out += "\nTODOS os recibos conferem — log íntegro e não adulterado retroativamente.";
+        Ok(out)
     } else {
-        "\n*** ATENÇÃO: pelo menos um recibo NÃO confere — possível adulteração retroativa do log. ***"
-    };
-    Ok(out)
+        out += "\n*** ATENÇÃO: pelo menos um recibo NÃO confere — possível adulteração retroativa do log. ***";
+        Err(out)
+    }
 }
 
 /// Synthetic hierarchical dataset (WordNet-shaped): a b-ary tree embedded by
