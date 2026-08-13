@@ -1071,7 +1071,8 @@ impl Log {
         let path = segment_path(&self.dir, seg);
         let mut f = match File::open(&path) {
             Ok(f) => f,
-            Err(_) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
         };
 
         f.seek(SeekFrom::Start(off))?;
@@ -1083,8 +1084,11 @@ impl Log {
         }
 
         let mut rh = [0u8; format::RECORD_HEADER_LEN];
-        if f.read_exact(&mut rh).is_err() {
-            return Ok(None);
+        if let Err(e) = f.read_exact(&mut rh) {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Ok(None);
+            }
+            return Err(e.into());
         }
 
         let len = u32::from_le_bytes(rh[..4].try_into().unwrap_or([0u8; 4])) as usize;
@@ -1097,8 +1101,11 @@ impl Log {
 
         let mut buf = vec![0u8; format::RECORD_HEADER_LEN + len];
         buf[..format::RECORD_HEADER_LEN].copy_from_slice(&rh);
-        if f.read_exact(&mut buf[format::RECORD_HEADER_LEN..]).is_err() {
-            return Ok(None);
+        if let Err(e) = f.read_exact(&mut buf[format::RECORD_HEADER_LEN..]) {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Ok(None);
+            }
+            return Err(e.into());
         }
 
         // Versão do SEGMENTO (não a corrente): decide a regra de CRC e o
@@ -1206,10 +1213,11 @@ impl Log {
                         }
                     };
 
-                    if file_ref.seek(SeekFrom::Start(entry.offset)).is_err() {
-                        scan_lsn += 1;
-                        continue;
-                    }
+                    // Um `seek` NUNCA falha por fim-de-ficheiro (posicionar além do
+                    // EOF é legal): qualquer erro aqui é I/O real. Saltar o LSN em
+                    // silêncio, como antes, devolvia `Ok` com um buraco no histórico
+                    // — exatamente o que o guard de CRC mais abaixo recusa fazer.
+                    file_ref.seek(SeekFrom::Start(entry.offset))?;
 
                     while scan_lsn < effective_to && out.len() < max {
                         // Fronteira de segmento SELADO: depois do último registo
@@ -1220,8 +1228,18 @@ impl Log {
                         if container.meta.sealed && scan_lsn > container.meta.max_lsn {
                             break;
                         }
-                        if file_ref.read_exact(&mut record_header_buffer).is_err() {
-                            break;
+                        // `UnexpectedEof` é fronteira legítima (cauda do segmento
+                        // ativo); qualquer OUTRO erro é falha de I/O e tem de subir.
+                        // Tratar os dois como "fim do segmento" — o que o código
+                        // fazia — transformava um EIO/EACCES num histórico truncado
+                        // em silêncio, com `Ok`. Mesma correção já aplicada a
+                        // `read_at`, agora no caminho de leitura principal (`scan`
+                        // serve catch_up/rebuild/subscribe/REST).
+                        if let Err(e) = file_ref.read_exact(&mut record_header_buffer) {
+                            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                                break;
+                            }
+                            return Err(e.into());
                         }
                         if record_header_buffer[..4] == format::FOOTER_MAGIC {
                             break;
@@ -1240,11 +1258,15 @@ impl Log {
                         record_buf.resize(format::RECORD_HEADER_LEN + len, 0);
                         record_buf[..format::RECORD_HEADER_LEN]
                             .copy_from_slice(&record_header_buffer);
-                        if file_ref
-                            .read_exact(&mut record_buf[format::RECORD_HEADER_LEN..])
-                            .is_err()
+                        // Idem para o corpo do registo: EOF = cauda torn legítima,
+                        // erro de I/O = falha que não pode virar buraco silencioso.
+                        if let Err(e) =
+                            file_ref.read_exact(&mut record_buf[format::RECORD_HEADER_LEN..])
                         {
-                            break;
+                            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                                break;
+                            }
+                            return Err(e.into());
                         }
 
                         match format::decode_record(container.meta.version, &record_buf) {
@@ -1347,8 +1369,12 @@ impl Log {
         }))
     }
 
-    pub fn verify(&self) -> Result<VerifyReport, HeraclitusError> {
+    pub fn verify_durable(&self) -> Result<VerifyReport, HeraclitusError> {
         self.flush()?;
+        self.verify()
+    }
+
+    pub fn verify(&self) -> Result<VerifyReport, HeraclitusError> {
         let catalog = self.catalog.load();
         let mut report = VerifyReport::default();
 

@@ -1192,15 +1192,35 @@ impl BEpsilonTree {
     /// respondendo `{"ok":true}`. O ficheiro anterior é descartado para o estado
     /// resultante ser função só do mapa recebido.
     pub fn from_map(path: &Path, map: BTreeMap<Key, Val>) -> io::Result<Self> {
-        if path.exists() {
-            std::fs::remove_file(path)?;
+        let tmp_path = path.with_extension("tmp");
+        if tmp_path.exists() {
+            std::fs::remove_file(&tmp_path)?;
         }
-        let mut t = Self::open(path, 1000, 128)?;
+        let mut t = Self::open(&tmp_path, 1000, 128)?;
         for (k, v) in map {
             t.upsert(k, v)?;
         }
         t.commit()?;
-        Ok(t)
+        // Fechar para permitir o rename em Windows
+        drop(t);
+        std::fs::rename(&tmp_path, path)?;
+        
+        // Sync do diretório pai: sem isto o `rename` pode não sobreviver a uma
+        // falha de energia e o checkpoint volta a apontar para o ficheiro antigo
+        // (ou para nenhum). O erro é PROPAGADO — engoli-lo com `let _ =` fazia a
+        // função reportar sucesso sobre uma barreira que não aconteceu, que é a
+        // mesma classe de mentira que o `read_at` cometia. Mesmo padrão do
+        // `sync_parent_dir` do heraclitus-log. No Windows não há API std
+        // equivalente (o rename já é transacional no NTFS via MoveFileEx).
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .open(parent)?
+                .sync_all()?;
+        }
+
+        Self::open(path, 1000, 128)
     }
 
     /// Checkpoint auto-contido: copia página a página o último estado
@@ -2182,14 +2202,14 @@ impl BEpsilonTree {
         Ok(out)
     }
 
-    /// Leitura com corte de visibilidade por `snapshot_lsn`.
+    /// Leitura com corte de visibilidade por `snapshot_generation`.
     ///
     /// HONESTIDADE SEMÂNTICA (revisão 2026-07-16): o "lsn" comparado aqui é o
     /// que `upsert`/`delete_key` carimbam nas mensagens — a **GENERATION do
     /// superbloco**, não um LSN do log do Heraclitus. Serve para snapshots
     /// relativos a commits desta árvore; NÃO passar LSNs do log (usar
     /// `get`, que lê o head, para o caso comum).
-    pub fn get_snapshot(&self, key: &[u8], snapshot_lsn: u64) -> io::Result<Option<Val>> {
+    pub fn get_snapshot(&self, key: &[u8], snapshot_generation: u64) -> io::Result<Option<Val>> {
         let root_id = self.superblock.read().unwrap().root_id;
         let mut curr_id = root_id;
         self.metrics
@@ -2210,7 +2230,7 @@ impl BEpsilonTree {
             }
 
             if let Some(versions) = node.buffer.get(key) {
-                if let Some(msg) = versions.iter().rev().find(|m| m.lsn() <= snapshot_lsn) {
+                if let Some(msg) = versions.iter().rev().find(|m| m.lsn() <= snapshot_generation) {
                     break Ok(match msg {
                         Msg::Upsert(v, _) => Some(v.clone()),
                         Msg::Delete(_) => None,

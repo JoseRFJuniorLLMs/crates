@@ -166,9 +166,22 @@ async fn sql(
     }
 }
 
+/// Orçamento de materialização de UM `POST /sql` (admission control).
+///
+/// Um `tokio::time::timeout` à volta de um `spawn_blocking` **não cancela** a
+/// tarefa bloqueante: no timeout o handler devolvia 408 e a materialização
+/// CONTINUAVA a alocar em segundo plano, pelo que pedidos sucessivos se
+/// empilhavam até ao OOM — o timeout dava a ilusão de proteção sem proteger. O
+/// que limita de facto é um teto DENTRO do trabalho bloqueante, que o faz
+/// terminar sozinho; daí o orçamento explícito em vez do timeout na construção.
+#[cfg(feature = "analytics")]
+const SQL_MAX_ROWS: usize = 2_000_000;
+#[cfg(feature = "analytics")]
+const SQL_MAX_BYTES: usize = 256 * 1024 * 1024;
+
 /// Núcleo testável de `POST /sql`: materializa o log em `spawn_blocking` (nunca
 /// no executor async) e corre o SQL no DataFusion. Erro de SQL do utilizador =
-/// 400; falha interna (scan/join) = 500.
+/// 400; falha interna (scan/join) = 500; orçamento excedido = 413.
 #[cfg(feature = "analytics")]
 async fn run_sql(
     engine: &Engine,
@@ -177,15 +190,38 @@ async fn run_sql(
 ) -> Result<Vec<serde_json::Value>, (StatusCode, String)> {
     let log = engine.log.clone();
     let analytics = tokio::task::spawn_blocking(move || {
-        heraclitus_analytics::LogAnalytics::from_log(&log, as_of)
+        heraclitus_analytics::LogAnalytics::from_log_capped(
+            &log,
+            as_of,
+            SQL_MAX_ROWS,
+            SQL_MAX_BYTES,
+        )
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")))?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("analytics: {e}")))?;
-    analytics
-        .sql(&query)
+    .map_err(|e| match e {
+        // Orçamento excedido é erro do PEDIDO (demasiado largo), não do servidor.
+        heraclitus_analytics::AnalyticsError::Budget { .. } => {
+            (StatusCode::PAYLOAD_TOO_LARGE, e.to_string())
+        }
+        other => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("analytics: {other}"),
+        ),
+    })?;
+
+    // Aqui o timeout é eficaz: `analytics.sql` é um futuro async, que ao ser
+    // largado é mesmo cancelado (ao contrário do `spawn_blocking` acima).
+    let rows = tokio::time::timeout(std::time::Duration::from_secs(30), analytics.sql(&query))
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("sql: {e}")))
+        .map_err(|_| (StatusCode::REQUEST_TIMEOUT, "timeout executando SQL".to_string()))?
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("sql: {e}")))?;
+
+    if rows.len() > 10_000 {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "Conjunto de resultados muito grande (> 10.000 linhas). Utilize LIMIT.".to_string()));
+    }
+
+    Ok(rows)
 }
 
 // ── M20 H-VM ledger (KV soberano durável no log) ─────────────────────────────

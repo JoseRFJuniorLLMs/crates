@@ -150,9 +150,12 @@ impl pb::heraclitus_server::Heraclitus for Service {
                     .await
                     {
                         Ok(Ok(b)) => b,
-                        // Erro de scan: como o `while let Ok` original, desiste do
-                        // histórico e passa ao tail ao vivo.
-                        Ok(Err(_)) => break,
+                        // Erro de scan: encerra a subscrição enviando o erro ao consumidor.
+                        // O comportamento anterior abandonava o histórico silenciosamente.
+                        Ok(Err(e)) => {
+                            let _ = tx.send(Err(Status::internal(e.to_string()))).await;
+                            return;
+                        }
                         // Task bloqueante abortada (shutdown): encerra o stream.
                         Err(_) => return,
                     };

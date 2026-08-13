@@ -827,7 +827,7 @@ impl Engine {
     }
 
     pub fn verify(&self) -> Result<serde_json::Value, HeraclitusError> {
-        let r = self.log.verify()?;
+        let r = self.log.verify_durable()?;
         Ok(serde_json::json!({
             "segments": r.segments, "records": r.records, "merkle_ok": r.merkle_ok
         }))
