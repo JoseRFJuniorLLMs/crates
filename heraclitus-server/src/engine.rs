@@ -245,7 +245,15 @@ impl Engine {
             registry.register(Box::new(Shared(entity.clone())));
             registry.register(Box::new(Shared(activation.clone())));
             if skip_replay {
-                p.ok("PULADO — HERACLITUS_SKIP_VIEW_REPLAY (views vazias; use view rebuild)");
+                // As views ficam VAZIAS — os watermarks carregados do disco
+                // deixam de as descrever. Mantê-los fazia um checkpoint
+                // posterior (periódico ou de shutdown) gravar snapshots vazios
+                // sob watermarks altos, e o arranque seguinte replayava só a
+                // cauda: perda PERMANENTE e silenciosa de tudo ≤ watermark nas
+                // views derivadas. A zero, qualquer checkpoint é seguro e o
+                // próximo boot normal reconstrói do LSN 0.
+                registry.reset_watermarks();
+                p.ok("PULADO — HERACLITUS_SKIP_VIEW_REPLAY (views vazias; watermarks a zero)");
             } else {
                 registry.catch_up(&log)?;
                 let wm = registry.min_watermark();
@@ -471,7 +479,8 @@ impl Engine {
     /// por isso não polui o grafo nem diverge o `state_hash`.
     fn hvm_append(&self, instr: &VmInstruction) -> Result<Lsn, HeraclitusError> {
         let frame = heraclitus_core::vm::encode(VmVersion(1), instr);
-        self.append(Episode::new(
+        // : este é o ÚNICO produtor legítimo de frames hvm_isa.
+        self.append_internal(Episode::new(
             "hvm",
             EventKind::Custom(vm_bridge::HVM_KIND.to_string()),
             frame,
@@ -754,6 +763,25 @@ impl Engine {
     /// Append + synchronously index into memtable AND views.
     /// Read-your-own-writes holds for every index path.
     pub fn append(&self, episode: Episode) -> Result<Lsn, HeraclitusError> {
+        // O kind `hvm_isa` é RESERVADO ao ledger soberano. Qualquer cliente podia
+        // escolhê-lo num Append normal (gRPC/REST/GQL) e o efeito era duplo e
+        // IRREVERSÍVEL (o log é imutável): (1) `is_hvm` fazia o episódio ser
+        // saltado por views/attr/memtable, ficando invisível a todas as queries;
+        // e (2) o frame entrava no replay do H-VM, onde bytes arbitrários não
+        // decodificam como instrução ISA — envenenando o ledger de forma
+        // permanente. As escritas H-VM legítimas usam `append_internal`.
+        if vm_bridge::is_hvm(&episode) {
+            return Err(HeraclitusError::Query(format!(
+                "o kind '{}' é reservado ao ledger H-VM — use /hvm/upsert ou /hvm/delete",
+                vm_bridge::HVM_KIND
+            )));
+        }
+        self.append_internal(episode)
+    }
+
+    /// Append sem a validação de kind reservado — só para o caminho INTERNO do
+    /// H-VM, que precisa mesmo de emitir frames `hvm_isa`.
+    fn append_internal(&self, episode: Episode) -> Result<Lsn, HeraclitusError> {
         // SPEC-015/021: com replicação ativa, a escrita passa pelo consenso (o
         // líder aplica via a state machine, que grava no log de CADA nó e chama
         // de volta `index_applied` aqui). Num não-líder, devolve um erro com o
@@ -766,8 +794,13 @@ impl Engine {
         if self.log_only {
             return self.log.append(episode);
         }
-        let lsn = self.log.append(episode.clone())?;
-        self.index_applied(lsn, &episode);
+        // Indexar o episódio COM o `ts_hlc` carimbado pelo log. Antes indexava-se
+        // o original (pré-carimbo, `ts_hlc = 0`) enquanto o log guardava o valor
+        // real: as views vivas divergiam das reconstruídas do LSN 0 — quebra do
+        // invariante I6 (a `activation` usa `ts_hlc >> 16` como instante de acesso,
+        // logo ao vivo registava tudo no instante 0).
+        let (lsn, stamped) = self.log.append_stamped(episode)?;
+        self.index_applied(lsn, &stamped);
         Ok(lsn)
     }
 
@@ -917,11 +950,24 @@ impl Engine {
         // Hydrate rows from the log.
         let mut rows = Vec::new();
         for (cand, score) in ranked {
-            if let Some((lsn, ep)) = self.log.read(cand.lsn)?.filter(|(_, e)| e.id == cand.id) {
+            // Candidato vindo SÓ do canal de ativação chega com lsn=0 (o canal
+            // não transporta LSN) — a leitura em 0 falhava o filtro de id e a
+            // linha saía sem conteúdo. Resolve-se o LSN real pelo índice de
+            // grafo (id → lsn) antes de hidratar.
+            let lsn = if cand.lsn == 0 {
+                self.graph
+                    .lock()
+                    .unwrap()
+                    .lsn_of(&cand.id)
+                    .unwrap_or(cand.lsn)
+            } else {
+                cand.lsn
+            };
+            if let Some((lsn, ep)) = self.log.read(lsn)?.filter(|(_, e)| e.id == cand.id) {
                 rows.push(serde_json::json!({
                     "lsn": lsn,
                     "id": ep.id.to_string(),
-                    "content": String::from_utf8_lossy(&ep.content),
+                    "content": crate::rest::bytes_str(&ep.content),
                     "score": score,
                 }));
             } else {

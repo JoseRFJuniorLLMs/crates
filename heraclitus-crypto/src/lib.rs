@@ -124,6 +124,13 @@ impl KeyStore {
     }
 
     /// Fetch the agent's key, generating and persisting one on first use.
+    ///
+    /// Corrida do primeiro uso (TOCTOU): dois threads que falham a cache e o
+    /// ficheiro geravam chaves DIFERENTES e ambos faziam rename para o mesmo
+    /// destino — o último ganhava o disco, mas cada thread cacheava a SUA
+    /// chave. Dados selados com a chave perdedora ficavam ilegíveis após
+    /// restart. O árbitro agora é `create_new` no caminho final: exatamente um
+    /// thread cria; os outros leem a chave do vencedor.
     pub fn get_or_create(&self, agent_id: &str) -> io::Result<[u8; 32]> {
         if let Some(k) = self.cache.get(agent_id) {
             return Ok(*k);
@@ -132,13 +139,41 @@ impl KeyStore {
         let key = match Self::read_key(&path) {
             Some(k) => k,
             None => {
-                let mut k = [0u8; 32];
-                rand::thread_rng().fill_bytes(&mut k);
-                let tmp = path.with_extension("tmp");
-                std::fs::write(&tmp, k)?;
-                restrict_file_perms(&tmp); // 0600 antes do rename atómico
-                std::fs::rename(&tmp, &path)?;
-                k
+                use std::io::Write as _;
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(mut f) => {
+                        // Vencedor: 0600 ANTES de escrever os bytes da chave.
+                        restrict_file_perms(&path);
+                        let mut k = [0u8; 32];
+                        rand::thread_rng().fill_bytes(&mut k);
+                        f.write_all(&k)?;
+                        f.sync_all()?;
+                        k
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        // Perdedor: o vencedor pode estar a meio do write_all —
+                        // espera curta e limitada pela chave completa (32 bytes).
+                        let mut got = None;
+                        for _ in 0..100 {
+                            if let Some(k) = Self::read_key(&path) {
+                                got = Some(k);
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        got.ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "ficheiro de chave existe mas está incompleto (artefacto de crash?)",
+                            )
+                        })?
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         };
         self.cache.insert(agent_id.to_string(), key);

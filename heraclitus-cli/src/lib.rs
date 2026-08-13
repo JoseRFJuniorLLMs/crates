@@ -179,6 +179,10 @@ impl BenchReport {
 /// The M7 harness core: build the index over a hierarchical dataset, then
 /// measure QPS × recall@10 against exact brute-force ground truth.
 pub fn bench_recall(n: usize, dim: usize, queries: usize) -> BenchReport {
+    // `--n 0` dava resto-por-zero em `(q * 37) % n`; dim=0 daria distâncias
+    // triviais. Clamp com o mínimo útil em vez de panicar.
+    let n = n.max(1);
+    let dim = dim.max(1);
     let pts = synth_tree(n, dim, 42);
     let metric = ProductMetric::default();
 

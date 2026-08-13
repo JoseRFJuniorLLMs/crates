@@ -99,6 +99,14 @@ pub async fn serve_with(
     let expected_auth = config.auth_token.clone().map(|t| format!("Bearer {t}"));
     if expected_auth.is_some() {
         boot.warn_line("Auth gRPC", "Bearer token EXIGIDO em cada chamada");
+    } else if !grpc_addr.ip().is_loopback() {
+        // Mesma política da superfície REST: o gRPC inclui ESCRITAS duráveis
+        // (append) e admin destrutivo (shred, rebuild). Sem auth_token, o
+        // interceptor é no-op — recusar expor isso fora do loopback.
+        return Err(HeraclitusError::Config(format!(
+            "grpc_addr {grpc_addr} não é loopback mas auth_token não está definido — \
+             append/shred/rebuild ficariam abertos. Defina auth_token ou use 127.0.0.1."
+        )));
     }
     let auth = move |req: Request<()>| -> Result<Request<()>, Status> {
         match &expected_auth {
@@ -281,6 +289,18 @@ pub async fn serve_with(
     // Opt-in via flight_addr; só existe com a feature `analytics`.
     #[cfg(feature = "analytics")]
     let flight_task = if let Some(addr) = config.flight_addr.clone() {
+        // O Flight serve o LOG INTEIRO via DoGet e (ainda) não tem qualquer
+        // autenticação — a única postura segura é loopback-only, como nas
+        // outras superfícies sem auth.
+        let flight_sock: std::net::SocketAddr = addr
+            .parse()
+            .map_err(|e| HeraclitusError::Config(format!("flight_addr: {e}")))?;
+        if !flight_sock.ip().is_loopback() {
+            return Err(HeraclitusError::Config(format!(
+                "flight_addr {flight_sock} não é loopback mas o Flight não tem autenticação — \
+                 o log inteiro ficaria legível. Use 127.0.0.1."
+            )));
+        }
         match flight_grpc::serve_flight(engine.log.clone(), &addr).await {
             Ok((local, handle)) => {
                 boot.ok_line("Arrow Flight (gRPC)", &format!("grpc://{local}"));

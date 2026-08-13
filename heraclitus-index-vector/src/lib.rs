@@ -445,6 +445,21 @@ impl VectorIndex {
         ) else {
             return Ok(false);
         };
+        // Invariante estrutural do HNSW: todo nó tem `level + 1` camadas de
+        // vizinhos (nunca vazio — `search_layer` indexa `neighbors[..len()-1]`
+        // e um vec vazio dava underflow/panic em TODA pesquisa futura). Um
+        // checkpoint decodável mas violado degrada para rebuild do log (I6),
+        // nunca para um índice que panica.
+        let coherent = snap.nodes.len() == snap.ids.len()
+            && snap.nodes.len() == snap.lsns.len()
+            && snap
+                .nodes
+                .iter()
+                .all(|n| n.neighbors.len() == n.level + 1 && !n.neighbors.is_empty())
+            && snap.entry.map(|e| (e as usize) < snap.nodes.len()).unwrap_or(true);
+        if !coherent {
+            return Ok(false);
+        }
         self.by_event = snap
             .ids
             .iter()
@@ -481,7 +496,9 @@ impl View for VectorIndex {
                 self.tombstone_event(&id);
             }
         }
-        self.watermark = lsn;
+        // Avanço-só (ver activation/text/attr): entrega fora de ordem não pode
+        // regredir o watermark persistido no checkpoint.
+        self.watermark = self.watermark.max(lsn);
     }
 
     fn watermark(&self) -> Lsn {

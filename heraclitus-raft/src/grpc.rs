@@ -213,7 +213,12 @@ where
     let addr = listener.local_addr()?.to_string();
     let raft = HeraclitusRaft::new(id, config, GrpcNetworkFactory, store, sm).await?;
     let svc = RaftTransportSvc { raft: raft.clone() };
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    // Um erro de `accept()` (ex.: EMFILE por exaustão de FDs sob carga) NÃO deve
+    // terminar o serve — senão o nó cairia do cluster até restart, sem sinal. O
+    // TCP puro (`net::serve`) já recua e continua; aqui saltamos o erro no stream.
+    use tokio_stream::StreamExt as _;
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener)
+        .filter_map(|r| r.ok().map(Ok::<_, std::io::Error>));
     let server = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
             .add_service(

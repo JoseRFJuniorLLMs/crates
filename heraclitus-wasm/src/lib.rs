@@ -52,7 +52,17 @@ impl WasmPlugin {
     /// instruções. Loop infinito / trap / função errada → `Err` tratado.
     pub fn call2_i64(&self, func: &str, a: i64, b: i64, fuel: u64) -> Result<i64, String> {
         // Store novo por chamada: estado do plugin não vaza entre execuções.
-        let mut store = Store::new(&self.engine, ());
+        // Fuel limita CPU mas NÃO memória — sem um ResourceLimiter, um módulo
+        // válido podia declarar/crescer memória linear até esgotar a RAM do
+        // host logo na instanciação. 64 MiB chegam de sobra para operadores.
+        let limits = wasmtime::StoreLimitsBuilder::new()
+            .memory_size(64 << 20)
+            .memories(2)
+            .tables(4)
+            .instances(4)
+            .build();
+        let mut store = Store::new(&self.engine, limits);
+        store.limiter(|l| l);
         store.set_fuel(fuel).map_err(|e| format!("fuel: {e}"))?;
         let instance = Instance::new(&mut store, &self.module, &[])
             .map_err(|e| format!("instantiate: {e}"))?;

@@ -134,13 +134,30 @@ impl ViewRegistry {
         }
         for v in self.views.iter_mut() {
             v.apply(lsn, event);
-            self.watermarks.insert(v.name().to_string(), lsn);
+            // Avanço-só (max): dois appends concorrentes podem aplicar 6 antes
+            // de 5; um insert cru regredia o watermark para 5, e um checkpoint
+            // nesse estado fazia o restart re-replayar o 6 (duplicação em views
+            // não-idempotentes). O max preserva "tudo ≤ wm foi aplicado".
+            let w = self.watermarks.entry(v.name().to_string()).or_insert(0);
+            *w = (*w).max(lsn);
         }
     }
 
     /// Watermarks por view (introspecção: `heraclitus_state()`).
     pub fn watermarks(&self) -> &HashMap<String, Lsn> {
         &self.watermarks
+    }
+
+    /// Descarta os watermarks carregados do disco — OBRIGATÓRIO quando as views
+    /// ficam VAZIAS por se saltar o replay (`HERACLITUS_SKIP_VIEW_REPLAY` /
+    /// `LOG_ONLY`). Sem isto o registo fica a afirmar "tudo ≤ W já foi
+    /// aplicado" com as views vazias; um checkpoint (periódico ou de shutdown)
+    /// grava então snapshots VAZIOS sob esses watermarks altos, e como
+    /// `restore()` devolve `true` para um snapshot vazio-mas-presente, o
+    /// arranque seguinte mantinha o watermark e replayava só `(W, head]` —
+    /// TODOS os eventos ≤ W ficavam permanentemente invisíveis às views.
+    pub fn reset_watermarks(&mut self) {
+        self.watermarks.clear();
     }
 
     /// Minimum watermark across views (safe prune point for the memtable).

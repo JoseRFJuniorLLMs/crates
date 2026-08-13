@@ -107,8 +107,26 @@ impl AttrIndex {
             Bound::Excluded(v) => Bound::Excluded(CanonicalKeyCodec::encode_f64(v)),
             Bound::Unbounded => Bound::Unbounded,
         };
+        let (lo, hi) = (enc(min), enc(max));
+        // `BTreeMap::range` PANICA se o início for maior que o fim (ou se ambos
+        // forem Excluded e iguais). Uma query GQL de sintaxe VÁLIDA chega aqui
+        // com um intervalo vazio — p.ex. `WHERE n.v > 100 AND n.v < 10`. Como
+        // este código corre com o Mutex do índice de atributos BLOQUEADO, o
+        // panic ENVENENAVA-O: a partir daí todo `index_applied` falhava e o nó
+        // deixava de aceitar escritas até reiniciar. Intervalo vazio ⇒ zero
+        // resultados, que é a resposta correta.
+        let vazio = match (&lo, &hi) {
+            (Bound::Included(a), Bound::Included(b)) => a > b,
+            (Bound::Included(a), Bound::Excluded(b))
+            | (Bound::Excluded(a), Bound::Included(b))
+            | (Bound::Excluded(a), Bound::Excluded(b)) => a >= b,
+            _ => false,
+        };
+        if vazio {
+            return Vec::new();
+        }
         let mut out: Vec<Lsn> = by_value
-            .range((enc(min), enc(max)))
+            .range((lo, hi))
             .flat_map(|(_, postings)| postings.iter().copied())
             .collect();
         out.sort_unstable();
@@ -149,36 +167,43 @@ impl View for AttrIndex {
     }
 
     fn apply(&mut self, lsn: Lsn, event: &Episode) {
-        // Idempotente: replay e tail entregam LSNs estritamente crescentes.
-        if self.inner.applied && lsn <= self.inner.watermark {
-            return;
+        // Inserção ORDENADA com dedup por LSN (binary_search): torna o apply
+        // idempotente (replay que sobrepõe o watermark re-entrega LSNs já
+        // aplicados → skip) E tolerante a entregas fora de ordem (dois appends
+        // concorrentes podem indexar 6 antes de 5 — o guard antigo
+        // `lsn <= watermark → return` DESCARTAVA o 5 para sempre, um buraco
+        // silencioso na view). Mantém o invariante "postings em ordem crescente".
+        fn insert_sorted(v: &mut Vec<Lsn>, lsn: Lsn) {
+            if let Err(i) = v.binary_search(&lsn) {
+                v.insert(i, lsn);
+            }
         }
         for (field, value) in &event.attrs {
             let v = value.trim();
             if v.len() > MAX_VALUE_LEN || SKIP_VALUES.contains(&v.to_ascii_lowercase().as_str()) {
                 continue;
             }
-            self.inner
-                .exact
-                .entry(ikey(field, v))
-                .or_default()
-                .push(lsn);
+            insert_sorted(self.inner.exact.entry(ikey(field, v)).or_default(), lsn);
             // Valor numérico entra também no índice ordenado (range filtering).
             // Os SKIP_VALUES continuam de fora — "0"/"-1" ubíquos gerariam
             // postings gigantes sem poder discriminante.
             if let Ok(n) = v.parse::<f64>() {
                 if n.is_finite() {
-                    self.inner
-                        .numeric
-                        .entry(field.clone())
-                        .or_default()
-                        .entry(CanonicalKeyCodec::encode_f64(n))
-                        .or_default()
-                        .push(lsn);
+                    insert_sorted(
+                        self.inner
+                            .numeric
+                            .entry(field.clone())
+                            .or_default()
+                            .entry(CanonicalKeyCodec::encode_f64(n))
+                            .or_default(),
+                        lsn,
+                    );
                 }
             }
         }
-        self.inner.watermark = lsn;
+        // Watermark só avança (max): regressão persistida causaria re-replay —
+        // agora inócuo (idempotente), mas o avanço-só mantém a semântica exata.
+        self.inner.watermark = self.inner.watermark.max(lsn);
         self.inner.applied = true;
     }
 
@@ -228,6 +253,21 @@ mod tests {
         idx.apply(0, &e);
         idx.apply(0, &e); // replay sobreposto do MESMO lsn -> ignorado
         assert_eq!(idx.lookup("cnpj", "11222333000144"), &[0]);
+    }
+
+    #[test]
+    fn out_of_order_apply_indexes_both_events() {
+        // Appends concorrentes podem entregar 6 antes de 5 (o log atribui o LSN,
+        // mas o index_applied corre fora de qualquer guarda de ordem). O guard
+        // antigo `lsn <= watermark → return` DESCARTAVA o 5 para sempre — um
+        // buraco silencioso na view que nem o replay pós-restart cobria (o
+        // watermark persistido dizia 6). Ambos têm de ficar indexados, ordenados.
+        let mut idx = AttrIndex::new();
+        idx.apply(6, &ep("11222333000144", "OMEGA LTDA"));
+        idx.apply(5, &ep("11222333000144", "OMEGA LTDA")); // atrasado, fora de ordem
+        assert_eq!(idx.lookup("cnpj", "11222333000144"), &[5, 6]);
+        // E o watermark não regrediu.
+        assert_eq!(idx.watermark(), 6);
     }
 
     #[test]

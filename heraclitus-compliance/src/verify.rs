@@ -20,9 +20,25 @@ pub struct VerifiedTime {
     pub gen_unix_ms: u64,
 }
 
+/// `true` se os bytes são um token da autoridade de DESENVOLVIMENTO. Serve para
+/// distinguir "não consigo validar este formato" (um `.tst` RFC 3161 real) de
+/// "a assinatura não confere" (adulteração) — confundir os dois fazia a
+/// verificação reportar fraude em todos os recibos legítimos de produção.
+pub fn is_dev_token(token_der: &[u8]) -> bool {
+    DevToken::from_der(token_der).is_ok()
+}
+
 /// Verify a dev token against the expected SHA-256 imprint: the signature must
 /// be valid under the embedded TSA key, the hash algorithm must be SHA-256, and
 /// the stamped imprint must equal `expected_imprint`.
+///
+/// ⚠️ **Sem âncora de confiança.** A chave que valida a assinatura vem DE DENTRO
+/// do próprio token (`token.tsa_key`), por isso quem forjar um par de chaves
+/// produz um recibo que passa aqui. Isto deteta corrupção e adulteração
+/// acidental, NÃO um adversário. O `LocalTsa` gera uma chave nova a cada
+/// arranque (nem sequer há âncora estável para fixar) — é uma autoridade de
+/// desenvolvimento. Prova forense a sério exige encadear o certificado do
+/// signatário às raízes ICP-Brasil, que é o milestone seguinte.
 pub fn verify_dev_token(
     token_der: &[u8],
     expected_imprint: &[u8; 32],

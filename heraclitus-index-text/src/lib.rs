@@ -67,7 +67,10 @@ impl TextIndex {
                 score,
             })
             .collect();
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+        // Desempate por LSN: os scores saem de um HashMap (ordem de iteração
+        // aleatória por seed) — sem isto, docs com score igual entravam/saíam
+        // do top-k de forma não-determinística entre execuções.
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.lsn.cmp(&b.lsn)));
         hits.truncate(k);
         hits
     }
@@ -125,7 +128,10 @@ impl View for TextIndex {
     }
 
     fn apply(&mut self, lsn: Lsn, event: &Episode) {
-        self.watermark = lsn;
+        // Avanço-só: uma entrega fora de ordem (appends concorrentes) não pode
+        // regredir o watermark persistido — o replay pós-restart cobriria a
+        // lacuna e o dedup por `by_event` absorve a sobreposição.
+        self.watermark = self.watermark.max(lsn);
         if self.by_event.contains_key(&event.id) {
             return; // idempotent replay
         }

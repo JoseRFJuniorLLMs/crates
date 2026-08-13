@@ -235,21 +235,49 @@ impl FileRaftLog {
             Ok(f) => f,
             Err(_) => return Ok((entries, last_purged, 0, false)), // WAL ainda não existe
         };
+        let file_size = file
+            .metadata()
+            .map_err(|e| StorageError::from(StorageIOError::read_logs(io_err(e))))?
+            .len();
         let mut reader = BufReader::new(file);
+        let mut pos: u64 = 0;
         loop {
+            // Cauda torn vs corrupção a meio: uma cauda torn é um SUFIXO curto
+            // (o crash parou a meio do write_all) — o ficheiro acaba DENTRO do
+            // registo. Um registo cujos bytes estão TODOS presentes mas não
+            // decodificam é bit-rot/corrupção — truncar aí descartava em
+            // silêncio TODAS as entradas raft comprometidas a seguir (e
+            // marcadores Truncate/Purge). Falha-se alto, como no meta.bin.
+            if file_size - pos < 4 {
+                break; // EOF limpo, ou prefixo de comprimento torn (< 4 bytes)
+            }
             let mut len_buf = [0u8; 4];
-            match reader.read_exact(&mut len_buf) {
-                Ok(()) => {}
-                Err(_) => break, // EOF ou cauda torn no prefixo de comprimento
-            }
+            reader
+                .read_exact(&mut len_buf)
+                .map_err(|e| StorageError::from(StorageIOError::read_logs(io_err(e))))?;
             let len = u32::from_le_bytes(len_buf) as usize;
-            let mut payload = vec![0u8; len];
-            if reader.read_exact(&mut payload).is_err() {
-                break; // cauda torn no payload — descarta este registo incompleto
+            if (len as u64) > file_size - pos - 4 {
+                break; // registo declarado além do EOF — cauda torn genuína
             }
+            // Alocação LIMITADA pelos bytes que restam no ficheiro (nunca pelo
+            // prefixo cru — um prefixo corrompido não pode pedir 4 GiB).
+            let mut payload = vec![0u8; len];
+            reader
+                .read_exact(&mut payload)
+                .map_err(|e| StorageError::from(StorageIOError::read_logs(io_err(e))))?;
             let rec: LogRecord = match bincode::serde::decode_from_slice(&payload, BINCODE_CFG) {
                 Ok((r, _)) => r,
-                Err(_) => break, // registo corrupto no fim — para o replay
+                Err(e) => {
+                    // Payload completo que não decodifica = corrupção a meio do
+                    // WAL. Recusar arrancar (o operador limpa o dir e o nó
+                    // re-replica dos pares) em vez de perder entradas em silêncio.
+                    return Err(StorageError::from(StorageIOError::read_logs(io_err(
+                        format!(
+                            "registo corrupto no WAL raft (offset {pos}, {len} bytes): {e}; \
+                             recuso truncar — apagar o diretório raft e re-replicar"
+                        ),
+                    ))));
+                }
             };
             match rec {
                 LogRecord::Insert(e) => {
@@ -277,7 +305,8 @@ impl FileRaftLog {
                     last_purged = Some(log_id);
                 }
             }
-            valid_len += 4 + len as u64;
+            pos += 4 + len as u64;
+            valid_len = pos;
         }
         Ok((entries, last_purged, valid_len, saw_compaction))
     }
@@ -522,5 +551,41 @@ mod tests {
         append(&mut log, vec![entry(3, 1, "c")]).await;
         let mut log2 = FileRaftLog::open(dir.path()).unwrap();
         assert_eq!(log2.get_log_state().await.unwrap().last_log_id.unwrap().index, 3);
+    }
+
+    #[tokio::test]
+    async fn midfile_corruption_fails_loud_instead_of_truncating() {
+        // Durabilidade raft: bit-rot num registo A MEIO do WAL não pode ser
+        // tratado como cauda torn — truncar aí descartava em silêncio todas as
+        // entradas COMPROMETIDAS a seguir. O open tem de recusar arrancar
+        // (como já faz com meta.bin corrupto), preservando o ficheiro intacto.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut log = FileRaftLog::open(dir.path()).unwrap();
+            append(
+                &mut log,
+                vec![entry(1, 1, "a"), entry(2, 1, "b"), entry(3, 1, "c")],
+            )
+            .await;
+        }
+        let wal_path = dir.path().join("entries.wal");
+        let before = std::fs::metadata(&wal_path).unwrap().len();
+        // Corrompe o discriminante do enum do 1.º registo (primeiro byte do
+        // payload, offset 4): o payload continua COMPLETO (len intacto) mas o
+        // decode falha garantidamente (variante inválida) — e os registos 2 e 3,
+        // comprometidos, ficam depois do ponto corrupto.
+        {
+            let mut f = OpenOptions::new().read(true).write(true).open(&wal_path).unwrap();
+            f.seek(SeekFrom::Start(4)).unwrap();
+            f.write_all(&[0xFF]).unwrap();
+            f.sync_all().unwrap();
+        }
+        // Recusa alto — nada de truncar entradas comprometidas em silêncio.
+        assert!(
+            FileRaftLog::open(dir.path()).is_err(),
+            "open devia falhar com corrupção a meio do WAL"
+        );
+        // E o ficheiro NÃO foi truncado (os dados ficam para forense/recuperação).
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), before);
     }
 }

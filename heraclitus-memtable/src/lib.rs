@@ -42,6 +42,12 @@ impl Memtable {
             self.adjacency.entry(*parent).or_default().push(episode.id);
         }
         entries.push_back((lsn, episode));
+        // INVARIANTE (auditoria 2026-07): a evicção por contagem só é segura
+        // porque o engine aplica as views SINCRONAMENTE no mesmo
+        // `index_applied` — tudo o que sai daqui já está indexado. Se as views
+        // voltarem a ser assíncronas (o desenho original do §3.4), esta
+        // evicção TEM de passar a respeitar o watermark (só evictar ≤ wm),
+        // senão perde-se read-your-own-writes.
         while entries.len() > self.cap {
             if let Some((_, evicted)) = entries.pop_front() {
                 self.forget_adjacency(&evicted);
@@ -166,10 +172,13 @@ pub fn merge_hits(
         }
     }
     let mut out: Vec<ScoredHit> = best.into_values().collect();
+    // Desempate por LSN (único por hit após o dedup): `best` é um HashMap e a
+    // ordem de iteração é aleatória — empates de score cortados pelo truncate
+    // variavam entre execuções.
     if ascending {
-        out.sort_by(|a, b| a.score.total_cmp(&b.score));
+        out.sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.lsn.cmp(&b.lsn)));
     } else {
-        out.sort_by(|a, b| b.score.total_cmp(&a.score));
+        out.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.lsn.cmp(&b.lsn)));
     }
     out.truncate(k);
     out

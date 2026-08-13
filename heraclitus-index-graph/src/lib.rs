@@ -206,7 +206,7 @@ impl View for GraphIndex {
         // Audit #9: idempotent replay must bail out entirely — continuing
         // would duplicate adjacency rows and index a wrong internal id.
         if self.dense.lookup_id(&event.id).is_some() {
-            self.watermark = lsn;
+            self.watermark = self.watermark.max(lsn); // avanço-só (entrega fora de ordem)
             return;
         }
         let internal = self.dense.get_or_alloc(event.id);
@@ -221,7 +221,7 @@ impl View for GraphIndex {
                 .or_default()
                 .insert(internal);
         }
-        self.watermark = lsn;
+        self.watermark = self.watermark.max(lsn); // avanço-só (entrega fora de ordem)
     }
 
     fn watermark(&self) -> Lsn {

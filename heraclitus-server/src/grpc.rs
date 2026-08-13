@@ -27,7 +27,7 @@ fn episode_json(lsn: u64, e: &Episode) -> String {
         "id": e.id.to_string(),
         "agent_id": e.agent_id,
         "kind": format!("{:?}", e.kind),
-        "content": String::from_utf8_lossy(&e.content),
+        "content": crate::rest::bytes_str(&e.content),
         "attrs": e.attrs,
         "ts_hlc": e.ts_hlc,
     })
@@ -135,7 +135,27 @@ impl pb::heraclitus_server::Heraclitus for Service {
             // re-reading history by LSN — gap-free, never silent drops.
             let mut next = from;
             'catchup: loop {
-                while let Ok(batch) = engine.log.scan(next, next + 256) {
+                loop {
+                    // `log.scan` é BLOQUEANTE (abre e lê ficheiros de segmento).
+                    // Chamá-lo direto aqui estagnava um worker do reactor durante
+                    // todo o catch-up de histórico de um subscritor (milhares de
+                    // leituras em disco num log grande) — mesma classe já corrigida
+                    // em rest.rs. Fora para a pool bloqueante; `saturating_add`
+                    // impede overflow de um `from_lsn` absurdo (u64::MAX).
+                    let engine_scan = engine.clone();
+                    let start = next;
+                    let batch = match tokio::task::spawn_blocking(move || {
+                        engine_scan.log.scan(start, start.saturating_add(256))
+                    })
+                    .await
+                    {
+                        Ok(Ok(b)) => b,
+                        // Erro de scan: como o `while let Ok` original, desiste do
+                        // histórico e passa ao tail ao vivo.
+                        Ok(Err(_)) => break,
+                        // Task bloqueante abortada (shutdown): encerra o stream.
+                        Err(_) => return,
+                    };
                     if batch.is_empty() {
                         break;
                     }

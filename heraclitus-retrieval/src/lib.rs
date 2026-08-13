@@ -35,7 +35,10 @@ pub fn rrf_fuse(lists: &[Vec<EventId>]) -> Vec<(EventId, f64)> {
         }
     }
     let mut out: Vec<(EventId, f64)> = scores.into_iter().collect();
-    out.sort_by(|a, b| b.1.total_cmp(&a.1));
+    // Desempate determinístico por EventId: os candidatos vêm de um HashMap, e
+    // empates de RRF (comuns) ficariam em ordem de iteração não-determinística
+    // (seed do SipHash) ⇒ o corte RECALL_N e o top-k variavam entre execuções.
+    out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     out
 }
 

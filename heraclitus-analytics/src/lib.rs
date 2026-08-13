@@ -145,9 +145,17 @@ impl LogAnalytics {
     /// Executa SQL sobre `events` e devolve as linhas como `Vec` de objetos
     /// JSON (uma chave por coluna). A fonte é imutável — isto é read-only.
     pub async fn sql(&self, query: &str) -> Result<Vec<serde_json::Value>, AnalyticsError> {
+        // SÓ leitura, imposto (não só documentado): sem SQLOptions, o `sql()`
+        // do DataFusion aceita DDL/DML/statements — p.ex. `CREATE EXTERNAL
+        // TABLE ... LOCATION '/qualquer/ficheiro'` lia ficheiros arbitrários do
+        // servidor através de um endpoint "read-only".
+        let opts = datafusion::execution::context::SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false);
         let df = self
             .ctx
-            .sql(query)
+            .sql_with_options(query, opts)
             .await
             .map_err(|e| AnalyticsError::Sql(e.to_string()))?;
         let batches = df
@@ -216,5 +224,27 @@ mod tests {
             .unwrap();
         assert_eq!(cols[0]["kind"], "Observation");
         assert_eq!(cols[0]["valid_from"], 0);
+    }
+
+    #[tokio::test]
+    async fn sql_refuses_ddl_dml_and_statements() {
+        // O endpoint é read-only IMPOSTO: sem isto, `CREATE EXTERNAL TABLE ...
+        // LOCATION` lia ficheiros arbitrários do servidor via /sql.
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+        log.append(Episode::new("a", EventKind::Observation, b"x".to_vec()))
+            .unwrap();
+        let a = LogAnalytics::from_log(&log, None).unwrap();
+
+        for bad in [
+            "CREATE EXTERNAL TABLE pwn STORED AS CSV LOCATION '/etc/passwd'",
+            "CREATE TABLE t AS SELECT * FROM events",
+            "INSERT INTO events VALUES (1)",
+            "SET datafusion.execution.batch_size = 1",
+        ] {
+            assert!(a.sql(bad).await.is_err(), "devia recusar: {bad}");
+        }
+        // E o SELECT legítimo continua a funcionar.
+        assert!(a.sql("SELECT COUNT(*) AS n FROM events").await.is_ok());
     }
 }

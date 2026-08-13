@@ -35,7 +35,7 @@ pub use commit::{commit_at, commit_now, current_watermark, Commitment};
 pub use receipt::{load_manifest, read_token, LegalReceipt};
 pub use signer::{InstitutionalSignature, InstitutionalSigner, Pkcs11Signer, SoftKeySigner};
 pub use tsa::{HttpTsa, LocalTsa, TsaClient};
-pub use verify::{verify_dev_token, VerifiedTime};
+pub use verify::{is_dev_token, verify_dev_token, VerifiedTime};
 pub use worker::{run_worker, tick};
 
 use heraclitus_core::Lsn;
@@ -147,7 +147,22 @@ pub fn verify_receipt(
         )));
     }
     let token = receipt::read_token(receipts_dir, receipt)?;
-    verify_dev_token(&token, &imprint)
+    // Distinguir "não consigo validar" de "fraude". `verify_dev_token` só sabe
+    // ler o token da autoridade de DESENVOLVIMENTO; um `.tst` RFC 3161 real
+    // (modo HttpTsa, produção) nunca descodifica como DevToken, e antes isso
+    // devolvia o mesmo erro de uma assinatura adulterada — ou seja, TODOS os
+    // recibos legítimos de produção eram reportados como fraude. O commitment
+    // (que é o que prova que o log não mudou) JÁ foi verificado acima.
+    match verify_dev_token(&token, &imprint) {
+        Ok(v) => Ok(v),
+        Err(e) if !verify::is_dev_token(&token) => Err(CompError::Verify(format!(
+            "commitment CONFERE (o log não foi alterado no LSN {}), mas o token é um \
+             RFC 3161 real e a validação da cadeia de confiança (ICP-Brasil) ainda não \
+             está implementada — isto NÃO é uma deteção de fraude. Detalhe: {e}",
+            receipt.lsn
+        ))),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]

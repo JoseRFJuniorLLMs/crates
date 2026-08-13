@@ -68,8 +68,15 @@ impl ActivationRecord {
                 oldest_recent_age.min(life),
                 life.max(oldest_recent_age + 1.0),
             );
-            let tail =
-                ((self.n - k) as f64) * (l.powf(1.0 - d) - h.powf(1.0 - d)) / ((1.0 - d) * (l - h));
+            // Caso d == 1.0: (l^(1-d) - h^(1-d))/(1-d) é 0/0; o limite correto é
+            // ln(l) - ln(h). Sem isto o NaN era mascarado por max(0.0) e a cauda
+            // contribuía 0 em silêncio — score errado para todo item longevo.
+            let tail_num = if (1.0 - d).abs() < 1e-12 {
+                l.ln() - h.ln()
+            } else {
+                (l.powf(1.0 - d) - h.powf(1.0 - d)) / (1.0 - d)
+            };
+            let tail = ((self.n - k) as f64) * tail_num / (l - h);
             sum += tail.max(0.0);
         }
         sum
@@ -127,7 +134,9 @@ impl ActivationStore {
                 score: e.value().score(now_secs, self.decay) as f32,
             })
             .collect();
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+        // Desempate por id: o DashMap itera em ordem aleatória — o conjunto
+        // top-k com scores empatados variava entre execuções.
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
         hits.truncate(k);
         hits
     }
@@ -234,7 +243,12 @@ impl View for ActivationStore {
     /// episode's own HLC timestamp, never the wall clock.
     fn apply(&mut self, lsn: Lsn, event: &Episode) {
         self.touch(event.id, event.ts_hlc >> 16); // physical millis -> stable seconds-ish unit
-        self.watermark = lsn;
+        // Avanço-só: dois appends concorrentes aplicam-se fora de ordem (o
+        // `index_applied` não tranca as views atomicamente), e um insert cru
+        // regredia este watermark. Persistido no snapshot, ficava a mentir
+        // sobre o que a view cobre — e esta view NÃO é idempotente (`touch`
+        // conta cada acesso), pelo que um re-replay contaria duas vezes.
+        self.watermark = self.watermark.max(lsn);
     }
 
     fn watermark(&self) -> Lsn {
@@ -297,5 +311,26 @@ mod tests {
             let rel = ((approx - exact) / exact).abs();
             prop_assert!(rel < 0.05, "relative error {rel} (approx {approx}, exact {exact})");
         }
+    }
+}
+
+#[cfg(test)]
+mod watermark_order_tests {
+    use super::*;
+    use heraclitus_core::{Episode, EventKind};
+    use heraclitus_views::View;
+
+    /// Entrega FORA DE ORDEM (dois appends concorrentes indexam 6 antes de 5)
+    /// não pode regredir o watermark: ele é persistido no checkpoint e esta
+    /// view não é idempotente — um re-replay contaria o acesso duas vezes.
+    #[test]
+    fn out_of_order_apply_does_not_regress_watermark() {
+        let mut s = ActivationStore::default();
+        let e6 = Episode::new("a", EventKind::Observation, b"six".to_vec());
+        let e5 = Episode::new("a", EventKind::Observation, b"five".to_vec());
+        s.apply(6, &e6);
+        assert_eq!(s.watermark(), 6);
+        s.apply(5, &e5); // chega atrasado
+        assert_eq!(s.watermark(), 6, "watermark regrediu com entrega fora de ordem");
     }
 }

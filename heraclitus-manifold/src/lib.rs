@@ -148,6 +148,12 @@ pub fn dist_hyp(u: &[f32], v: &[f32], c: f64) -> f64 {
     }
     let denom = (1.0 - c * nu * nu) * (1.0 - c * nv * nv); // > 0 by the clamp above
     let arg = 1.0 + (2.0 * c * diff2 / denom);
+    // Guarda anti-NaN: um embedding com NaN dava arg=NaN, e NaN.max(1.0) == 1.0
+    // em Rust → acosh(1) = 0 → o vetor corrompido ficava a distância ZERO de
+    // tudo (vizinho mais próximo universal). Não-finito = infinitamente longe.
+    if !arg.is_finite() {
+        return f64::INFINITY;
+    }
     (1.0 / c.sqrt()) * arg.max(1.0).acosh()
 }
 

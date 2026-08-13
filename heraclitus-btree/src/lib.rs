@@ -968,9 +968,18 @@ impl DiskNode {
 
                 let version_count = read_u32(data, pos)? as usize;
                 pos += 4;
-                let mut msg_vec = Vec::with_capacity(version_count);
+                // Pré-alocação LIMITADA pelos bytes restantes (cada versão ocupa
+                // ≥ 9 bytes): um u32 corrompido no disco não pode pedir GiBs de
+                // capacidade — o loop abaixo falha com `?` no primeiro read.
+                let bound = data.len().saturating_sub(pos) / 9;
+                let mut msg_vec = Vec::with_capacity(version_count.min(bound));
                 for _ in 0..version_count {
-                    let m_type = data[pos];
+                    let m_type = *data.get(pos).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "m_type fora dos limites da página física",
+                        )
+                    })?;
                     pos += 1;
                     let m_lsn = read_u64(data, pos)?;
                     pos += 8;
@@ -1176,7 +1185,16 @@ impl BEpsilonTree {
         })
     }
 
+    /// Materializa EXATAMENTE `map` em `path` — é um snapshot de estado, não um
+    /// delta. Abrir a árvore existente e só fazer upsert (como antes) deixava lá
+    /// as chaves que já não estão no mapa: um `POST /hvm/checkpoint` depois de um
+    /// `hvm/delete` RESSUSCITAVA o registo apagado no checkpoint durável,
+    /// respondendo `{"ok":true}`. O ficheiro anterior é descartado para o estado
+    /// resultante ser função só do mapa recebido.
     pub fn from_map(path: &Path, map: BTreeMap<Key, Val>) -> io::Result<Self> {
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
         let mut t = Self::open(path, 1000, 128)?;
         for (k, v) in map {
             t.upsert(k, v)?;

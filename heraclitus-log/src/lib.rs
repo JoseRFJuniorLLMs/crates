@@ -302,6 +302,9 @@ pub struct Log {
     tail_tx: broadcast::Sender<(Lsn, Arc<Episode>)>,
     cmd_tx: crossbeam_channel::Sender<LogCommand>,
     keystore: Option<Arc<KeyStore>>,
+    /// Serializa (carimbo HLC + entrada na fila) para que a ordem de `ts` seja a
+    /// mesma dos LSNs — contrato de que a busca binária do AS OF TIMESTAMP depende.
+    stamp_lock: std::sync::Mutex<()>,
 }
 
 fn sync_parent_dir(dir: &Path) -> Result<(), HeraclitusError> {
@@ -364,6 +367,31 @@ impl Log {
             // a monotonicidade de ts por LSN (o contrato do AS OF TIMESTAMP).
             hlc.observe(scan.max_hlc);
             if scan.corruption_detected || scan.valid_len < scan.file_len {
+                // Uma cauda torn (crash a meio de uma escrita) só é legítima no
+                // segmento ATIVO — o último. Num segmento ANTERIOR, que já estava
+                // completo e normalmente selado, um registo ilegível é BIT ROT, e
+                // truncar era catastrófico e silencioso: (1) apagava para sempre
+                // todos os registos a seguir ao ponto corrompido, (2) o ramo de
+                // re-selagem reescrevia a raiz Merkle só sobre os sobreviventes,
+                // fazendo `verify_segment` responder `valid: true` — a prova de
+                // adulteração era DESTRUÍDA em vez de reportada — e (3) ficava uma
+                // LACUNA de LSN (o segmento seguinte mantém o seu base_lsn), pelo
+                // que views reconstruídas do LSN 0 e leituras AS OF passavam a ver
+                // um histórico com buraco. `Log::open` devolvia `Ok`.
+                // Mesma política já aplicada ao WAL do raft (durable.rs): falhar
+                // alto e preservar o ficheiro para perícia/restauro.
+                if !is_last {
+                    return Err(HeraclitusError::Corruption {
+                        context: format!("segmento {id} ({})", path.display()),
+                        detail: format!(
+                            "registo ilegível no offset {} de um segmento NÃO-ativo \
+                             (bit rot / falha de hardware). Recuso truncar: perderia os \
+                             registos seguintes e reescreveria a raiz Merkle sobre o que \
+                             sobrasse. Restaure este segmento de backup ou de uma réplica.",
+                            scan.valid_len
+                        ),
+                    });
+                }
                 execute_physical_repair(&path, scan.valid_len)?;
             }
 
@@ -520,7 +548,7 @@ impl Log {
                 let mut active = active_state;
                 let mut current_lsn = initial_lsn;
                 let mut batch = Vec::with_capacity(128);
-                let mut stashed_updates = Vec::with_capacity(128);
+                let mut stashed_updates: Vec<StashedUpdate> = Vec::with_capacity(128);
                 let mut stashed_flushes = Vec::with_capacity(32);
 
                 let mut scratch_buffer = Vec::with_capacity(262144);
@@ -530,6 +558,11 @@ impl Log {
                     batch.clear();
                     stashed_updates.clear();
                     stashed_flushes.clear();
+                    // Início (em `stashed_updates`) das entradas que ainda
+                    // pertencem ao segmento ATIVO. Tudo antes disto já foi
+                    // publicado no catálogo e selado num segmento anterior por
+                    // um roll a meio do lote.
+                    let mut pending_index_start = 0usize;
 
                     let first_cmd = match cmd_rx.recv() {
                         Ok(cmd) => cmd,
@@ -664,6 +697,44 @@ impl Log {
                                 );
 
                                 if active.bytes_written + record.len() as u64 > segment_max_bytes {
+                                    // CORREÇÃO DE PERDA NO ROLL: publicar no
+                                    // catálogo as entradas deste lote que
+                                    // pertencem ao segmento prestes a ser
+                                    // SELADO. `roll_segment` sela com
+                                    // `catalog.active.index`; sem isto o
+                                    // segmento ficava com um índice INCOMPLETO
+                                    // (os registos já escritos neste lote
+                                    // desapareciam) e, pior, a FASE 4 colava-os
+                                    // depois ao segmento NOVO com offsets do
+                                    // ficheiro ANTIGO — seeks para o sítio
+                                    // errado. Media-se ~1 registo perdido por
+                                    // roll.
+                                    if pending_index_start < stashed_updates.len() {
+                                        let cat = worker_catalog.load();
+                                        let mut entries =
+                                            Vec::with_capacity(cat.active.index.entries.len()
+                                                + (stashed_updates.len() - pending_index_start));
+                                        entries.extend_from_slice(&cat.active.index.entries);
+                                        for u in &stashed_updates[pending_index_start..] {
+                                            entries.push(LsnEntry {
+                                                lsn: u.lsn,
+                                                offset: u.offset,
+                                                opaque_meta: u.opaque_meta,
+                                            });
+                                        }
+                                        let mut meta = cat.active.meta.clone();
+                                        meta.max_lsn = active.max_lsn;
+                                        worker_catalog.store(Arc::new(LogCatalog {
+                                            sealed: cat.sealed.clone(),
+                                            active: Arc::new(SegmentContainer {
+                                                meta,
+                                                index: Arc::new(SegmentIndex {
+                                                    entries: Arc::new(entries),
+                                                }),
+                                            }),
+                                        }));
+                                        pending_index_start = stashed_updates.len();
+                                    }
                                     if let Err(e) = roll_segment(
                                         &worker_dir,
                                         &mut active,
@@ -763,25 +834,30 @@ impl Log {
                     }
 
                     // PIPELINE — FASE 4: COW ATOMIZADO NO SEGMENTO ATIVO (Splat-Free Completo)
-                    let mut highest_committed_lsn_in_batch = None;
+                    // O `committed_lsn` cobre o lote INTEIRO, inclusive os
+                    // registos já publicados antes de um roll a meio — por isso
+                    // sai de `stashed_updates` completo, e não do sub-lote que
+                    // ainda falta indexar.
+                    let highest_committed_lsn_in_batch = stashed_updates.last().map(|u| u.lsn);
 
-                    if !stashed_updates.is_empty() {
+                    if pending_index_start < stashed_updates.len() {
                         let current_catalog = worker_catalog.load();
                         let old_active_container = &current_catalog.active;
 
-                        // Alocação incremental restrita estritamente ao tamanho do novo lote
+                        // Só as entradas do segmento ATIVO (as anteriores a um
+                        // roll já foram publicadas e seladas com ele).
+                        let tail = &stashed_updates[pending_index_start..];
                         let mut updated_entries = Vec::with_capacity(
-                            old_active_container.index.entries.len() + stashed_updates.len(),
+                            old_active_container.index.entries.len() + tail.len(),
                         );
                         updated_entries.extend_from_slice(&old_active_container.index.entries);
 
-                        for update in &stashed_updates {
+                        for update in tail {
                             updated_entries.push(LsnEntry {
                                 lsn: update.lsn,
                                 offset: update.offset,
                                 opaque_meta: update.opaque_meta,
                             });
-                            highest_committed_lsn_in_batch = Some(update.lsn);
                         }
 
                         let mut updated_meta = old_active_container.meta.clone();
@@ -863,6 +939,7 @@ impl Log {
             tail_tx,
             cmd_tx,
             keystore,
+            stamp_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -930,12 +1007,24 @@ impl Log {
         if lsn >= catalog.active.meta.base_lsn {
             let active_container = &catalog.active;
             let offset_idx = (lsn - active_container.meta.base_lsn) as usize;
+            // O atalho O(1) assume o índice DENSO (`entries[i].lsn == base_lsn+i`).
+            // Essa invariante NÃO se verifica com appends concorrentes + roll de
+            // segmento (repro: 8 threads, segmentos pequenos → entry.lsn=16 na
+            // posição do LSN 19). O `debug_assert_eq!` que a protegia é compilado
+            // FORA em release, portanto produção devolvia SILENCIOSAMENTE o
+            // episódio errado. Agora confirma-se o LSN e, se não bater, procura-se
+            // a sério (as entradas são gravadas por ordem de LSN).
             if let Some(entry) = active_container.index.entries.get(offset_idx) {
-                // INVARIANTE FRACA PROTEGIDA: Auditoria rigorosa de linearidade de índice contíguo
-                debug_assert_eq!(
-                    entry.lsn,
-                    active_container.meta.base_lsn + (offset_idx as u64)
-                );
+                if entry.lsn == lsn {
+                    return self.read_at(active_container.meta.id, entry.offset);
+                }
+            }
+            if let Ok(j) = active_container
+                .index
+                .entries
+                .binary_search_by_key(&lsn, |e| e.lsn)
+            {
+                let entry = &active_container.index.entries[j];
                 return self.read_at(active_container.meta.id, entry.offset);
             }
         } else {
@@ -956,8 +1045,17 @@ impl Log {
             if let Some(i) = idx {
                 let container = &catalog.sealed[i];
                 let offset_idx = (lsn - container.meta.base_lsn) as usize;
+                // Mesma correção do container ativo: o acesso posicional só vale
+                // se o índice for denso — confirmar o LSN e, caso contrário,
+                // localizar a entrada por busca binária em vez de devolver o
+                // registo errado (ou panicar em debug).
                 if let Some(entry) = container.index.entries.get(offset_idx) {
-                    debug_assert_eq!(entry.lsn, container.meta.base_lsn + (offset_idx as u64));
+                    if entry.lsn == lsn {
+                        return self.read_at(container.meta.id, entry.offset);
+                    }
+                }
+                if let Ok(j) = container.index.entries.binary_search_by_key(&lsn, |e| e.lsn) {
+                    let entry = &container.index.entries[j];
                     return self.read_at(container.meta.id, entry.offset);
                 }
             }
@@ -1051,6 +1149,14 @@ impl Log {
         let catalog = self.catalog.load();
 
         while scan_lsn < effective_to && out.len() < max {
+            // GARANTIA DE TERMINAÇÃO: o loop interno tem vários `break` que NÃO
+            // avançam o cursor (footer, EOF, read_exact falhado, `scan_lsn >
+            // max_lsn`). Todos devolviam ao loop externo, que reescolhia o MESMO
+            // container e refazia o mesmo seek/leitura — scan infinito a queimar
+            // CPU. Guardar o cursor no início de cada iteração e forçar +1 se não
+            // houver progresso torna a terminação independente de qualquer
+            // inconsistência de metadados do segmento.
+            let scan_lsn_at_iter_start = scan_lsn;
             let container = if scan_lsn >= catalog.active.meta.base_lsn {
                 Some(&catalog.active)
             } else {
@@ -1075,7 +1181,15 @@ impl Log {
 
                 // FRONTEIRA VALIDADA: Impede leituras trans-segmento inconsistentes ou transições inválidas
                 if offset_idx >= container.index.entries.len() {
-                    scan_lsn = container.meta.max_lsn + 1;
+                    // PROGRESSO ESTRITO (obrigatório): `max_lsn + 1` só avança se
+                    // for MAIOR que o `scan_lsn` atual. Havendo uma lacuna de LSN
+                    // entre segmentos (o `binary_search` volta a escolher ESTE
+                    // container porque o seguinte tem `base_lsn > scan_lsn`), o
+                    // salto repunha o mesmo valor e o `while` girava para sempre —
+                    // scan infinito a queimar CPU, alcançável a partir do replay
+                    // de boot (`ViewRegistry::catch_up`) e do `subscribe`.
+                    let next = container.meta.max_lsn.saturating_add(1);
+                    scan_lsn = if next > scan_lsn { next } else { scan_lsn + 1 };
                     continue;
                 }
 
@@ -1143,15 +1257,49 @@ impl Log {
                                     out.push((rlsn, ep));
                                     scan_lsn += 1;
                                 } else {
-                                    scan_lsn = scan_lsn.max(rlsn + 1);
+                                    // PROGRESSO ESTRITO: sem o `+1` mínimo, um
+                                    // registo cujo LSN esteja ATRÁS do `scan_lsn`
+                                    // deixava o cursor no mesmo sítio; o `break`
+                                    // devolvia ao loop externo, que reescolhia o
+                                    // mesmo container, fazia seek ao mesmo offset
+                                    // e relia o MESMO registo — scan infinito a
+                                    // queimar CPU (o `continue` a seguir salta o
+                                    // `scan_lsn += 1` de fallback). Alcançável do
+                                    // replay de boot e do subscribe.
+                                    scan_lsn = rlsn.saturating_add(1).max(scan_lsn + 1);
                                     break;
                                 }
                             }
                             _ => {
-                                scan_lsn += 1;
-                                break;
+                                // Um registo que não descodifica DENTRO do
+                                // intervalo comprometido é corrupção (CRC-32C
+                                // violado / bit rot) — nunca uma cauda torn, que
+                                // fica acima do `committed_lsn` e por isso fora
+                                // do `effective_to`. Antes saltava-se o LSN em
+                                // silêncio e devolvia-se `Ok`, enquanto
+                                // `Log::read` do MESMO LSN devolvia `Corruption`:
+                                // os dois caminhos de leitura discordavam, e como
+                                // `catch_up`/`rebuild`/replay do H-VM usam o scan,
+                                // as views eram reconstruídas SEM o episódio, sem
+                                // erro, sem métrica, sem tracing — contra o
+                                // contrato de heraclitus-core/src/error.rs
+                                // ("`Corruption` is never silently swallowed").
+                                return Err(HeraclitusError::Corruption {
+                                    context: format!("Segmento: {}", container.meta.id),
+                                    detail: format!(
+                                        "registo ilegível no LSN {scan_lsn} durante o scan \
+                                         (CRC-32C violado?) — recuso devolver um histórico \
+                                         com buracos silenciosos"
+                                    ),
+                                });
                             }
                         }
+                    }
+                    // Progresso obrigatório: se o loop interno saiu por um `break`
+                    // que não moveu o cursor, avança 1 (salta o LSN problemático)
+                    // em vez de reprocessar o mesmo container para sempre.
+                    if scan_lsn == scan_lsn_at_iter_start {
+                        scan_lsn += 1;
                     }
                     continue;
                 }
@@ -1250,9 +1398,22 @@ impl Log {
     /// estrita de ts por LSN é o contrato de que `lsn_for_timestamp` (AS OF
     /// TIMESTAMP) depende. `opaque_meta` transporta o `EventId` (Ulid, 16 bytes)
     /// para reconstrução do `id` na leitura.
-    pub fn append(&self, mut episode: Episode) -> Result<Lsn, HeraclitusError> {
-        episode.ts_hlc = self.hlc.now();
-        self.enqueue_append(episode, None, "append")
+    pub fn append(&self, episode: Episode) -> Result<Lsn, HeraclitusError> {
+        self.enqueue_append_inner(episode, None, "append", true)
+            .map(|(lsn, _)| lsn)
+    }
+
+    /// Como [`Log::append`], mas devolve TAMBÉM o episódio com o `ts_hlc` já
+    /// carimbado. Quem indexa views derivadas TEM de usar esta versão: indexar
+    /// a cópia pré-carimbo mete `ts_hlc = 0` nas views enquanto o log guarda o
+    /// valor real, e a view reconstruída do LSN 0 (que lê o log) fica DIFERENTE
+    /// da view viva — quebra do invariante I6. A `activation`, por exemplo, usa
+    /// `ts_hlc >> 16` como instante de acesso.
+    pub fn append_stamped(&self, episode: Episode) -> Result<(Lsn, Episode), HeraclitusError> {
+        let mut copia = episode.clone();
+        let (lsn, ts) = self.enqueue_append_inner(episode, None, "append", true)?;
+        copia.ts_hlc = ts; // o carimbo real, feito dentro da secção crítica
+        Ok((lsn, copia))
     }
 
     /// Append com compare-and-append (OCC): só grava se o head do log for
@@ -1260,7 +1421,8 @@ impl Log {
     /// Carimba o `ts_hlc` como `append`.
     pub fn append_cas(&self, expected: Lsn, mut episode: Episode) -> Result<Lsn, HeraclitusError> {
         episode.ts_hlc = self.hlc.now();
-        self.enqueue_append(episode, Some(expected), "append_cas")
+        self.enqueue_append_inner(episode, Some(expected), "append_cas", true)
+            .map(|(lsn, _)| lsn)
     }
 
     /// Aplicação replicada (follower): grava a entrada do líder na posição exata
@@ -1295,26 +1457,60 @@ impl Log {
         expected_lsn: Option<Lsn>,
         ctx: &str,
     ) -> Result<Lsn, HeraclitusError> {
+        self.enqueue_append_inner(episode, expected_lsn, ctx, false)
+            .map(|(lsn, _)| lsn)
+    }
+
+    /// Devolve `(lsn, ts_hlc)`. Com `stamp = true` o carimbo HLC é feito AQUI,
+    /// dentro da secção crítica que também enfileira o comando.
+    ///
+    /// Porquê: o `ts` era carimbado no chamador e só DEPOIS a mensagem entrava no
+    /// canal, mas é o worker (FIFO) que atribui o LSN. Dois appends concorrentes
+    /// podiam então inverter-se — o que carimbou primeiro entrava na fila depois
+    /// e ficava com um LSN maior E um ts menor. Medido: **69 inversões em 1200
+    /// registos (5,75%)**. Como `lsn_for_timestamp` (AS OF TIMESTAMP) faz BUSCA
+    /// BINÁRIA assumindo ts monotónico por LSN, operava sobre dados desordenados
+    /// e devolvia snapshots errados. Carimbar dentro do lock que enfileira torna
+    /// a ordem de `ts` igual à ordem de chegada à fila — e portanto à dos LSNs.
+    /// A secção crítica é minúscula (um tick do HLC + um `send`); a espera pela
+    /// resposta fica DE FORA, para não serializar as escritas.
+    fn enqueue_append_inner(
+        &self,
+        mut episode: Episode,
+        expected_lsn: Option<Lsn>,
+        ctx: &str,
+        stamp: bool,
+    ) -> Result<(Lsn, u64), HeraclitusError> {
         self.check_poison()?;
         let (tx, rx) = crossbeam_channel::bounded(1);
         let opaque_meta = episode.id.0.to_bytes();
-        self.cmd_tx
-            .send_timeout(
-                LogCommand::Append {
-                    opaque_meta,
-                    episode: Arc::new(episode),
-                    expected_lsn,
-                    resp_tx: tx,
-                },
-                std::time::Duration::from_secs(10),
-            )
-            .map_err(|_| {
-                HeraclitusError::StorageEngine(format!(
-                    "Timeout de canal: pipeline saturado ({ctx})"
-                ))
-            })?;
-        rx.recv()
-            .map_err(|_| HeraclitusError::StorageEngine(format!("Worker interrompido no {ctx}")))?
+        let ts;
+        {
+            let _ordem = self.stamp_lock.lock().unwrap_or_else(|e| e.into_inner());
+            if stamp {
+                episode.ts_hlc = self.hlc.now();
+            }
+            ts = episode.ts_hlc;
+            self.cmd_tx
+                .send_timeout(
+                    LogCommand::Append {
+                        opaque_meta,
+                        episode: Arc::new(episode),
+                        expected_lsn,
+                        resp_tx: tx,
+                    },
+                    std::time::Duration::from_secs(10),
+                )
+                .map_err(|_| {
+                    HeraclitusError::StorageEngine(format!(
+                        "Timeout de canal: pipeline saturado ({ctx})"
+                    ))
+                })?;
+        }
+        let lsn = rx.recv().map_err(|_| {
+            HeraclitusError::StorageEngine(format!("Worker interrompido no {ctx}"))
+        })??;
+        Ok((lsn, ts))
     }
 
     pub fn sealed_segments(&self) -> Vec<SegmentMeta> {

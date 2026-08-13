@@ -342,6 +342,22 @@ impl ColdTier {
             .bytes()
             .await
             .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?;
+        // Integridade: o objeto cold TEM de conferir com o recibo (contagem +
+        // raiz Merkle). Sem isto, um objeto truncado/corrompido (bit-flip, corpo
+        // curto de um backend S3) devolvia um resultado PARCIAL em silêncio e o
+        // chamador re-indexava dados incompletos.
+        let (count, root) = scan_and_root(&bytes)?;
+        if count != receipt.record_count || hex(&root) != receipt.blake3_root {
+            return Err(HeraclitusError::Corruption {
+                context: receipt.object_path.clone(),
+                detail: format!(
+                    "objeto cold não confere com o recibo (registos {count}≠{}; root {}≠{})",
+                    receipt.record_count,
+                    hex(&root),
+                    receipt.blake3_root
+                ),
+            });
+        }
         let version = SegmentHeader::decode(&bytes)?.version;
         let mut out = Vec::new();
         visit_records(&bytes, &mut |lsn, payload, _record| {
@@ -369,8 +385,14 @@ fn kind_label(k: &EventKind) -> String {
 
 /// C2.4: converte os episódios de um segmento `.hrkl` num ficheiro Parquet em
 /// memória (colunas: lsn, id, agent_id, session_id, ts_hlc, kind, content,
-/// attrs_json, parents_json). O `content` vai como veio do log (cifrado se a
-/// cifra em repouso estiver ligada — os METADADOS continuam analisáveis).
+/// attrs_json, parents_json, valid_from, valid_to, embedding_json). O `content`
+/// vai como veio do log (cifrado se a cifra em repouso estiver ligada — os
+/// METADADOS continuam analisáveis).
+///
+/// `valid_from`/`valid_to` (bi-temporalidade nativa) e `embedding_json` são
+/// **nuláveis**: `NULL` = ausente/aberto, distinto de um `0` real. Sem estas
+/// colunas o analytics bitemporal sobre o Parquet tratava tudo como
+/// sempre-válido e perdia o embedding do episódio.
 fn segment_to_parquet(bytes: &[u8]) -> Result<Vec<u8>, HeraclitusError> {
     let version = SegmentHeader::decode(bytes)?.version;
     let mut rows: Vec<(Lsn, Episode)> = Vec::new();
@@ -390,12 +412,22 @@ fn segment_to_parquet(bytes: &[u8]) -> Result<Vec<u8>, HeraclitusError> {
         Field::new("content", DataType::Binary, false),
         Field::new("attrs_json", DataType::Utf8, false),
         Field::new("parents_json", DataType::Utf8, false),
+        // Bi-temporalidade: NULL = aberto (desde/até sempre), não um 0 real.
+        Field::new("valid_from", DataType::UInt64, true),
+        Field::new("valid_to", DataType::UInt64, true),
+        // Embedding no manifold produto, serializado em JSON; NULL se ausente.
+        Field::new("embedding_json", DataType::Utf8, true),
     ]));
 
     let attrs_json = |e: &Episode| serde_json::to_string(&e.attrs).unwrap_or_else(|_| "{}".into());
     let parents_json = |e: &Episode| {
         serde_json::to_string(&e.parents.iter().map(|p| p.to_string()).collect::<Vec<_>>())
             .unwrap_or_else(|_| "[]".into())
+    };
+    let embedding_json = |e: &Episode| {
+        e.embedding
+            .as_ref()
+            .map(|p| serde_json::to_string(p).unwrap_or_else(|_| "null".into()))
     };
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -438,6 +470,15 @@ fn segment_to_parquet(bytes: &[u8]) -> Result<Vec<u8>, HeraclitusError> {
                 rows.iter()
                     .map(|(_, e)| parents_json(e))
                     .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|(_, e)| e.valid_from).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|(_, e)| e.valid_to).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|(_, e)| embedding_json(e)).collect::<Vec<_>>(),
             )),
         ],
     )
@@ -549,6 +590,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_cold_rejects_corrupted_object() {
+        // Contrato do recall: NUNCA devolver dados parciais/corrompidos em
+        // silêncio. Se o objeto cold não confere com o recibo (bit-flip, corpo
+        // truncado de um backend remoto), fetch_cold TEM de falhar — não
+        // re-indexar lixo. Prova a verificação de integridade contra o recibo.
+        let dir = tempfile::tempdir().unwrap();
+        let log = seeded_log(&dir.path().join("log"));
+        let tier = ColdTier::open_local(dir.path().join("cold")).unwrap();
+        let seg = log.sealed_segments()[0].clone();
+        let (receipt, _) = tier.demote(&log, seg.id).await.unwrap();
+
+        // Sanidade: íntegro ⇒ recuperável.
+        assert!(tier.fetch_cold(&receipt).await.is_ok());
+
+        // Corrompe o objeto: um byte no meio do corpo (bem depois do cabeçalho
+        // do segmento) muda a raiz Merkle sem partir o enquadramento.
+        let obj = tier
+            .store
+            .get(&ObjPath::from(receipt.object_path.clone()))
+            .await
+            .unwrap();
+        let mut bytes = obj.bytes().await.unwrap().to_vec();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        tier.store
+            .put(&ObjPath::from(receipt.object_path.clone()), bytes.into())
+            .await
+            .unwrap();
+
+        // Agora o recall recusa em vez de devolver registos silenciosamente errados.
+        let err = tier.fetch_cold(&receipt).await;
+        assert!(err.is_err(), "fetch_cold devia recusar objeto corrompido");
+    }
+
+    #[tokio::test]
     async fn demotion_writes_parquet_mirror() {
         // C2.4: a demoção gera também o espelho Parquet — legível por qualquer
         // motor colunar, com as mesmas linhas do segmento.
@@ -581,6 +657,88 @@ mod tests {
             "parquet == segmento, linha a linha"
         );
         assert!(saw_lsn_col, "schema colunar com lsn");
+    }
+
+    #[tokio::test]
+    async fn parquet_mirror_carries_bitemporal_and_embedding() {
+        // Auditoria §6.2: o espelho Parquet tem de preservar a bi-temporalidade
+        // (valid_from/valid_to) e o embedding — colunas NULÁVEIS, com NULL a
+        // significar "aberto/ausente", não um 0 real. Sem elas o analytics
+        // bitemporal sobre o Parquet tratava tudo como sempre-válido e perdia
+        // o embedding.
+        use arrow_array::{Array, StringArray, UInt64Array};
+        let dir = tempfile::tempdir().unwrap();
+        // Segmentos minúsculos forçam um selado; primeiro episódio enriquecido.
+        let log = Log::open(&dir.path().join("log"), 2048, FsyncPolicy::Always).unwrap();
+        let mut enriched =
+            Episode::new("tier", EventKind::Observation, b"enriquecido".to_vec());
+        enriched.valid_from = Some(100);
+        enriched.valid_to = Some(200);
+        enriched.embedding = Some(heraclitus_core::ProductPoint {
+            hyp: vec![0.1, 0.2],
+            sph: vec![],
+            euc: vec![0.5],
+        });
+        log.append(enriched).unwrap();
+        for i in 0..120 {
+            log.append(Episode::new(
+                "tier",
+                EventKind::Observation,
+                format!("plain {i}").into_bytes(),
+            ))
+            .unwrap();
+        }
+        assert!(!log.sealed_segments().is_empty());
+
+        let tier = ColdTier::open_local(dir.path().join("cold")).unwrap();
+        let seg = log.sealed_segments()[0].clone();
+        let (receipt, _) = tier.demote(&log, seg.id).await.unwrap();
+        let ppath = receipt.parquet_path.clone().expect("recibo aponta o parquet");
+        let obj = tier.store.get(&ObjPath::from(ppath)).await.unwrap();
+        let bytes = obj.bytes().await.unwrap();
+
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .unwrap()
+            .build()
+            .unwrap();
+        let batches: Vec<_> = reader.map(|b| b.unwrap()).collect();
+        let b = &batches[0];
+
+        // As três colunas novas existem e são nuláveis.
+        for col in ["valid_from", "valid_to", "embedding_json"] {
+            let f = b.schema().field_with_name(col).unwrap().clone();
+            assert!(f.is_nullable(), "{col} tem de ser nulável");
+        }
+
+        let vf = b
+            .column_by_name("valid_from")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let vt = b
+            .column_by_name("valid_to")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let emb = b
+            .column_by_name("embedding_json")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        // Linha 0 = o episódio enriquecido (append mais antigo do segmento).
+        assert_eq!(vf.value(0), 100);
+        assert_eq!(vt.value(0), 200);
+        assert!(!emb.is_null(0), "embedding presente na linha enriquecida");
+        assert!(emb.value(0).contains("hyp"), "embedding serializado em JSON");
+
+        // Linhas simples ⇒ NULL (aberto/ausente), NÃO 0 — a distinção que faltava.
+        assert!(vf.is_null(1), "sem valid_from → NULL, não 0");
+        assert!(vt.is_null(1), "sem valid_to → NULL, não 0");
+        assert!(emb.is_null(1), "sem embedding → NULL");
     }
 
     #[tokio::test]

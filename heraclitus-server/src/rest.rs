@@ -190,9 +190,33 @@ async fn run_sql(
 
 // ── M20 H-VM ledger (KV soberano durável no log) ─────────────────────────────
 
+/// Representa bytes do ledger de forma **injetiva e sem perdas**: UTF-8 válido
+/// que não comece por `hex:` vai literal (legível — o caso comum, já que
+/// `/hvm/upsert` só aceita `key`/`val` string); qualquer outra coisa (bytes
+/// não-UTF-8, ou um literal que colidiria com o prefixo) vira `hex:<hex>`.
+///
+/// Sem isto, `from_utf8_lossy` mapeava bytes distintos para o MESMO string (com
+/// `U+FFFD`): duas chaves binárias diferentes colapsavam na mesma chave JSON e
+/// uma sobrescrevia a outra ⇒ entradas desapareciam da resposta. O esquema é
+/// injetivo (literais e `hex:…` vivem em namespaces disjuntos; o hex é 1-para-1).
+pub(crate) fn bytes_str(b: &[u8]) -> String {
+    match std::str::from_utf8(b) {
+        Ok(s) if !s.starts_with("hex:") => s.to_string(),
+        _ => {
+            use std::fmt::Write;
+            let mut out = String::with_capacity(4 + b.len() * 2);
+            out.push_str("hex:");
+            for byte in b {
+                let _ = write!(out, "{byte:02x}");
+            }
+            out
+        }
+    }
+}
+
 /// Vista JSON do estado do ledger H-VM (usada pelo handler e testável sem HTTP).
-/// Chaves/valores são interpretados como UTF-8 (o ledger é bytes; usa-se
-/// `from_utf8_lossy`), mais os LSNs de consistência.
+/// Chaves e valores são bytes: renderizados via [`hvm_bytes_str`] (UTF-8 legível
+/// quando possível, senão `hex:…`), mais os LSNs de consistência.
 fn hvm_state_json(engine: &Engine) -> Result<serde_json::Value, String> {
     let state = engine.hvm_state().map_err(|e| format!("hvm: {e}"))?;
     let entries: serde_json::Map<String, serde_json::Value> = state
@@ -200,8 +224,8 @@ fn hvm_state_json(engine: &Engine) -> Result<serde_json::Value, String> {
         .iter()
         .map(|(k, v)| {
             (
-                String::from_utf8_lossy(k).into_owned(),
-                serde_json::Value::String(String::from_utf8_lossy(v).into_owned()),
+                bytes_str(k),
+                serde_json::Value::String(bytes_str(v)),
             )
         })
         .collect();
@@ -371,7 +395,7 @@ async fn tier_fetch(
                         "lsn": lsn,
                         "agent_id": e.agent_id,
                         "kind": format!("{:?}", e.kind),
-                        "content": String::from_utf8_lossy(&e.content),
+                        "content": bytes_str(&e.content),
                     })
                 })
                 .collect();
@@ -508,6 +532,51 @@ mod hvm_tests {
         assert!(v["entries"].get("user:1").is_none(), "chave apagada não aparece");
         // 3 instruções escritas (upsert/upsert/delete), LSNs 0-indexados ⇒ 2.
         assert!(v["max_lsn_applied"].as_u64().unwrap() >= 2);
+    }
+
+    /// Auditoria §6.2: chaves binárias distintas NÃO podem colapsar. Com
+    /// `from_utf8_lossy` ambas viravam a mesma string (`U+FFFD`) e uma
+    /// sobrescrevia a outra no mapa JSON — uma entrada desaparecia. O esquema
+    /// `hex:` é injetivo, por isso as duas sobrevivem com valores próprios.
+    #[test]
+    fn non_utf8_keys_do_not_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path());
+        // Dois bytes inválidos em UTF-8, distintos entre si; from_utf8_lossy
+        // mapearia ambos para "\u{FFFD}".
+        engine.hvm_upsert(vec![0xff], b"um".to_vec()).unwrap();
+        engine.hvm_upsert(vec![0xfe], b"dois".to_vec()).unwrap();
+        // Valor binário também: deve sair como hex, não corrompido em silêncio.
+        engine.hvm_upsert(b"bin".to_vec(), vec![0x00, 0xff]).unwrap();
+
+        let v = hvm_state_json(&engine).unwrap();
+        let entries = v["entries"].as_object().unwrap();
+        // As duas chaves binárias sobrevivem, cada uma com o SEU valor.
+        assert_eq!(entries["hex:ff"], "um");
+        assert_eq!(entries["hex:fe"], "dois");
+        assert_eq!(entries.len(), 3, "nenhuma entrada colapsou");
+        // Chave UTF-8 continua legível; valor binário vai em hex.
+        assert_eq!(entries["bin"], "hex:00ff");
+    }
+
+    /// O prefixo `hex:` reservado não pode ser ambíguo: uma chave UTF-8 que já
+    /// comece por `hex:` é ela própria codificada, para nunca colidir com a
+    /// forma codificada de uma chave binária.
+    #[test]
+    fn literal_hex_prefix_is_disambiguated() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path());
+        // Chave literal "hex:ff" (texto) vs. chave binária 0xff (→ "hex:ff").
+        engine.hvm_upsert(b"hex:ff".to_vec(), b"literal".to_vec()).unwrap();
+        engine.hvm_upsert(vec![0xff], b"binario".to_vec()).unwrap();
+
+        let v = hvm_state_json(&engine).unwrap();
+        let entries = v["entries"].as_object().unwrap();
+        assert_eq!(entries.len(), 2, "as duas não colidem apesar do prefixo");
+        // O literal "hex:ff" é re-codificado (hex de b"hex:ff"); o binário 0xff
+        // fica "hex:ff". Chaves distintas ⇒ ambas presentes.
+        assert_eq!(entries["hex:ff"], "binario");
+        assert_eq!(entries["hex:6865783a6666"], "literal");
     }
 }
 
