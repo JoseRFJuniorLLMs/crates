@@ -407,10 +407,9 @@ fn episode_to_json(lsn: Lsn, e: &Episode) -> Json {
 /// (n:ItemLicitacao)` nem com `WHERE n.kind = "ItemLicitacao"` (kinds Custom
 /// — gerados pela ingestão de dados — eram invisíveis às queries por tipo).
 fn kind_label(k: &EventKind) -> String {
-    match k {
-        EventKind::Custom(s) => s.clone(),
-        other => format!("{other:?}"),
-    }
+    // Delega na definicao canonica do core: o indice de atributos guarda
+    // `_kind` com ESTE rotulo, logo divergir aqui devolveria zero linhas.
+    k.label()
 }
 
 fn field_of(lsn: Lsn, e: &Episode, field: &str) -> Option<Json> {
@@ -749,12 +748,35 @@ fn attr_eq_hint(conditions: &[(BoolOp, Condition)]) -> Option<(String, String)> 
             _ => None,
         };
         if let Some((f, v)) = pair {
+            // `kind`/`tipo` são campos do ENVELOPE, mas desde a v4 do índice de
+            // atributos são também indexados como o pseudo-atributo `_kind`
+            // (`heraclitus-index-attr`). Traduzir aqui é o que transforma
+            // `MATCH (n:Contrato)` — o predicado mais usado da camada de grafo
+            // — de um varrimento do log numa consulta de índice.
+            //
+            // Sem isto, medido a 2026-08-19 sobre 10 093 244 eventos reais:
+            // 7m27s para achar 13 891 nós de um kind, e o edge-builder nunca
+            // terminava. O pós-filtro `matches` revalida na mesma, portanto a
+            // correção não depende deste atalho — só o custo depende.
+            if let Some(chave) = pseudo_atributo_de(&f) {
+                return Some((chave.to_string(), v));
+            }
             if !is_builtin_field(&f) {
                 return Some((f, v));
             }
         }
     }
     None
+}
+
+/// Campos do envelope que o índice de atributos guarda sob uma chave
+/// reservada. `agent_id` → `_agent` (v3), `kind`/`tipo` → `_kind` (v4).
+fn pseudo_atributo_de(campo: &str) -> Option<&'static str> {
+    match campo {
+        "kind" | "tipo" => Some("_kind"),
+        "agent_id" => Some("_agent"),
+        _ => None,
+    }
 }
 
 /// Like [`attr_eq_hint`] but for zone-mapped builtin fields (`agent_id`,

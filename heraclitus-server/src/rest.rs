@@ -11,6 +11,10 @@ use axum::{
 };
 use std::sync::Arc;
 
+/// Se `POST /titular/:id/eliminar` esta autorizado. Vem da config
+/// (`rest_allow_erasure`), `false` por omissao.
+static ERASURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Comparação em tempo constante (R17): o tempo não depende do prefixo
 /// coincidente, fechando o side-channel de timing do `==` de strings. O
 /// comprimento continua observável — inevitável e inócuo (o segredo não é o
@@ -57,13 +61,31 @@ fn b64(input: &[u8]) -> String {
 /// Constrói o router; com `basic_auth = Some("user:pass")` TODAS as rotas
 /// exigem `Authorization: Basic ...` (comparação de string constante contra o
 /// valor esperado — nunca se descodifica input do cliente).
-pub fn router(engine: Arc<Engine>, basic_auth: Option<String>) -> Router {
+pub fn router(
+    engine: Arc<Engine>,
+    basic_auth: Option<String>,
+    cors_origins: Vec<String>,
+    allow_erasure: bool,
+) -> Router {
+    ERASURE.store(allow_erasure, std::sync::atomic::Ordering::Relaxed);
     let routes = Router::new()
         .route("/healthz", get(healthz))
         .route("/stats", get(stats))
         .route("/state", get(state))
         .route("/verify", get(verify))
         .route("/verify/:segment", get(verify_segment))
+        // Fluxo ao vivo de appends (SSE). O log já emitia cada append
+        // confirmado num broadcast interno; faltava só quem o expusesse.
+        .route("/live/events", get(live_events))
+        // LGPD art. 18: pegada do titular, acessos aos dados dele, e eliminacao.
+        .route("/replay", get(replay))
+        .route("/fontes", get(fontes))
+        .route("/fontes/:id", get(fonte_detalhe))
+        .route("/atributos", get(atributos))
+        .route("/diff", get(diff))
+        .route("/titular/:id", get(titular))
+        .route("/titular/:id/acessos", get(titular_acessos))
+        .route("/titular/:id/eliminar", axum::routing::post(titular_eliminar))
         // M20 — H-VM sovereignty ledger (SPEC-025-adjacente). KV durável no log.
         .route("/hvm/state", get(hvm_state))
         .route("/hvm/upsert", axum::routing::post(hvm_upsert))
@@ -84,6 +106,14 @@ pub fn router(engine: Arc<Engine>, basic_auth: Option<String>) -> Router {
         .route("/tier/fetch/:segment", get(tier_fetch));
     let routes = routes.with_state(engine);
 
+    let protegido = aplicar_auth(routes, basic_auth);
+    // O CORS fica por FORA da autenticação: o browser envia o preflight
+    // `OPTIONS` sem credenciais nenhumas, portanto se a auth o apanhasse
+    // primeiro devolveria 401 e o pedido real nem chegava a ser feito.
+    aplicar_cors(protegido, cors_origins)
+}
+
+fn aplicar_auth(routes: Router, basic_auth: Option<String>) -> Router {
     match basic_auth {
         None => routes,
         Some(creds) => {
@@ -109,6 +139,325 @@ pub fn router(engine: Arc<Engine>, basic_auth: Option<String>) -> Router {
                 }
             }))
         }
+    }
+}
+
+/// CORS por lista explícita de origens. Vazio ⇒ nenhum cabeçalho, que é o
+/// comportamento histórico.
+///
+/// Escrito à mão em vez de puxar o `tower-http`: são 30 linhas, e a política
+/// aqui é restritiva de um modo que a camada genérica tornaria fácil de
+/// afrouxar por acidente. **Nunca emite `*`** — este REST tem rotas que
+/// escrevem e liga-se a `127.0.0.1`; um wildcard deixaria qualquer página que
+/// o operador visitasse falar com a base de dados dele através do browser.
+fn aplicar_cors(routes: Router, origens: Vec<String>) -> Router {
+    // Validar à entrada em vez de confiar. Uma origem malformada nunca vai
+    // casar com o `Origin` que o browser envia, e o sintoma seria o painel a
+    // dizer "bloqueado por CORS" com a configuração aparentemente correta —
+    // horas a depurar o lado errado. Um `*` aqui seria pior: o operador
+    // pensaria tê-lo autorizado e o código ignorá-lo-ia em silêncio.
+    let (validas, rejeitadas): (Vec<String>, Vec<String>) = origens.into_iter().partition(|o| {
+        // Forma de "serialized origin" (RFC 6454): esquema://host[:porta], sem
+        // barra final, sem caminho, sem wildcard.
+        (o.starts_with("http://") || o.starts_with("https://"))
+            && !o.contains('*')
+            && !o.ends_with('/')
+            && o.matches('/').count() == 2
+    });
+    for r in &rejeitadas {
+        tracing::warn!(
+            origem = %r,
+            "rest_cors_origins: entrada IGNORADA — tem de ser esquema://host[:porta], \
+             sem barra final e sem `*` (o wildcard nunca é aceite nesta superfície)"
+        );
+    }
+    if validas.is_empty() {
+        if !rejeitadas.is_empty() {
+            tracing::warn!("rest_cors_origins: nenhuma origem válida — CORS fica DESLIGADO");
+        }
+        return routes;
+    }
+    tracing::info!(origens = ?validas, "CORS ativo para estas origens");
+    let permitidas = Arc::new(validas);
+    routes.layer(middleware::from_fn(move |req: Request, next: Next| {
+        let permitidas = permitidas.clone();
+        async move {
+            let autorizada = req
+                .headers()
+                .get(header::ORIGIN)
+                .and_then(|v| v.to_str().ok())
+                .filter(|o| permitidas.iter().any(|p| p == o))
+                .map(|o| o.to_string());
+
+            // Preflight: responder aqui, sem tocar no handler.
+            if req.method() == axum::http::Method::OPTIONS {
+                let mut b = Response::builder().status(StatusCode::NO_CONTENT);
+                if let Some(o) = &autorizada {
+                    b = b
+                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, o.as_str())
+                        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS")
+                        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "authorization, content-type")
+                        // SEM `Allow-Credentials`, deliberadamente. O painel
+                        // envia `Authorization` explicitamente, portanto não
+                        // precisa dele. COM ele, bastava o operador ter feito
+                        // login uma vez neste servidor no browser: qualquer
+                        // página servida na origem autorizada podia então fazer
+                        // `fetch(..., {credentials:'include'})`, o browser
+                        // anexava sozinho a credencial guardada, e o cabeçalho
+                        // tornava a resposta LEGÍVEL — leitura do log inteiro e
+                        // escrita por /hvm/*, sem nunca saber a password.
+                        .header(header::ACCESS_CONTROL_MAX_AGE, "600")
+                        // Sem `Vary: Origin` um intermediário podia servir a
+                        // resposta de uma origem autorizada a outra qualquer.
+                        .header(header::VARY, "Origin");
+                }
+                return b.body("".into()).unwrap();
+            }
+
+            let mut resp = next.run(req).await;
+            if let Some(o) = autorizada {
+                let h = resp.headers_mut();
+                if let Ok(v) = o.parse() {
+                    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+                }
+                // `append` e nao `insert`: um handler pode ja ter posto o seu
+                // proprio `Vary`, e substitui-lo estragaria a chave de cache dele.
+                h.append(header::VARY, "Origin".parse().unwrap());
+            }
+            resp
+        }
+    }))
+}
+
+/// `GET /live/events` → SSE com **metadados** de cada append confirmado.
+///
+/// O log já emitia isto: `Log::tail_subscribe` devolve um broadcast alimentado
+/// pelo worker a cada registo commitado. Não havia era quem o expusesse.
+///
+/// ## O que NÃO vai no fluxo, e porquê
+///
+/// Nem `content` nem os valores dos `attrs`. O broadcast do log transporta o
+/// episódio **antes de ser cifrado** — a cifra é aplicada ao payload que vai
+/// para o disco, não à cópia que segue para o canal. Ou seja, com
+/// `encryption_at_rest` ligado, o que está guardado vai cifrado mas o que passa
+/// aqui iria em claro. Reencaminhar isso para um browser desfazia exatamente o
+/// que a cifra em repouso e o crypto-shred existem para proteger.
+///
+/// ## O que vai, e a ressalva que fica
+///
+/// `lsn`, `agent_id`, `kind`, `bytes` e o instante. É quanto basta para ver
+/// ritmo, origem e mistura de tipos.
+///
+/// **Ressalva séria:** no modelo do Forge o `agent_id` é o **titular** dos
+/// dados (`titular:<id>`), não o produtor — é a chave por que o
+/// crypto-shred apaga. Está pseudonimizado por HMAC na ponte, portanto não é
+/// diretamente identificante, mas é um pseudónimo estável por pessoa. Este
+/// endpoint fica atrás da autenticação de administração, o que é proporcional
+/// para quem já podia consultar tudo por `/sql` — **mas um painel destes num
+/// ecrã de parede tem outra exposição**. Quem o puser à vista deve pensar nisso.
+async fn live_events(
+    State(engine): State<Arc<Engine>>,
+) -> axum::response::Sse<impl tokio_stream::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>
+{
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use tokio_stream::StreamExt;
+
+    let rx = engine.log.tail_subscribe();
+    let fluxo = tokio_stream::wrappers::BroadcastStream::new(rx).map(|item| {
+        let dado = match item {
+            Ok((lsn, ep)) => serde_json::json!({
+                "lsn": lsn,
+                "agent_id": ep.agent_id,
+                "kind": rotulo_kind(&ep.kind),
+                "bytes": ep.content.len(),
+                "attrs": ep.attrs.len(),
+                // Como STRING, nao como numero. Um HLC ronda 1,17e17, e o
+                // `Number` do JavaScript so e exato ate 2^53 (9,0e15): ao
+                // desserializar, os 16 bits do contador logico eram
+                // silenciosamente arredondados. Quem comparasse dois `ts_hlc`
+                // vindos do painel podia ve-los iguais sendo diferentes — num
+                // sistema cuja premissa e a ordem total dos eventos.
+                "ts_hlc": ep.ts_hlc.to_string(),
+                // O HLC é `(milissegundos << 16) | contador` (core/src/hlc.rs).
+                // Enviar já em milissegundos evita que o cliente tenha de
+                // deslocar 64 bits — em JavaScript o `>>` é de 32 e truncava.
+                "t_ms": ep.ts_hlc >> 16,
+            }),
+            // O canal tem 4096 de folga. Um cliente mais lento que a ingestão
+            // fica para trás e o broadcast descarta — que é o correto numa
+            // vista AO VIVO (quer-se o agora, não a fila). Mas tem de ser dito:
+            // um painel que silenciosamente salta 200 mil eventos mente sobre
+            // o que mostra.
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                serde_json::json!({ "saltados": n })
+            }
+        };
+        Ok(Event::default().data(dado.to_string()))
+    });
+
+    Sse::new(fluxo).keep_alive(KeepAlive::default())
+}
+
+/// Rótulo estável para o tipo de evento. `Custom` já traz o nome; os restantes
+/// usam o `Debug` da variante.
+fn rotulo_kind(k: &heraclitus_core::EventKind) -> String {
+    match k {
+        heraclitus_core::EventKind::Custom(s) => s.clone(),
+        outro => format!("{outro:?}"),
+    }
+}
+
+/// `GET /replay[?executar=1]` — prova de reconstrução determinista.
+///
+/// Sem `executar`, devolve só os hashes atuais: barato, não toca em nada, e
+/// serve para comparar com outra instância ou outro momento.
+///
+/// Com `executar=1`, reconstrói as views a partir do LSN 0 e compara os hashes
+/// antes/depois. É caro e mexe nas views vivas — nunca acontece por omissão.
+async fn replay(
+    State(engine): State<Arc<Engine>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let executar = matches!(q.get("executar").map(|s| s.as_str()), Some("1") | Some("true"));
+    let out = tokio::task::spawn_blocking(move || engine.replay_prova(executar))
+        .await
+        .unwrap_or_else(|e| serde_json::json!({ "erro": format!("join: {e}") }));
+    Json(out)
+}
+
+/// `GET /fontes` — quem escreve neste log, quanto, e desde/ate quando.
+async fn fontes(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
+    Json(engine.fontes())
+}
+
+/// `GET /fontes/:id` — características de uma fonte: tipos, campos, principais.
+async fn fonte_detalhe(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let out = tokio::task::spawn_blocking(move || engine.fonte_detalhe(&id, 2_000))
+        .await
+        .unwrap_or_else(|e| serde_json::json!({ "error": format!("join: {e}") }));
+    Json(out)
+}
+
+/// `GET /atributos` — campos indexados e cardinalidade (matéria-prima do ROPA).
+async fn atributos(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
+    Json(engine.atributos())
+}
+
+/// `GET /diff?de=&ate=` — o que mudou entre dois instantes do log.
+///
+/// As pontas aceitam-se em LSN (`de`/`ate`) ou em milissegundos epoch
+/// (`de_ms`/`ate_ms`), que sao convertidos por busca binaria sobre o log. A
+/// forma por tempo e a que uma pessoa usa; a forma por LSN e a que um auditor
+/// cita, porque nao depende de relogios.
+///
+/// Sem qualquer parametro, a janela e a ultima hora.
+async fn diff(
+    State(engine): State<Arc<Engine>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let num = |k: &str| q.get(k).and_then(|v| v.parse::<u64>().ok());
+    let (de_ms, ate_ms, de_lsn, ate_lsn) =
+        (num("de_ms"), num("ate_ms"), num("de"), num("ate"));
+    let topo = num("topo").unwrap_or(12).clamp(1, 200) as usize;
+
+    let out = tokio::task::spawn_blocking(move || {
+        let head = engine.head();
+        let ate = ate_lsn
+            .or_else(|| ate_ms.map(|m| engine.lsn_em(m)))
+            .unwrap_or(head);
+        let de = de_lsn.or_else(|| de_ms.map(|m| engine.lsn_em(m))).unwrap_or_else(|| {
+            // Sem janela pedida: a ultima hora de INGESTAO. Cair para "desde o
+            // inicio" seria pior — num log grande devolve tudo como "novo" e da
+            // a impressao de que tudo apareceu agora.
+            match engine.ts_ms(ate.saturating_sub(1)) {
+                Some(ms) => engine.lsn_em(ms.saturating_sub(3_600_000)),
+                None => 0,
+            }
+        });
+        engine.diff(de, ate, topo)
+    })
+    .await
+    .unwrap_or_else(|e| serde_json::json!({ "error": format!("join: {e}") }));
+    Json(out)
+}
+
+/// `GET /titular/:id` — pegada de um titular (LGPD art. 18, I e II).
+/// Devolve METADADOS: quantos eventos, de que tipos, desde quando, e se a
+/// chave dele ainda existe. Nunca devolve conteudo.
+async fn titular(State(engine): State<Arc<Engine>>, Path(id): Path<String>) -> Json<serde_json::Value> {
+    Json(engine.titular(&id, 50))
+}
+
+/// `GET /titular/:id/acessos` — eventos de auditoria que mencionam este titular.
+async fn titular_acessos(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let out = tokio::task::spawn_blocking(move || engine.titular_acessos(&id, 100))
+        .await
+        .unwrap_or_else(|e| serde_json::json!({ "error": format!("join: {e}") }));
+    Json(out)
+}
+
+/// `POST /titular/:id/eliminar` — crypto-shred (LGPD art. 18, VI).
+///
+/// DESLIGADO por omissao. Ver `HeraclitusConfig::rest_allow_erasure`: a
+/// operacao e irreversivel e o REST so tem Basic auth, que nao distingue
+/// papeis. Com o interruptor a `false` responde 403 **e diz qual o comando
+/// gRPC equivalente**, que passa pelo RBAC — recusar sem indicar o caminho
+/// certo so leva a que alguem procure um atalho pior.
+///
+/// Exige `{"confirmar": "<id>"}` no corpo: um POST acidental nao apaga nada.
+async fn titular_eliminar(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(corpo): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !ERASURE.load(std::sync::atomic::Ordering::Relaxed) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "eliminacao pelo REST desligada (rest_allow_erasure = false)",
+                "alternativa": format!("Admin RPC com op = \"shred:{id}\", que passa pelo RBAC do gRPC"),
+            })),
+        );
+    }
+    if corpo.get("confirmar").and_then(|v| v.as_str()) != Some(id.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "confirmacao em falta: o corpo tem de trazer {\"confirmar\": \"<id>\"}",
+            })),
+        );
+    }
+    let alvo = id.clone();
+    let r = tokio::task::spawn_blocking(move || engine.shred(&alvo)).await;
+    match r {
+        Ok(Ok(destruida)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "chave_destruida": destruida,
+                "nota": if destruida {
+                    "Chave destruida. O log NAO foi alterado: a cadeia Merkle continua a verificar."
+                } else {
+                    "Nao havia chave para este titular (ja eliminado, ou nunca escreveu)."
+                },
+            })),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("join: {e}") })),
+        ),
     }
 }
 
@@ -473,13 +822,23 @@ async fn state(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
 
 /// Verificação Merkle do log inteiro. `Log::verify` re-lê+re-hasha todos os
 /// segmentos → `spawn_blocking` (nunca bloquear o reactor / os probes de saúde).
-async fn verify(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
-    let out = match tokio::task::spawn_blocking(move || engine.verify()).await {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => serde_json::json!({ "error": e.to_string() }),
-        Err(e) => serde_json::json!({ "error": format!("join: {e}") }),
-    };
-    Json(out)
+async fn verify(State(engine): State<Arc<Engine>>) -> (StatusCode, Json<serde_json::Value>) {
+    // Uma falha de integridade saía com HTTP **200** e um `{"error": ...}` no
+    // corpo. Um cliente que só olhasse ao estado — ou que procurasse campos que
+    // ali não vinham — lia isso como sucesso: um painel chegou a escrever
+    // "íntegro" por cima de uma corrupção detectada. A deteção de adulteração é
+    // a razão de existir deste produto; não pode viajar como 200.
+    match tokio::task::spawn_blocking(move || engine.verify()).await {
+        Ok(Ok(v)) => (StatusCode::OK, Json(v)),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("join: {e}") })),
+        ),
+    }
 }
 
 /// Verificação Merkle pontual de um segmento (idem: em `spawn_blocking`).

@@ -56,7 +56,28 @@ impl Default for FsyncPolicy {
 #[serde(default)]
 pub struct HeraclitusConfig {
     pub data_dir: PathBuf,
-    /// Segments roll at this size (default 256 MB).
+    /// Tamanho a que o segmento rola e sela (default 8 MiB).
+    ///
+    /// **Isto não é só uma escolha de tamanho de ficheiro — governa o débito de
+    /// escrita.** O índice do segmento ativo é publicado por copy-on-write a
+    /// cada lote (`heraclitus-log/src/lib.rs:938`), portanto o custo por append
+    /// cresce com as entradas JÁ acumuladas nesse segmento; selar reinicia-o.
+    /// Um segmento maior deixa esse quadrático correr durante mais tempo.
+    ///
+    /// Medido a 1M de registos realistas (~487 B cada):
+    ///
+    /// | segmento | appends/s | 1M registos |
+    /// |---|---|---|
+    /// | 8 MiB | 12 798 (curva plana) | 78 s |
+    /// | 256 MiB (o default antigo) | 399 (degrada 7,4×) | 42 min |
+    ///
+    /// **Ressalva:** segmentos pequenos não são grátis — cada selagem custa
+    /// fsync, criação de ficheiro e sync do diretório-pai. Abaixo de ~50k
+    /// registos por segmento o default antigo era mais rápido (a 20k: 18 393
+    /// vs 10 109 app/s). Para bases pequenas e de escrita rara, subir este
+    /// valor é legítimo.
+    ///
+    /// Ver `docs/md/auditorias/append-lento-com-o-crescimento.md`.
     pub segment_max_bytes: u64,
     pub fsync: FsyncPolicy,
     /// Memtable holds at most this many events above the view watermark.
@@ -101,6 +122,32 @@ pub struct HeraclitusConfig {
     /// bind). Prefer `HERACLITUS_REST_AUTH_FILE`; the legacy inline
     /// `HERACLITUS_REST_AUTH` remains available outside production.
     pub rest_basic_auth: Option<String>,
+    /// Origens autorizadas a chamar o REST a partir de um browser (CORS).
+    /// Vazio (default) = **nenhum** cabeçalho CORS, que é o comportamento
+    /// histórico e o mais seguro.
+    ///
+    /// **Nunca aceita `*`, e é deliberado.** Este REST tem rotas que ESCREVEM
+    /// (`/hvm/upsert`, `/hvm/delete`, `/tier/demote`) e liga-se tipicamente a
+    /// `127.0.0.1`. Um `Access-Control-Allow-Origin: *` faria com que qualquer
+    /// página que o operador visitasse pudesse falar com a base de dados local
+    /// através do browser dele. A lista é explícita por isso.
+    ///
+    /// Exemplo: `rest_cors_origins = ["http://localhost:9337"]` para o painel
+    /// forense em desenvolvimento. Em produção, o melhor continua a ser servir
+    /// painel e API na **mesma origem** (nginx) e deixar isto vazio.
+    pub rest_cors_origins: Vec<String>,
+    /// Permite `POST /titular/:id/eliminar` (crypto-shred) pelo REST.
+    /// **`false` por omissao, e deliberadamente.**
+    ///
+    /// A eliminacao e IRREVERSIVEL: destroi a chave do titular e o conteudo
+    /// dele fica ilegivel para sempre. O REST so tem Basic auth, que e tudo-ou-
+    /// nada — nao distingue papeis como o RBAC do gRPC. Expor uma operacao
+    /// destrutiva atras disso, por omissao, seria pos a decisao mais grave do
+    /// sistema atras da protecao mais fraca dele.
+    ///
+    /// Com `false`, o endpoint responde 403 e devolve o comando gRPC
+    /// equivalente, que passa pelo RBAC. Ligue-se so onde isso for aceitavel.
+    pub rest_allow_erasure: bool,
     /// Periodic view-checkpoint interval in seconds (fast boot): bounds the
     /// tail a crash-boot has to replay. `0` = checkpoint only at boot and on
     /// graceful shutdown. Default 300.
@@ -218,7 +265,8 @@ impl Default for HeraclitusConfig {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("./data"),
-            segment_max_bytes: 256 * 1024 * 1024,
+            // 8 MiB: ver a doc do campo. Medido 32x mais rapido a 1M de registos.
+            segment_max_bytes: 8 * 1024 * 1024,
             fsync: FsyncPolicy::default(),
             memtable_cap: 100_000,
             compaction_max_cores: 1,
@@ -235,6 +283,8 @@ impl Default for HeraclitusConfig {
             tls_client_ca_path: None,
             production_mode: false,
             rest_basic_auth: None,
+            rest_cors_origins: Vec::new(),
+            rest_allow_erasure: false,
             checkpoint_interval_secs: 300,
             audit_queries: false,
             encryption_at_rest: false,
@@ -339,6 +389,23 @@ impl HeraclitusConfig {
             self.rest_basic_auth = Some(read_single_line_secret(&path, "REST auth")?);
         } else if let Some(value) = inline_rest_auth {
             self.rest_basic_auth = Some(value);
+        }
+        // Origens CORS por variável de ambiente, no mesmo estilo do resto.
+        // Lista separada por vírgulas; vazio desliga (o default). A validação
+        // do formato é feita onde a camada é montada (`rest.rs::aplicar_cors`),
+        // que rejeita `*` e origens malformadas com aviso nomeando a entrada —
+        // aqui só se separa, para uma entrada inválida ser reportada uma vez
+        // e no sítio onde se percebe o efeito.
+        if let Ok(v) = std::env::var("HERACLITUS_REST_CORS_ORIGINS") {
+            self.rest_cors_origins = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_REST_ALLOW_ERASURE") {
+            self.rest_allow_erasure =
+                matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes");
         }
         if let Ok(v) = std::env::var("HERACLITUS_CHECKPOINT_INTERVAL") {
             if let Ok(s) = v.parse() {

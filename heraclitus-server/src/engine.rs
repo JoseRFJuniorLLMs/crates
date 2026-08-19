@@ -801,6 +801,400 @@ impl Engine {
         Ok(out)
     }
 
+    /// Prova de reconstrucao determinista.
+    ///
+    /// A afirmacao mais forte deste sistema perante um auditor nao e "o painel
+    /// mostrou isto naquele dia" — e **"consigo reconstruir o estado que levou
+    /// a esta conclusao"**. O contrato ja existe e e testado (`state_hash`
+    /// identico entre replays), mas nunca esteve visivel.
+    ///
+    /// Com `executar = false` devolve so os hashes atuais: barato, nao mexe em
+    /// nada, e permite a um auditor comparar com os de outra instancia ou de
+    /// outro momento.
+    ///
+    /// Com `executar = true` reconstroi as views a partir do LSN 0 e compara os
+    /// hashes antes/depois. Se baterem, o replay e determinista **agora, sobre
+    /// este log** — que e diferente de "os testes dizem que e". E caro e mexe
+    /// nas views vivas, por isso e a pedido explicito.
+    pub fn replay_prova(&self, executar: bool) -> serde_json::Value {
+        let hex = |b: [u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let antes = hex(self.graph_state_hash());
+        let head = self.log.head();
+
+        if !executar {
+            return serde_json::json!({
+                "executado": false,
+                "head": head,
+                "graph_state_hash": antes,
+                "nota": "Hashes do estado atual. Reconstruir e comparar exige `executar=true`.",
+            });
+        }
+
+        let t0 = std::time::Instant::now();
+        if let Err(e) = self.rebuild(None) {
+            return serde_json::json!({
+                "executado": true, "ok": false, "erro": e.to_string(),
+            });
+        }
+        let depois = hex(self.graph_state_hash());
+        serde_json::json!({
+            "executado": true,
+            "ok": antes == depois,
+            "head": head,
+            "hash_antes": antes,
+            "hash_depois": depois,
+            "segundos": t0.elapsed().as_secs_f64(),
+            "nota": if antes == depois {
+                "Estado reconstruido a partir do LSN 0 e IDENTICO ao anterior."
+            } else {
+                "DIVERGENCIA: a reconstrucao nao reproduziu o estado. Isto e um incidente."
+            },
+        })
+    }
+
+    /// Fontes que escrevem neste log: quem, quanto, e desde/ate quando.
+    ///
+    /// Numa plataforma forense, **uma fonte que se cala e um incidente** — pode
+    /// ser o atacante a desligar o log. Este endpoint da a materia-prima para
+    /// detetar isso: com o instante do ultimo evento de cada fonte, o painel
+    /// compara com o ritmo historico dela e assinala silencio.
+    ///
+    /// Sai do indice `_agent`, nao de um varrimento: duas leituras por fonte
+    /// (o primeiro e o ultimo LSN, que sao as pontas dos postings ordenados).
+    pub fn fontes(&self) -> serde_json::Value {
+        let vals = self.attr.lock().unwrap().field_values("_agent");
+        let mut fontes = Vec::with_capacity(vals.len());
+        let (mut global_min, mut global_max) = (u64::MAX, 0u64);
+
+        for (agente, eventos) in vals {
+            let span = self.attr.lock().unwrap().field_span("_agent", &agente);
+            let (mut primeiro_ms, mut ultimo_ms) = (None, None);
+            if let Some((a, b)) = span {
+                if let Ok(Some((_, ep))) = self.log.read(a) {
+                    let ms = ep.ts_hlc >> 16;
+                    primeiro_ms = Some(ms);
+                    global_min = global_min.min(ms);
+                }
+                if let Ok(Some((_, ep))) = self.log.read(b) {
+                    let ms = ep.ts_hlc >> 16;
+                    ultimo_ms = Some(ms);
+                    global_max = global_max.max(ms);
+                }
+            }
+            fontes.push(serde_json::json!({
+                "agente": agente,
+                "eventos": eventos,
+                "primeiro_ms": primeiro_ms,
+                "ultimo_ms": ultimo_ms,
+                "primeiro_lsn": span.map(|s| s.0),
+                "ultimo_lsn": span.map(|s| s.1),
+            }));
+        }
+
+        serde_json::json!({
+            "fontes": fontes,
+            // Retencao: o evento mais antigo do log. O Marco Civil (12.965/2014)
+            // obriga a guardar registos de conexao 1 ano e de aplicacao 6 meses;
+            // a LGPD obriga a NAO guardar alem do necessario. Os dois lados
+            // precisam deste numero.
+            "mais_antigo_ms": if global_min == u64::MAX { None } else { Some(global_min) },
+            "mais_recente_ms": if global_max == 0 { None } else { Some(global_max) },
+            "head": self.log.head(),
+        })
+    }
+
+    /// Caracteristicas de UMA fonte: que tipos de evento produz, que campos
+    /// preenche, e sob que principal autenticado escreve.
+    ///
+    /// Num SOC a pergunta nao e so "quem escreve" — e "o que e que esta fonte
+    /// mete no log". Um agente que sempre mandou `Observation` e comeca a
+    /// mandar outra coisa, ou que passa a preencher um campo novo, mudou de
+    /// comportamento; e isso e a materia-prima de uma deteccao.
+    ///
+    /// Le eventos, portanto tem tecto (`amostra_max`). Com o tecto atingido, o
+    /// resultado diz `amostrado: true` — uma distribuicao calculada sobre parte
+    /// dos dados nao pode ser apresentada como se fosse sobre todos.
+    pub fn fonte_detalhe(&self, agente: &str, amostra_max: usize) -> serde_json::Value {
+        let lsns: Vec<Lsn> = self.attr.lock().unwrap().lookup("_agent", agente).to_vec();
+        let total = lsns.len();
+        // Amostra pelas pontas: os mais RECENTES importam mais para saber o que
+        // a fonte faz agora, mas os primeiros mostram como comecou.
+        let lidos: Vec<Lsn> = if total <= amostra_max {
+            lsns.clone()
+        } else {
+            let metade = amostra_max / 2;
+            lsns.iter().take(metade).chain(lsns.iter().rev().take(amostra_max - metade)).copied().collect()
+        };
+
+        let mut tipos: std::collections::BTreeMap<String, u64> = Default::default();
+        let mut campos: std::collections::BTreeMap<String, u64> = Default::default();
+        let mut principais: std::collections::BTreeMap<String, u64> = Default::default();
+        let mut sessoes: std::collections::BTreeSet<String> = Default::default();
+        let (mut bytes, mut n) = (0u64, 0u64);
+
+        for lsn in lidos {
+            if let Ok(Some((_, ep))) = self.log.read(lsn) {
+                n += 1;
+                bytes += ep.content.len() as u64;
+                let k = match &ep.kind {
+                    heraclitus_core::EventKind::Custom(s) => s.clone(),
+                    outro => format!("{outro:?}"),
+                };
+                *tipos.entry(k).or_insert(0) += 1;
+                for campo in ep.attrs.keys() {
+                    *campos.entry(campo.clone()).or_insert(0) += 1;
+                }
+                if let Some(p) = ep.attrs.get("__heraclitus_authenticated_principal") {
+                    *principais.entry(p.clone()).or_insert(0) += 1;
+                }
+                if !ep.session_id.is_empty() {
+                    sessoes.insert(ep.session_id.clone());
+                }
+            }
+        }
+
+        serde_json::json!({
+            "agente": agente,
+            "eventos": total,
+            "amostrado": total > amostra_max,
+            "amostra": n,
+            "tipos": tipos,
+            "campos": campos,
+            // Quem escreveu, do ponto de vista da AUTENTICACAO — distinto do
+            // `agent_id`, que e a quem os dados dizem respeito. Uma fonte que
+            // muda de principal e uma mudanca de quem tem a credencial.
+            "principais": principais,
+            "sessoes": sessoes.len(),
+            "bytes_medios": bytes.checked_div(n).unwrap_or(0),
+        })
+    }
+
+    /// Campos indexados e a cardinalidade de cada um.
+    ///
+    /// Responde "que categorias de dados estao a ser tratadas?" a partir do que
+    /// esta MESMO no log — o inverso de um registo de tratamento mantido a mao,
+    /// que descreve o que alguem se lembrou de escrever.
+    ///
+    /// So nomes de campo e contagens: nunca valores. Listar os valores de um
+    /// campo `cpf` seria despejar os CPFs todos.
+    pub fn atributos(&self) -> serde_json::Value {
+        let campos = self.attr.lock().unwrap().fields();
+        let lista: Vec<_> = campos
+            .into_iter()
+            .map(|(campo, distintos)| {
+                serde_json::json!({
+                    "campo": campo,
+                    "valores_distintos": distintos,
+                })
+            })
+            .collect();
+        serde_json::json!({ "campos": lista })
+    }
+
+    /// O ultimo LSN escrito (exclusivo: o proximo append usa este valor).
+    pub fn head(&self) -> Lsn {
+        self.log.head()
+    }
+
+    /// O carimbo de ingestao (ms epoch) do evento em `lsn`, se legivel.
+    pub fn ts_ms(&self, lsn: Lsn) -> Option<u64> {
+        match self.log.read(lsn) {
+            Ok(Some((_, ep))) => Some(ep.ts_hlc >> 16),
+            _ => None,
+        }
+    }
+
+    /// O LSN a partir do qual os eventos foram registados em/depois de `ms`.
+    ///
+    /// O `ts_hlc` e carimbado pelo `Log::append`, e o HLC e monotono — logo a
+    /// ordem dos LSN E a ordem do tempo de INGESTAO, e uma busca binaria sobre
+    /// o log resolve isto em O(log n) leituras em vez de um varrimento.
+    ///
+    /// Atencao ao que isto significa: o tempo aqui e quando o registo ENTROU,
+    /// nao quando o facto aconteceu no mundo. Um lote importado ontem de logs
+    /// da semana passada aparece com o carimbo de ontem.
+    pub fn lsn_em(&self, ms: u64) -> Lsn {
+        let (mut lo, mut hi) = (0u64, self.log.head());
+        while lo < hi {
+            let meio = lo + (hi - lo) / 2;
+            match self.log.read(meio) {
+                Ok(Some((_, ep))) if (ep.ts_hlc >> 16) < ms => lo = meio + 1,
+                // Buraco no log (LSN sem registo legivel): trata-se como
+                // "ainda nao chegou a `ms`" para a busca continuar em vez de
+                // parar num ponto arbitrario.
+                Ok(None) | Err(_) => lo = meio + 1,
+                _ => hi = meio,
+            }
+        }
+        lo
+    }
+
+    /// Diff entre dois instantes do log: o que existe em `ate` que nao existia
+    /// em `de`, campo a campo.
+    ///
+    /// Num log append-only nada e apagado, por isso um diff **nao pode** mostrar
+    /// remocoes. Mostra as duas coisas que um investigador de facto procura:
+    ///
+    ///  - **apareceu** — um valor cujo primeiro registo cai dentro da janela.
+    ///    Um IP, um utilizador, um comando que o sistema nunca tinha visto.
+    ///  - **calou-se** — um valor que existia antes e nao produziu nada na
+    ///    janela. Numa plataforma forense isto pesa tanto como o resto: uma
+    ///    fonte que emudece pode ser o atacante a desligar o registo.
+    ///
+    /// Sai todo do indice de atributos — nao le o log, tirando as duas leituras
+    /// para carimbar as pontas da janela.
+    pub fn diff(&self, de: Lsn, ate: Lsn, topo: usize) -> serde_json::Value {
+        let head = self.log.head();
+        let ate = ate.min(head);
+        let de = de.min(ate);
+
+        let campos = self.attr.lock().unwrap().diff(de, ate, topo);
+        let ms = |lsn: Lsn| self.ts_ms(lsn);
+
+        serde_json::json!({
+            "de": de,
+            "ate": ate,
+            "head": head,
+            "eventos": ate.saturating_sub(de),
+            "de_ms": ms(de),
+            // `ate` e exclusivo: o ultimo evento DENTRO da janela e `ate - 1`.
+            "ate_ms": if ate > de { ms(ate - 1) } else { None },
+            // A janela ANTERIOR de igual duracao e o termo de comparacao de
+            // "calou-se" e de "disparou". Vai no JSON para o painel poder
+            // dizer contra o que compara, em vez de o subentender.
+            "anterior_de": de.saturating_sub(ate.saturating_sub(de)),
+            "anterior_ate": de,
+            "campos": campos,
+            "nota": "Janela [de, ate), comparada com a janela anterior de igual \
+                     duracao. O tempo e o de INGESTAO (carimbo do append), nao o \
+                     momento em que o facto ocorreu no mundo.",
+        })
+    }
+
+    /// Pegada de um titular no log: quantos eventos, de que tipos, desde
+    /// quando, e se a chave dele ainda existe.
+    ///
+    /// Responde ao que a LGPD art. 18 (I e II) obriga a conseguir responder —
+    /// confirmação da existência do tratamento e acesso aos dados — e é a
+    /// base do ecrã do titular no painel.
+    ///
+    /// Usa o índice `_agent` do `AttrIndex`. Um índice construído antes de
+    /// esse campo existir não o tem: `indexado: false` diz isso em vez de
+    /// devolver zero eventos e deixar alguém concluir que não há dados
+    /// nenhuns sobre a pessoa. Nesse caso, `rebuild` resolve.
+    pub fn titular(&self, agent_id: &str, limite: usize) -> serde_json::Value {
+        let lsns: Vec<Lsn> = {
+            let attr = self.attr.lock().unwrap();
+            attr.lookup("_agent", agent_id).to_vec()
+        };
+        // O índice conhece o campo `_agent`? Se não conhecer, foi construído
+        // antes desta funcionalidade — e aí "0 eventos" NÃO é uma resposta, é
+        // uma ausência de índice. Dizer a um titular "não temos nada sobre si"
+        // por causa de um índice desatualizado é uma declaração falsa.
+        //
+        // Nota: os frames H-VM (`hvm_isa`) são excluídos dos índices por
+        // desenho (`index_applied`) — vivem no replay da VM. Um log só com
+        // esses frames dá `agentes_indexados: 0` legitimamente.
+        let agentes_indexados = self.attr.lock().unwrap().field_entries("_agent");
+
+        let mut tipos: std::collections::BTreeMap<String, u64> = Default::default();
+        let mut amostra = Vec::new();
+        let (mut primeiro_ms, mut ultimo_ms) = (u64::MAX, 0u64);
+        for &lsn in &lsns {
+            if let Ok(Some((_, ep))) = self.log.read(lsn) {
+                let kind = match &ep.kind {
+                    heraclitus_core::EventKind::Custom(s) => s.clone(),
+                    outro => format!("{outro:?}"),
+                };
+                *tipos.entry(kind.clone()).or_insert(0) += 1;
+                let ms = ep.ts_hlc >> 16;
+                primeiro_ms = primeiro_ms.min(ms);
+                ultimo_ms = ultimo_ms.max(ms);
+                if amostra.len() < limite {
+                    // METADADOS apenas. O conteúdo não sai por aqui: este
+                    // endpoint existe para provar tratamento, não para o expor.
+                    amostra.push(serde_json::json!({
+                        "lsn": lsn,
+                        "kind": kind,
+                        "bytes": ep.content.len(),
+                        "t_ms": ms,
+                        "atributos": ep.attrs.len(),
+                    }));
+                }
+            }
+        }
+
+        serde_json::json!({
+            "titular": agent_id,
+            "eventos": lsns.len(),
+            "tipos": tipos,
+            "primeiro_ms": if primeiro_ms == u64::MAX { serde_json::Value::Null } else { primeiro_ms.into() },
+            "ultimo_ms": if ultimo_ms == 0 { serde_json::Value::Null } else { ultimo_ms.into() },
+            "cifrado": self.keystore.is_some(),
+            // `false` com `cifrado: true` = a chave foi destruída: os dados
+            // deste titular já foram eliminados por crypto-shred.
+            "chave_presente": self
+                .keystore
+                .as_ref()
+                // `get` devolve `None` quando a chave nao existe — que e
+                // exatamente o estado pos-shred. Nao se usa a chave para nada:
+                // so se pergunta se ainda la esta.
+                .map(|ks| ks.get(agent_id).is_some())
+                .unwrap_or(false),
+            // `false` = este índice não conhece o campo do titular; a contagem
+            // acima não é de confiança e um `rebuild` resolve.
+            "indexado": agentes_indexados > 0,
+            "agentes_indexados": agentes_indexados,
+            "amostra": amostra,
+        })
+    }
+
+    /// Eventos de auditoria que mencionam este titular.
+    ///
+    /// O `audit_queries` transforma cada consulta GQL num evento do log — quem
+    /// consultou o quê é, ele próprio, prova. Aqui procuram-se os que citam
+    /// este identificador, mais os `shred:<id>` do `AuditAdmin`.
+    ///
+    /// **Ressalva:** é uma procura por menção no texto registado, não um
+    /// índice de "acessos a este titular". Uma consulta que devolva dados dele
+    /// sem o nomear não aparece. É o que a informação atual permite afirmar.
+    pub fn titular_acessos(&self, agent_id: &str, limite: usize) -> serde_json::Value {
+        let head = self.log.head();
+        let mut achados = Vec::new();
+        let mut cur = 0u64;
+        while cur < head && achados.len() < limite {
+            let lote = match self.log.scan_capped(cur, head, 20_000) {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            let Some(&(ultimo, _)) = lote.last() else { break };
+            for (lsn, ep) in &lote {
+                let e_auditoria = ep.attrs.contains_key("audit");
+                if !e_auditoria {
+                    continue;
+                }
+                let texto = String::from_utf8_lossy(&ep.content);
+                let operacao = ep.attrs.get("operation").cloned().unwrap_or_default();
+                if !texto.contains(agent_id) && !operacao.contains(agent_id) {
+                    continue;
+                }
+                achados.push(serde_json::json!({
+                    "lsn": lsn,
+                    "t_ms": ep.ts_hlc >> 16,
+                    "tipo": ep.attrs.get("audit").cloned().unwrap_or_default(),
+                    "principal": ep.attrs.get("principal").cloned().unwrap_or_default(),
+                    "operacao": operacao,
+                    "ok": ep.attrs.get("ok").cloned().unwrap_or_default(),
+                }));
+                if achados.len() >= limite {
+                    break;
+                }
+            }
+            cur = ultimo + 1;
+        }
+        serde_json::json!({ "titular": agent_id, "acessos": achados })
+    }
+
     /// Crypto-shred (§3.10): destroy an agent's encryption key so all of its
     /// sealed content becomes permanently unreadable. The log is never mutated.
     /// Errors if encryption at rest is disabled.
@@ -906,17 +1300,16 @@ impl Engine {
         key: &str,
     ) -> Result<(Lsn, bool, String), HeraclitusError> {
         if key.is_empty() {
+            // O `EventId` é gerado por `Episode::new` ANTES de chegar aqui, e
+            // `append_internal` nunca lhe toca (só o `ts_hlc` é carimbado pelo
+            // log). Ler o `id` do episódio custa zero; relê-lo do disco, como
+            // se fazia, custava uma leitura pontual COMPLETA por append —
+            // abrir o ficheiro do segmento, seek, ler o registo e descodificar
+            // o bincode — para devolver um valor que já estava em memória.
+            // Medido a 2026-08-19: era o desperdício mais caro do caminho de
+            // escrita por gRPC. Ver docs/md/auditorias/otimizacao-20m.md §3.5.
+            let id = episode.id.to_string();
             let lsn = self.append(episode)?;
-            let id = self
-                .log
-                .read(lsn)?
-                .ok_or_else(|| HeraclitusError::Corruption {
-                    context: "append response".into(),
-                    detail: format!("LSN {lsn} não pôde ser relido"),
-                })?
-                .1
-                .id
-                .to_string();
             return Ok((lsn, false, id));
         }
         if self.log_only {
@@ -1056,7 +1449,19 @@ impl Engine {
     pub fn verify(&self) -> Result<serde_json::Value, HeraclitusError> {
         let r = self.log.verify_durable()?;
         Ok(serde_json::json!({
-            "segments": r.segments, "records": r.records, "merkle_ok": r.merkle_ok
+            "segments": r.segments,
+            "sealed": r.sealed,
+            "records": r.records,
+            "merkle_ok": r.merkle_ok,
+            // Verdadeiro sempre que existe relatório: `Log::verify` devolve
+            // `Err` assim que uma raiz Merkle não bate. Explicitar isto poupa
+            // ao cliente ter de o inferir da AUSÊNCIA de um campo de erro —
+            // inferência que já levou um painel a escrever "íntegro" em cima
+            // de uma corrupção detectada.
+            "ok": true,
+            // Selados sem raiz gravada no rodapé: não são falha, são
+            // não-verificáveis. Sem este número, "3 de 5" não se explica.
+            "sem_raiz": r.sealed.saturating_sub(r.merkle_ok)
         }))
     }
 

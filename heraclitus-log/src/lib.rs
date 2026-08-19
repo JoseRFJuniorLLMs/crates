@@ -127,37 +127,6 @@ pub struct LogCatalog {
     pub active: Arc<SegmentContainer>,
 }
 
-#[derive(Clone, Debug)]
-pub struct RaftEntry {
-    pub term: u64,
-    pub index: u64,
-    pub payload: Arc<Episode>,
-}
-
-/// Interface formal de acoplamento com o Consenso Distribuído (Raft).
-///
-/// **LEGADO v0 (R13/§2.3):** o consenso real (openraft, feature `replication`)
-/// NÃO usa esta superfície — usa `append_replicated` + `FileRaftLog`. Este
-/// trait tem 0 callers fora do próprio crate e fica como referência. Limitação
-/// conhecida: `opaque_meta[8..16]` só é um índice raft em entradas escritas
-/// por `append_raft_entry`; em appends normais são bytes do ULID — num log
-/// misto, `resolve_lsn_from_consensus_index` degrada para o valor PROTETOR
-/// (bloqueia truncates em vez de permitir apagar committed).
-pub trait RaftLogStorage: Send + Sync {
-    fn append_raft_entry(
-        &self,
-        term: u64,
-        index: u64,
-        episode: Episode,
-    ) -> Result<Lsn, HeraclitusError>;
-    fn read_raft_entry(&self, lsn: Lsn) -> Result<Option<(Lsn, RaftEntry)>, HeraclitusError>;
-    fn truncate_from_lsn(
-        &self,
-        from_lsn: Lsn,
-        current_raft_commit: u64,
-    ) -> Result<(), HeraclitusError>;
-}
-
 struct Active {
     file: File,
     segment_id: SegmentId,
@@ -176,11 +145,6 @@ enum LogCommand {
         resp_tx: crossbeam_channel::Sender<Result<Lsn, HeraclitusError>>,
     },
     Flush {
-        resp_tx: crossbeam_channel::Sender<Result<(), HeraclitusError>>,
-    },
-    Truncate {
-        from_lsn: Lsn,
-        allowed_max_lsn: Lsn,
         resp_tx: crossbeam_channel::Sender<Result<(), HeraclitusError>>,
     },
 }
@@ -352,6 +316,52 @@ pub struct Log {
     /// Serializa (carimbo HLC + entrada na fila) para que a ordem de `ts` seja a
     /// mesma dos LSNs — contrato de que a busca binária do AS OF TIMESTAMP depende.
     stamp_lock: std::sync::Mutex<()>,
+    /// Descritores abertos por segmento, partilhados entre leitores.
+    ///
+    /// Antes, CADA leitura pontual fazia `File::open` + `close`. Com o log de
+    /// 20M (1 164 segmentos, 9,8 GB) isso era um par de syscalls por leitura,
+    /// no caminho mais sensível a latência do motor. O cache guarda `Arc<File>`
+    /// e as leituras são POSICIONAIS (`seek_read`/`read_at`), que aceitam
+    /// `&File` — portanto o lock só cobre a consulta ao mapa, nunca o I/O, e
+    /// vários leitores usam o mesmo descritor em paralelo sem se bloquearem.
+    ///
+    /// Medido (`benches/otim_leitura.rs`, 2026-08-19): 22 959 → 236 244
+    /// leituras/s, **10,3×**, somando este cache e o fim da releitura do
+    /// cabeçalho do segmento.
+    ///
+    /// Segmentos são imutáveis depois de selados e o ficheiro ativo só cresce,
+    /// por isso um descritor nunca fica obsoleto: só o `truncate` o invalidaria,
+    /// e essa superfície já não existe.
+    fds: std::sync::Mutex<std::collections::HashMap<SegmentId, Arc<File>>>,
+}
+
+/// Leitura posicional: não move o cursor do ficheiro, portanto aceita `&File` e
+/// pode ser chamada por vários leitores em paralelo sobre o MESMO descritor.
+/// Substitui o par `seek` + `read_exact`, que exigia `&mut File`.
+fn ler_exato_em(f: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        let n = {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::FileExt;
+                f.seek_read(buf, offset)?
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileExt;
+                f.read_at(buf, offset)?
+            }
+        };
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "fim de ficheiro a meio do registo",
+            ));
+        }
+        buf = &mut buf[n..];
+        offset += n as u64;
+    }
+    Ok(())
 }
 
 fn sync_parent_dir(dir: &Path) -> Result<(), HeraclitusError> {
@@ -616,44 +626,9 @@ impl Log {
                         Err(_) => break,
                     };
 
-                    if let LogCommand::Truncate {
-                        from_lsn,
-                        allowed_max_lsn,
-                        resp_tx,
-                    } = first_cmd
-                    {
-                        match handle_truncation_protected(
-                            &worker_dir,
-                            &mut active,
-                            &worker_catalog,
-                            from_lsn,
-                            allowed_max_lsn,
-                            &mut current_lsn,
-                            &worker_committed_lsn,
-                        ) {
-                            Ok(_) => {
-                                let _ = resp_tx.send(Ok(()));
-                            }
-                            Err(e) => {
-                                let _ = resp_tx.send(Err(e));
-                                worker_poisoned.store(true, Ordering::SeqCst);
-                                break;
-                            }
-                        }
-                        continue;
-                    }
-
                     batch.push(first_cmd);
-                    // R6: um Truncate que chegue durante o batching NÃO envenena
-                    // o worker — fecha o lote, deixa-o concluir (write/sync/ack)
-                    // e processa o truncate a seguir, na mesma iteração.
-                    let mut pending_truncate: Option<LogCommand> = None;
                     while batch.len() < 128 {
                         match cmd_rx.try_recv() {
-                            Ok(t @ LogCommand::Truncate { .. }) => {
-                                pending_truncate = Some(t);
-                                break;
-                            }
                             Ok(cmd) => batch.push(cmd),
                             Err(_) => break,
                         }
@@ -895,13 +870,6 @@ impl Log {
                                 sync_required = true;
                                 stashed_flushes.push(resp_tx.clone());
                             }
-                            LogCommand::Truncate { resp_tx, .. } => {
-                                // Truncate é tratado fora do lote (fase de batching); se
-                                // aqui chegar, recusa defensivamente sem corromper o pipeline.
-                                let _ = resp_tx.send(Err(HeraclitusError::StorageEngine(
-                                    "Truncate não é processado dentro do lote de escrita".into(),
-                                )));
-                            }
                         }
                     }
 
@@ -993,34 +961,6 @@ impl Log {
                         let _ = flush_tx.send(Ok(()));
                     }
 
-                    // R6: o truncate adiado corre agora, com o lote já
-                    // publicado e ack'ado — a mesma semântica do caminho
-                    // "primeiro comando", sem envenenar appends concorrentes.
-                    if let Some(LogCommand::Truncate {
-                        from_lsn,
-                        allowed_max_lsn,
-                        resp_tx,
-                    }) = pending_truncate
-                    {
-                        match handle_truncation_protected(
-                            &worker_dir,
-                            &mut active,
-                            &worker_catalog,
-                            from_lsn,
-                            allowed_max_lsn,
-                            &mut current_lsn,
-                            &worker_committed_lsn,
-                        ) {
-                            Ok(_) => {
-                                let _ = resp_tx.send(Ok(()));
-                            }
-                            Err(e) => {
-                                let _ = resp_tx.send(Err(e));
-                                worker_poisoned.store(true, Ordering::SeqCst);
-                                break;
-                            }
-                        }
-                    }
                 }
             }));
         });
@@ -1035,6 +975,7 @@ impl Log {
             cmd_tx,
             keystore,
             stamp_lock: std::sync::Mutex::new(()),
+            fds: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -1162,28 +1103,89 @@ impl Log {
         Ok(self.scan(lsn, lsn + 1)?.into_iter().next())
     }
 
+    /// Descritor do segmento, do cache. Abre-o na primeira utilização.
+    ///
+    /// O lock cobre só a consulta ao mapa; o `Arc<File>` devolvido é usado FORA
+    /// dele, com leituras posicionais, por isso vários leitores partilham o
+    /// mesmo descritor sem serializar o I/O.
+    fn descritor_do_segmento(&self, seg: SegmentId) -> Result<Option<Arc<File>>, HeraclitusError> {
+        if let Some(f) = self.fds.lock().unwrap_or_else(|e| e.into_inner()).get(&seg) {
+            return Ok(Some(f.clone()));
+        }
+        let path = segment_path(&self.dir, seg);
+        let file = match File::open(&path) {
+            Ok(f) => Arc::new(f),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        // Corrida benigna: dois leitores podem abrir o mesmo segmento em
+        // paralelo. `or_insert_with` faz o primeiro ganhar e o segundo larga o
+        // seu descritor — mais barato que segurar o lock durante o `open`.
+        let mut guarda = self.fds.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(Some(guarda.entry(seg).or_insert(file).clone()))
+    }
+
+    /// A versão de FORMATO de um segmento, vinda do catálogo em memória.
+    ///
+    /// Antes, `read_at` descobria-a fazendo `seek(0)` + ler 22 bytes do próprio
+    /// ficheiro, EM CADA LEITURA — quando `SegmentMeta.version` já a tem. Era
+    /// um seek e uma leitura extra por leitura pontual (1,40x sozinho, medido).
+    fn versao_do_segmento(&self, seg: SegmentId) -> Option<u16> {
+        let catalogo = self.catalog.load();
+        if catalogo.active.meta.id == seg {
+            return Some(catalogo.active.meta.version);
+        }
+        catalogo
+            .sealed
+            .iter()
+            .find(|c| c.meta.id == seg)
+            .map(|c| c.meta.version)
+    }
+
     pub fn read_at(
         &self,
         seg: SegmentId,
         off: u64,
     ) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
-        let path = segment_path(&self.dir, seg);
-        let mut f = match File::open(&path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
+        let version = match self.versao_do_segmento(seg) {
+            Some(v) => v,
+            // Segmento fora do catálogo: cai para a leitura do cabeçalho do
+            // ficheiro. Não acontece no caminho normal (`read` só passa ids que
+            // acabou de tirar do catálogo), mas `read_at` é público.
+            None => match self.versao_do_ficheiro(seg)? {
+                Some(v) => v,
+                None => return Ok(None),
+            },
+        };
+        self.ler_registo_em(seg, off, version)
+    }
+
+    /// Fallback: lê a versão do cabeçalho do ficheiro (22 B).
+    fn versao_do_ficheiro(&self, seg: SegmentId) -> Result<Option<u16>, HeraclitusError> {
+        let Some(f) = self.descritor_do_segmento(seg)? else {
+            return Ok(None);
+        };
+        let mut hdr = [0u8; HEADER_LEN];
+        match ler_exato_em(&f, &mut hdr, 0) {
+            Ok(()) => Ok(Some(format::SegmentHeader::decode(&hdr)?.version)),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Lê UM registo no offset dado, com a versão já conhecida.
+    fn ler_registo_em(
+        &self,
+        seg: SegmentId,
+        off: u64,
+        version: u16,
+    ) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
+        let Some(f) = self.descritor_do_segmento(seg)? else {
+            return Ok(None);
         };
 
-        f.seek(SeekFrom::Start(off))?;
-        if format::RECORD_HEADER_LEN < 4 {
-            return Err(HeraclitusError::Corruption {
-                context: format!("Segmento: {seg}"),
-                detail: "RECORD_HEADER_LEN inválido".into(),
-            });
-        }
-
         let mut rh = [0u8; format::RECORD_HEADER_LEN];
-        if let Err(e) = f.read_exact(&mut rh) {
+        if let Err(e) = ler_exato_em(&f, &mut rh, off) {
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
                 return Ok(None);
             }
@@ -1200,22 +1202,17 @@ impl Log {
 
         let mut buf = vec![0u8; format::RECORD_HEADER_LEN + len];
         buf[..format::RECORD_HEADER_LEN].copy_from_slice(&rh);
-        if let Err(e) = f.read_exact(&mut buf[format::RECORD_HEADER_LEN..]) {
+        if let Err(e) = ler_exato_em(
+            &f,
+            &mut buf[format::RECORD_HEADER_LEN..],
+            off + format::RECORD_HEADER_LEN as u64,
+        ) {
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
                 return Ok(None);
             }
             return Err(e.into());
         }
 
-        // Versão do SEGMENTO (não a corrente): decide a regra de CRC e o
-        // layout do payload. read_at recebe só (seg, off), por isso lê o
-        // header do próprio ficheiro — barato: já está aberto.
-        let version = {
-            let mut hdr = [0u8; HEADER_LEN];
-            f.seek(SeekFrom::Start(0))?;
-            f.read_exact(&mut hdr)?;
-            format::SegmentHeader::decode(&hdr)?.version
-        };
         match format::decode_record(version, &buf) {
             Decoded::Record(rlsn, _hlc, payload, _) => {
                 let mut ep = decode_episode_payload(version, payload)?;
@@ -1224,7 +1221,7 @@ impl Log {
             }
             _ => Err(HeraclitusError::Corruption {
                 context: format!("Segmento: {seg}"),
-                detail: "CRC32 violado no registro".into(),
+                detail: "CRC-32C violado no registo".into(),
             }),
         }
     }
@@ -1486,6 +1483,7 @@ impl Log {
             report.segments += 1;
             report.records += scan.record_hashes.len() as u64;
             if scan.sealed {
+                report.sealed += 1;
                 let root = merkle_root(&scan.record_hashes);
                 match scan.blake3_root {
                     Some(stored) if stored == root => report.merkle_ok += 1,
@@ -1539,15 +1537,6 @@ impl Log {
         let (lsn, ts) = self.enqueue_append_inner(episode, None, "append", true)?;
         copia.ts_hlc = ts; // o carimbo real, feito dentro da secção crítica
         Ok((lsn, copia))
-    }
-
-    /// Append com compare-and-append (OCC): só grava se o head do log for
-    /// exatamente `expected`, senão devolve `CasConflict`. Usado por `heraclitus-txn`.
-    /// Carimba o `ts_hlc` como `append`.
-    pub fn append_cas(&self, expected: Lsn, mut episode: Episode) -> Result<Lsn, HeraclitusError> {
-        episode.ts_hlc = self.hlc.now();
-        self.enqueue_append_inner(episode, Some(expected), "append_cas", true)
-            .map(|(lsn, _)| lsn)
     }
 
     /// Aplicação replicada (follower): grava a entrada do líder na posição exata
@@ -1756,129 +1745,6 @@ impl Log {
     }
 }
 
-impl RaftLogStorage for Log {
-    fn append_raft_entry(
-        &self,
-        term: u64,
-        index: u64,
-        episode: Episode,
-    ) -> Result<Lsn, HeraclitusError> {
-        self.check_poison()?;
-        // Entrada expedida pelo líder: preserva o carimbo dele, observa-o localmente.
-        self.hlc.observe(episode.ts_hlc);
-        let (tx, rx) = crossbeam_channel::bounded(1);
-
-        let mut opaque_meta = [0u8; 16];
-        opaque_meta[..8].copy_from_slice(&term.to_le_bytes());
-        opaque_meta[8..16].copy_from_slice(&index.to_le_bytes());
-
-        self.cmd_tx
-            .send_timeout(
-                LogCommand::Append {
-                    opaque_meta,
-                    episode: Arc::new(episode),
-                    expected_lsn: None,
-                    resp_tx: tx,
-                },
-                std::time::Duration::from_secs(10),
-            )
-            .map_err(|_| {
-                HeraclitusError::StorageEngine(
-                    "Timeout de canal concorrente: Pipeline saturado".into(),
-                )
-            })?;
-
-        rx.recv().map_err(|_| {
-            HeraclitusError::StorageEngine("Worker interrompido no processamento Raft".into())
-        })?
-    }
-
-    fn read_raft_entry(&self, lsn: Lsn) -> Result<Option<(Lsn, RaftEntry)>, HeraclitusError> {
-        if lsn >= self.committed_lsn.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        let catalog = self.catalog.load();
-
-        let container = if lsn >= catalog.active.meta.base_lsn {
-            Some(&catalog.active)
-        } else {
-            let idx = match catalog
-                .sealed
-                .binary_search_by_key(&lsn, |c| c.meta.base_lsn)
-            {
-                Ok(i) => Some(i),
-                Err(i) => {
-                    if i > 0 {
-                        Some(i - 1)
-                    } else {
-                        None
-                    }
-                }
-            };
-            idx.map(|i| &catalog.sealed[i])
-        };
-
-        if let Some(container) = container {
-            let offset_idx = (lsn - container.meta.base_lsn) as usize;
-            if let Some(entry) = container.index.entries.get(offset_idx) {
-                let path = segment_path(&self.dir, container.meta.id);
-                let mut f = File::open(&path)?;
-                f.seek(SeekFrom::Start(entry.offset))?;
-                let mut rh = [0u8; format::RECORD_HEADER_LEN];
-                f.read_exact(&mut rh)?;
-                let len = u32::from_le_bytes(rh[..4].try_into().unwrap_or([0u8; 4])) as usize;
-                let mut buf = vec![0u8; format::RECORD_HEADER_LEN + len];
-                f.seek(SeekFrom::Start(entry.offset))?;
-                f.read_exact(&mut buf)?;
-
-                if let Decoded::Record(_, _, payload, _) =
-                    format::decode_record(container.meta.version, &buf)
-                {
-                    let ep = decode_episode_payload(container.meta.version, payload)?;
-
-                    let term =
-                        u64::from_le_bytes(entry.opaque_meta[..8].try_into().unwrap_or([0u8; 8]));
-                    let index =
-                        u64::from_le_bytes(entry.opaque_meta[8..16].try_into().unwrap_or([0u8; 8]));
-
-                    return Ok(Some((
-                        lsn,
-                        RaftEntry {
-                            term,
-                            index,
-                            payload: Arc::new(ep),
-                        },
-                    )));
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    fn truncate_from_lsn(
-        &self,
-        from_lsn: Lsn,
-        current_raft_commit: u64,
-    ) -> Result<(), HeraclitusError> {
-        self.check_poison()?;
-        let allowed_max_lsn = self.resolve_lsn_from_consensus_index(current_raft_commit);
-        let (tx, rx) = crossbeam_channel::bounded(1);
-
-        self.cmd_tx
-            .send(LogCommand::Truncate {
-                from_lsn,
-                allowed_max_lsn,
-                resp_tx: tx,
-            })
-            .map_err(|_| {
-                HeraclitusError::StorageEngine(
-                    "Falha de injeção na barreira de Truncate do Raft".into(),
-                )
-            })?;
-        rx.recv()
-            .map_err(|_| HeraclitusError::StorageEngine("Truncamento de log abortado".into()))?
-    }
-}
 
 fn new_active(
     dir: &Path,
@@ -1947,7 +1813,12 @@ fn roll_segment(
         },
         index: current_catalog.active.index.clone(),
     }));
-    new_sealed.sort_by_key(|c| c.meta.base_lsn);
+    // Sem `sort_by_key` aqui: os segmentos são criados por ordem monotónica de
+    // `base_lsn` e o `push` preserva-a, portanto o vetor JÁ está ordenado. O
+    // sort era O(s log s) a cada selagem — 1 164 selagens na carga de 20M — a
+    // reordenar o que já estava em ordem. A ordenação é invariante de que a
+    // `binary_search_by_key(base_lsn)` em `read`/`scan_capped` depende; o teste
+    // `selados_ficam_ordenados_por_base_lsn` fixa-a.
 
     *active = new_active(dir, next_id, next_base_lsn, hlc)?;
 
@@ -1973,189 +1844,18 @@ fn roll_segment(
     Ok(())
 }
 
-fn handle_truncation_protected(
-    dir: &Path,
-    active: &mut Active,
-    catalog_swap: &ArcSwap<LogCatalog>,
-    from_lsn: Lsn,
-    allowed_max_lsn: Lsn,
-    current_lsn: &mut Lsn,
-    committed_lsn: &AtomicU64,
-) -> Result<(), HeraclitusError> {
-    if from_lsn < allowed_max_lsn {
-        return Err(HeraclitusError::StorageEngine(
-            "Violação de Consenso: Rejeitada tentativa ilegal de apagar registros consolidados por quórum!".into()
-        ));
-    }
-
-    let catalog = catalog_swap.load();
-    let is_in_active = from_lsn >= catalog.active.meta.base_lsn;
-    let mut new_sealed = (*catalog.sealed).clone();
-
-    let (target_container, target_idx) = if is_in_active {
-        (&catalog.active, None)
-    } else {
-        let pos = catalog
-            .sealed
-            .binary_search_by_key(&from_lsn, |c| c.meta.base_lsn)
-            .unwrap_or_else(|i| if i > 0 { i - 1 } else { 0 });
-        new_sealed.truncate(pos + 1);
-        (&catalog.sealed[pos], Some(pos))
-    };
-
-    let path = segment_path(dir, target_container.meta.id);
-    let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
-
-    let mut new_entries = Vec::new();
-    let mut valid_len = HEADER_LEN as u64;
-    let mut max_lsn = target_container.meta.base_lsn;
-    let mut hashes = Vec::new();
-
-    for entry in target_container.index.entries.iter() {
-        if entry.lsn >= from_lsn {
-            break;
-        }
-        new_entries.push(*entry);
-        max_lsn = max_lsn.max(entry.lsn);
-
-        file.seek(SeekFrom::Start(entry.offset))?;
-        let mut rh = [0u8; format::RECORD_HEADER_LEN];
-        file.read_exact(&mut rh)?;
-        let len = u32::from_le_bytes(rh[..4].try_into().unwrap_or([0u8; 4])) as usize;
-        let mut buf = vec![0u8; format::RECORD_HEADER_LEN + len];
-        file.seek(SeekFrom::Start(entry.offset))?;
-        file.read_exact(&mut buf)?;
-        hashes.push(format::record_leaf(target_container.meta.version, &buf));
-
-        valid_len = entry.offset + format::RECORD_HEADER_LEN as u64 + len as u64;
-    }
-
-    // PHASE 1 (2PC): Marcador de intenção físico confere idempotência contra falhas elétricas abruptas.
-    // R5: o intent cobre o plano COMPLETO — o set_len do alvo E a lista de
-    // segmentos seguintes a remover. Sem a lista, um crash entre o set_len e os
-    // remove_file fazia os segmentos "truncados" ressuscitarem no reopen.
-    let mut victims: Vec<SegmentId> = Vec::new();
-    if let Some(pos) = target_idx {
-        victims.extend(catalog.sealed[pos + 1..].iter().map(|s| s.meta.id));
-    }
-    if !is_in_active {
-        victims.push(catalog.active.meta.id);
-    }
-    let intent_path = dir.join("truncate.intent");
-    let mut intent_file = File::create(&intent_path)?;
-    intent_file.write_all(&target_container.meta.id.to_le_bytes())?;
-    intent_file.write_all(&valid_len.to_le_bytes())?;
-    intent_file.write_all(&(victims.len() as u32).to_le_bytes())?;
-    for v in &victims {
-        intent_file.write_all(&v.to_le_bytes())?;
-    }
-    intent_file.sync_all()?;
-    sync_parent_dir(dir)?;
-
-    file.set_len(valid_len)?;
-    file.sync_all()?;
-
-    for v in &victims {
-        let _ = std::fs::remove_file(segment_path(dir, *v));
-    }
-
-    // R14: um segmento de versão ANTIGA nunca é reativado como ativo — o worker
-    // escreve novos registos sempre com FORMAT_VERSION atual, e misturar regras
-    // de CRC/layout num ficheiro cujo header declara a versão antiga tornaria os
-    // registos novos ilegíveis. Sela-se o alvo truncado e abre-se um segmento
-    // novo na versão corrente.
-    let next_active_container = if target_container.meta.version != format::FORMAT_VERSION {
-        let footer = SegmentFooter {
-            record_count: hashes.len() as u64,
-            min_lsn: target_container.meta.base_lsn,
-            max_lsn,
-            blake3_root: merkle_root(&hashes),
-        };
-        file.seek(SeekFrom::Start(valid_len))?;
-        file.write_all(&footer.encode())?;
-        file.sync_all()?;
-
-        let sealed_target = Arc::new(SegmentContainer {
-            meta: SegmentMeta {
-                id: target_container.meta.id,
-                path: path.clone(),
-                base_lsn: target_container.meta.base_lsn,
-                max_lsn,
-                sealed: true,
-                blake3_root: Some(footer.blake3_root),
-                version: target_container.meta.version,
-            },
-            index: Arc::new(SegmentIndex {
-                entries: Arc::new(new_entries),
-            }),
-        });
-        if is_in_active {
-            new_sealed.push(sealed_target);
-        } else {
-            *new_sealed.last_mut().expect("alvo presente no catálogo") = sealed_target;
-        }
-
-        let next_id = catalog.active.meta.id + 1;
-        *active = new_active(dir, next_id, from_lsn, &Hlc::new())?;
-
-        Arc::new(SegmentContainer {
-            meta: SegmentMeta {
-                id: next_id,
-                path: segment_path(dir, next_id),
-                base_lsn: from_lsn,
-                max_lsn: u64::MAX,
-                sealed: false,
-                blake3_root: None,
-                version: format::FORMAT_VERSION,
-            },
-            index: Arc::new(SegmentIndex {
-                entries: Arc::new(Vec::new()),
-            }),
-        })
-    } else {
-        *active = Active {
-            file,
-            segment_id: target_container.meta.id,
-            bytes_written: valid_len,
-            record_hashes: hashes,
-            base_lsn: target_container.meta.base_lsn,
-            max_lsn,
-            last_sync: Instant::now(),
-        };
-
-        if !is_in_active {
-            new_sealed.pop();
-        }
-
-        Arc::new(SegmentContainer {
-            meta: SegmentMeta {
-                id: target_container.meta.id,
-                path: path.clone(),
-                base_lsn: target_container.meta.base_lsn,
-                max_lsn: u64::MAX,
-                sealed: false,
-                blake3_root: None,
-                version: target_container.meta.version,
-            },
-            index: Arc::new(SegmentIndex {
-                entries: Arc::new(new_entries),
-            }),
-        })
-    };
-
-    catalog_swap.store(Arc::new(LogCatalog {
-        sealed: Arc::new(new_sealed),
-        active: next_active_container,
-    }));
-
-    *current_lsn = from_lsn;
-    committed_lsn.store(from_lsn, Ordering::Release);
-    sync_parent_dir(dir)?;
-
-    let _ = std::fs::remove_file(&intent_path);
-    Ok(())
-}
-
+/// Recuperação de boot para um `truncate.intent` deixado em disco.
+///
+/// **Nada neste crate volta a escrever esse ficheiro:** a superfície de
+/// truncate (o trait `RaftLogStorage` v0, o `LogCommand::Truncate` e o
+/// `handle_truncation_protected`) foi removida em 2026-08-19 por não ter um
+/// único chamador — o consenso real usa `append_replicated` + `FileRaftLog`.
+///
+/// Esta função FICA porque um data-dir criado por uma versão anterior pode
+/// ainda ter o ficheiro, e ignorá-lo deixaria o log num estado meio-truncado
+/// sem ninguém a reparar. Custa um `exists()` por arranque. Só pode sair
+/// depois de existir a garantia de que nenhum data-dir em uso vem de uma
+/// versão com truncate.
 fn check_and_recover_truncate_intent(dir: &Path) -> Result<(), HeraclitusError> {
     let intent_path = dir.join("truncate.intent");
     if intent_path.exists() {
@@ -2447,8 +2147,19 @@ pub fn merkle_root(hashes: &[[u8; 32]]) -> [u8; 32] {
 
 #[derive(Default)]
 pub struct VerifyReport {
+    /// Total de segmentos varridos, **incluindo o ativo**.
     pub segments: u64,
+    /// Quantos desses estavam SELADOS. O ativo nunca está, portanto
+    /// `sealed == segments - 1` no caso normal.
+    ///
+    /// Existe porque sem ele o relatório não conseguia exprimir "íntegro":
+    /// quem comparasse `merkle_ok == segments` nunca obtinha verdadeiro num log
+    /// saudável, e um painel chegou a declarar FALHA DE INTEGRIDADE em bases
+    /// perfeitamente sãs por causa disso.
+    pub sealed: u64,
     pub records: u64,
+    /// Selados cuja raiz gravada no rodapé bate com a recomputada. Um selado
+    /// sem raiz gravada não conta aqui **e não é falha** — é não-verificável.
     pub merkle_ok: u64,
 }
 
