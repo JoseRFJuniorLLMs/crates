@@ -769,12 +769,21 @@ fn attr_eq_hint(conditions: &[(BoolOp, Condition)]) -> Option<(String, String)> 
     None
 }
 
-/// Campos do envelope que o índice de atributos guarda sob uma chave
-/// reservada. `agent_id` → `_agent` (v3), `kind`/`tipo` → `_kind` (v4).
+/// Campos do envelope que este planner resolve pelo índice de atributos, sob
+/// uma chave reservada.
+///
+/// **Só `kind`/`tipo`.** O `agent_id` também está indexado (como `_agent`,
+/// desde a v3), mas já tem um caminho próprio e testado por *zone maps*
+/// (`agent_eq_hint` + `skip_scan`), que salta segmentos inteiros pelos min/max
+/// gravados. Encaminhá-lo para cá desligava esse caminho — o
+/// `spec028_zone_maps_are_registered_and_reused_across_queries` apanhou-o de
+/// imediato, porque deixavam de ser registados artefactos.
+///
+/// Trocar um por outro pode até compensar, mas é uma decisão que precisa de
+/// medição própria; não é um efeito lateral de indexar o `kind`.
 fn pseudo_atributo_de(campo: &str) -> Option<&'static str> {
     match campo {
         "kind" | "tipo" => Some("_kind"),
-        "agent_id" => Some("_agent"),
         _ => None,
     }
 }

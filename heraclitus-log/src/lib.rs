@@ -30,7 +30,7 @@ use heraclitus_core::{
 };
 use heraclitus_crypto::KeyStore;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -182,6 +182,20 @@ struct StoragePayload {
     /// FORMAT v4: valid time nativo (mundo real), distinto do transaction time.
     pub valid_from: Option<u64>,
     pub valid_to: Option<u64>,
+}
+
+/// Só o PRIMEIRO campo do payload (v3+): os 16 bytes de `opaque_meta`.
+///
+/// O bincode desserializa os campos por ordem e pára quando o struct acaba,
+/// portanto isto lê 16 bytes em vez do `Episode` inteiro. É o que o
+/// `scan_segment_file` precisa — e só isso — para reconstruir o índice no
+/// arranque. `StoragePayload` e `StoragePayloadV3` declaram `opaque_meta`
+/// primeiro; se alguma geração futura mudar essa ordem, este struct tem de
+/// mudar com ela (o teste `prefixo_opaque_meta_bate_com_payload_completo`
+/// falha se divergirem).
+#[derive(serde::Deserialize)]
+struct OpaqueMetaPrefix {
+    opaque_meta: [u8; 16],
 }
 
 /// Layout EXATO do payload FORMAT v3 (pré-Valid-Time). O bincode não é
@@ -414,11 +428,19 @@ impl Log {
         let mut max_recovered_lsn: Option<Lsn> = None;
         let mut tail_scan: Option<(SegmentId, SegmentScan)> = None;
 
-        for id in &ids {
+        // Os segmentos são ficheiros INDEPENDENTES: varrê-los é puro por
+        // ficheiro. O tratamento a seguir (ordem dos LSN, selagem, catálogo)
+        // continua serial e por ordem de id — só a varredura é paralela.
+        // Medido a 1 187 segmentos: 3,47x só com isto (`benches/otim_boot.rs`).
+        let mut scans = varrer_segmentos_em_paralelo(&dir, &ids)?;
+
+        for (idx, id) in ids.iter().enumerate() {
             let path = segment_path(&dir, *id);
             let is_last = Some(*id) == ids.last().copied();
 
-            let scan = scan_segment_file(&path, *id)?;
+            let scan = scans[idx]
+                .take()
+                .expect("cada segmento é varrido exatamente uma vez");
             // O relógio HLC nunca arranca ATRÁS do que já está persistido:
             // sem isto, um wall clock que recuasse entre execuções quebraria
             // a monotonicidade de ts por LSN (o contrato do AS OF TIMESTAMP).
@@ -1245,7 +1267,25 @@ impl Log {
         let mut out = Vec::with_capacity(max.min(2048));
         let mut scan_lsn = from;
 
-        let mut active_file_handle: Option<(SegmentId, File)> = None;
+        // `BufReader` e não `File` cru. O varrimento faz DOIS `read_exact` por
+        // registo (cabeçalho, depois corpo); sem buffer isso são duas syscalls
+        // por registo — 40 milhões num varrimento do log de 20M, medido.
+        //
+        // Sonda `benches/otim_leitura.rs` (2026-08-19), mesmo segmento real:
+        //   File cru          : 235 941 reg/s ·  109 MB/s
+        //   BufReader de 1 MiB: 767 419 reg/s ·  356 MB/s   3,25x
+        //   mmap (zero-copy)  : 624 805 reg/s ·  290 MB/s   2,65x
+        //
+        // Nota de arquivo: o `mmap.rs` foi medido em 2026-08-15 contra um
+        // leitor COM `BufReader` e perdeu — mas este caminho, o vivo, nunca
+        // teve buffer nenhum. A conclusão certa não era "o mmap é mau", era
+        // "falta um `BufReader` aqui". Com ele posto, o mmap continua a não
+        // compensar, agora por comparação justa.
+        //
+        // O buffer é de 1 MiB e o `BufReader` implementa `Seek` (descartando o
+        // que tem em buffer), portanto o salto para `entry.offset` na troca de
+        // segmento continua correto.
+        let mut active_file_handle: Option<(SegmentId, BufReader<File>)> = None;
         let mut record_header_buffer = [0u8; format::RECORD_HEADER_LEN];
         let mut record_buf = Vec::with_capacity(65536);
 
@@ -1304,7 +1344,10 @@ impl Log {
                         _ => {
                             let path = segment_path(&self.dir, container.meta.id);
                             let file = File::open(&path)?;
-                            active_file_handle = Some((container.meta.id, file));
+                            active_file_handle = Some((
+                                container.meta.id,
+                                BufReader::with_capacity(1 << 20, file),
+                            ));
                             &mut active_file_handle.as_mut().unwrap().1
                         }
                     };
@@ -1444,7 +1487,7 @@ impl Log {
             .find(|m| m.id == id)
             .cloned();
         let Some(meta) = meta else { return Ok(None) };
-        let scan = scan_segment_file(&meta.path, id)?;
+        let scan = scan_segment_file(&meta.path, id, true)?;
         let computed_root = merkle_root(&scan.record_hashes);
         let stored_root = scan.blake3_root.or(meta.blake3_root);
         // Um segmento selado é válido se a raiz recomputada bate com a do
@@ -1456,7 +1499,7 @@ impl Log {
             id,
             version: scan.version,
             sealed: meta.sealed,
-            records: scan.record_hashes.len() as u64,
+            records: scan.locs.len() as u64,
             base_lsn: meta.base_lsn,
             max_lsn: scan.max_lsn.unwrap_or(meta.base_lsn),
             computed_root,
@@ -1470,6 +1513,56 @@ impl Log {
         self.verify()
     }
 
+    /// Varre os segmentos de `paths` em paralelo, COM leaf hashes, na ordem
+    /// dada. Ver a nota em [`varrer_segmentos_em_paralelo`] sobre porque o erro
+    /// devolvido é o do menor índice.
+    fn varrer_para_verificacao(
+        &self,
+        paths: &[PathBuf],
+    ) -> Result<Vec<SegmentScan>, HeraclitusError> {
+        if paths.len() < 2 {
+            let mut out = Vec::with_capacity(paths.len());
+            for p in paths {
+                out.push(scan_segment_file(p, segment_id_from_path(p)?, true)?);
+            }
+            return Ok(out);
+        }
+
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(paths.len());
+        let proximo = AtomicU64::new(0);
+        let recolhidos: std::sync::Mutex<Vec<(usize, Result<SegmentScan, HeraclitusError>)>> =
+            std::sync::Mutex::new(Vec::with_capacity(paths.len()));
+
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| loop {
+                    let i = proximo.fetch_add(1, Ordering::Relaxed) as usize;
+                    if i >= paths.len() {
+                        break;
+                    }
+                    let p = &paths[i];
+                    let r = segment_id_from_path(p)
+                        .and_then(|id| scan_segment_file(p, id, true));
+                    recolhidos
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((i, r));
+                });
+            }
+        });
+
+        let mut recolhidos = recolhidos.into_inner().unwrap_or_else(|e| e.into_inner());
+        recolhidos.sort_by_key(|(i, _)| *i);
+        let mut out = Vec::with_capacity(paths.len());
+        for (_, r) in recolhidos {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     pub fn verify(&self) -> Result<VerifyReport, HeraclitusError> {
         let catalog = self.catalog.load();
         let mut report = VerifyReport::default();
@@ -1477,11 +1570,19 @@ impl Log {
         let mut paths: Vec<PathBuf> = catalog.sealed.iter().map(|c| c.meta.path.clone()).collect();
         paths.push(catalog.active.meta.path.clone());
 
-        for path in paths {
-            let id = segment_id_from_path(&path)?;
-            let scan = scan_segment_file(&path, id)?;
+        // Paralelo pela mesma razão do `Log::open`: cada segmento é um ficheiro
+        // independente e `scan_segment_file` é puro. A DIFERENÇA é que aqui os
+        // leaf hashes são obrigatórios — `verify` existe para recomputar a raiz
+        // Merkle e a comparar com a do rodapé; confiar no rodapé aqui seria
+        // verificar a prova contra ela própria.
+        //
+        // A agregação continua serial e por ordem de path, para o relatório e a
+        // mensagem de erro serem reproduzíveis entre corridas.
+        let scans = self.varrer_para_verificacao(&paths)?;
+
+        for (path, scan) in paths.iter().zip(scans) {
             report.segments += 1;
-            report.records += scan.record_hashes.len() as u64;
+            report.records += scan.locs.len() as u64;
             if scan.sealed {
                 report.sealed += 1;
                 let root = merkle_root(&scan.record_hashes);
@@ -1913,8 +2014,111 @@ struct SegmentScan {
     max_hlc: u64,
 }
 
+/// Varre vários segmentos em paralelo, devolvendo os resultados **na ordem dos
+/// `ids`**.
+///
+/// `scan_segment_file` é puro por ficheiro — não toca em estado partilhado —
+/// portanto a paralelização é segura por construção. O que NÃO é paralelizado
+/// é o tratamento a seguir (ordem de LSN, selagem, montagem do catálogo), que
+/// continua serial e determinístico.
+///
+/// O erro devolvido é o do **menor índice** que falhou, não o primeiro a
+/// chegar: sem isso, dois segmentos corrompidos dariam mensagens diferentes
+/// conforme o escalonamento das threads, e um relatório forense tem de ser
+/// reproduzível.
+///
+/// Medido em 1 187 segmentos (`benches/otim_boot.rs`, 2026-08-19): 3,47x só
+/// com a paralelização, e 14,3x somada às outras duas poupanças do arranque.
+fn varrer_segmentos_em_paralelo(
+    dir: &Path,
+    ids: &[SegmentId],
+) -> Result<Vec<Option<SegmentScan>>, HeraclitusError> {
+    let varrer_um = |id: SegmentId| -> Result<SegmentScan, HeraclitusError> {
+        let path = segment_path(dir, id);
+        scan_segment_file(&path, id, !tem_rodape_selado(&path))
+    };
+
+    // Abaixo de dois segmentos, arrancar threads custa mais do que poupa.
+    if ids.len() < 2 {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push(Some(varrer_um(*id)?));
+        }
+        return Ok(out);
+    }
+
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(ids.len());
+    let proximo = AtomicU64::new(0);
+    let recolhidos: std::sync::Mutex<Vec<(usize, Result<SegmentScan, HeraclitusError>)>> =
+        std::sync::Mutex::new(Vec::with_capacity(ids.len()));
+
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let i = proximo.fetch_add(1, Ordering::Relaxed) as usize;
+                if i >= ids.len() {
+                    break;
+                }
+                let r = varrer_um(ids[i]);
+                recolhidos
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((i, r));
+            });
+        }
+    });
+
+    let mut recolhidos = recolhidos.into_inner().unwrap_or_else(|e| e.into_inner());
+    recolhidos.sort_by_key(|(i, _)| *i);
+
+    let mut out = Vec::with_capacity(ids.len());
+    for (_, r) in recolhidos {
+        match r {
+            Ok(scan) => out.push(Some(scan)),
+            Err(e) => return Err(e), // menor índice, por causa do sort acima
+        }
+    }
+    Ok(out)
+}
+
+/// Espreita o RODAPÉ sem varrer o segmento: lê os últimos `FOOTER_LEN` bytes e
+/// confirma o magic. Um `true` significa "este segmento está selado e traz a
+/// sua raiz Merkle gravada".
+///
+/// Serve para o `Log::open` decidir, ANTES de varrer, se precisa dos leaf
+/// hashes: se a raiz já está no rodapé, calcular blake3 sobre o segmento
+/// inteiro é trabalho para deitar fora. Custa um `seek` + 60 bytes por
+/// segmento. Só o `verify()` — que existe precisamente para RECOMPUTAR a raiz
+/// e a comparar — é que continua a pedir os hashes sempre.
+fn tem_rodape_selado(path: &Path) -> bool {
+    let Ok(f) = File::open(path) else {
+        return false;
+    };
+    let Ok(meta) = f.metadata() else {
+        return false;
+    };
+    let len = meta.len();
+    if len < (HEADER_LEN + format::FOOTER_LEN) as u64 {
+        return false;
+    }
+    let mut buf = [0u8; format::FOOTER_LEN];
+    if ler_exato_em(&f, &mut buf, len - format::FOOTER_LEN as u64).is_err() {
+        return false;
+    }
+    // Só aceita como selado se o rodapé DESCODIFICA — um magic solto no meio
+    // de dados não chega.
+    SegmentFooter::decode(&buf).is_some()
+}
+
 /// PASSADA ÚNICA ( BufReader streaming): Varre o log de forma estritamente sequencial sem seek recursivo O(N²).
-fn scan_segment_file(path: &Path, _id: SegmentId) -> Result<SegmentScan, HeraclitusError> {
+fn scan_segment_file(
+    path: &Path,
+    _id: SegmentId,
+    com_leaf_hashes: bool,
+) -> Result<SegmentScan, HeraclitusError> {
     let file = File::open(path)?;
     let file_len = file.metadata()?.len();
 
@@ -1979,7 +2183,16 @@ fn scan_segment_file(path: &Path, _id: SegmentId) -> Result<SegmentScan, Heracli
                 } else {
                     min_lsn == Some(f.min_lsn) && max_lsn == Some(f.max_lsn)
                 };
-                if offset != file_len || hashes.len() as u64 != f.record_count || !bounds_ok {
+                // A contagem vem de `locs`, NÃO de `hashes`.
+                //
+                // `hashes` deixou de ser preenchido quando o chamador não
+                // precisa dos leaf hashes (segmento já selado, raiz no
+                // rodapé). Usá-lo como contador fazia `0 != record_count` em
+                // TODO segmento selado — ou seja, marcava o log inteiro como
+                // corrompido. A suite de crash-injection apanhou-o
+                // imediatamente. `locs` é preenchido sempre, por registo, e é
+                // o contador correto.
+                if offset != file_len || locs.len() as u64 != f.record_count || !bounds_ok {
                     corruption = true;
                 }
                 break;
@@ -2020,17 +2233,20 @@ fn scan_segment_file(path: &Path, _id: SegmentId) -> Result<SegmentScan, Heracli
                     max_hlc = max_hlc.max(hlc);
 
                     // Versão do segmento decide o layout: v3+ traz opaque_meta
-                    // no payload; v<=2 deriva-o do EventId do Episode.
-                    let opaque_meta = if version >= 4 {
-                        let (sp, _): (StoragePayload, usize) =
+                    // como PRIMEIRO campo do payload; v<=2 deriva-o do
+                    // EventId do Episode.
+                    //
+                    // Antes desserializava-se o `StoragePayload` INTEIRO — o
+                    // `content`, o `BTreeMap` de attrs, o `embedding`, os
+                    // `parents`, todos alocados — para ler 16 bytes. Como
+                    // `opaque_meta` é o primeiro campo, um struct só com ele
+                    // descodifica o prefixo e pára. Medido: 1,98x no
+                    // arranque a frio (`benches/otim_boot.rs`).
+                    let opaque_meta = if version >= 3 {
+                        let (p, _): (OpaqueMetaPrefix, usize) =
                             bincode::serde::decode_from_slice(payload, BINCODE_CFG)
                                 .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-                        sp.opaque_meta
-                    } else if version == 3 {
-                        let (sp, _): (StoragePayloadV3, usize) =
-                            bincode::serde::decode_from_slice(payload, BINCODE_CFG)
-                                .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-                        sp.opaque_meta
+                        p.opaque_meta
                     } else {
                         let (ep, _): (EpisodeV2, usize) =
                             bincode::serde::decode_from_slice(payload, BINCODE_CFG)
@@ -2038,7 +2254,16 @@ fn scan_segment_file(path: &Path, _id: SegmentId) -> Result<SegmentScan, Heracli
                         ep.id.0.to_bytes()
                     };
 
-                    hashes.push(format::record_leaf(version, &record_buf[..consumed]));
+                    // O leaf hash só é preciso para quem vai COMPARAR raízes
+                    // Merkle (`verify`) ou continuar a selagem (o segmento
+                    // ativo). Num segmento já selado com rodapé válido, o
+                    // `Log::open` usa a raiz do rodapé e DEITA FORA estes
+                    // hashes — calcular blake3 sobre 9,8 GB para os descartar
+                    // era o segundo maior desperdício do arranque (2,88x
+                    // acumulado com o prefixo, medido).
+                    if com_leaf_hashes {
+                        hashes.push(format::record_leaf(version, &record_buf[..consumed]));
+                    }
                     locs.push((lsn, offset, opaque_meta));
                     min_lsn = Some(min_lsn.map_or(lsn, |m: u64| m.min(lsn)));
                     max_lsn = Some(max_lsn.map_or(lsn, |m: u64| m.max(lsn)));
