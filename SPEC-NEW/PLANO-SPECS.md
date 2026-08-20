@@ -117,9 +117,13 @@ relação ganho/risco:
 4. **Spill-to-disk** determinístico em agregação/join grandes (SPEC-0039): já há
    `io`/tiering; falta o sub-pipeline de spill quando o join excede orçamento.
 
-### Fase 2 — Consolidação do consenso (quase fechado)
-- [ ] Wrapper gRPC/tonic sobre os tipos serde do `heraclitus-raft` (o único passo
-      "cosmético" que a STATUS admite faltar). Consenso real já está provado.
+### Fase 2 — Consolidação do consenso (FECHADO 2026-07-16)
+- [x] Wrapper gRPC/tonic sobre os tipos serde do `heraclitus-raft` — **feito**:
+      `heraclitus-raft::grpc` (`RaftTransport` proto + `GrpcNetworkFactory`), o
+      servidor escolhe TCP ou gRPC via `ReplicationConfig.transport` (default
+      `tcp`, back-compat). Testado a nível de raft (cluster por gRPC) e de servidor
+      (3 nós replicam+indexam por gRPC). Nota: `replication` **mantém-se
+      feature-gated** (nó único é o caminho normal — não vira default).
 
 ### Fase 3 — Endurecimento "referência → produção" (adiado, deliberado)
 - NUMA node-local pleno (multi-socket; hoje só pinning round-robin).
